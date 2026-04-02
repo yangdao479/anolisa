@@ -346,7 +346,7 @@ make build-sandbox
 **安装**
 
 ```bash
-sudo make install
+sudo make install-sandbox
 ```
 
 #### 4.2.4 agentsight（可选，仅 Linux）

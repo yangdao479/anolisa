@@ -345,7 +345,7 @@ Artifact: `linux-sandbox/target/release/linux-sandbox`
 **Install**
 
 ```bash
-sudo make install
+sudo make install-sandbox
 ```
 
 #### 4.2.4 agentsight (Optional, Linux only)
