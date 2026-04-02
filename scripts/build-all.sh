@@ -705,9 +705,9 @@ install_sec_core() {
     [[ -d "$dir" ]] || die "Directory not found: $dir"
     cd "$dir"
 
-    info "sudo make install ..."
-    sudo make install
-    ok "agent-sec-core installed to /usr/local/bin/"
+    info "sudo make install-sandbox ..."
+    sudo make install-sandbox
+    ok "agent-sec-core (linux-sandbox) installed to /usr/local/bin/"
 }
 
 install_sight() {
