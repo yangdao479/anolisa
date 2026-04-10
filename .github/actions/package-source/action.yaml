@@ -1,7 +1,7 @@
-name: Package Archive
+name: Package Source
 description: >
   Build a source archive for the given component and version.
-  Optionally signs the archive (os-skills only) and uploads it as a GitHub Actions artifact.
+  Optionally signs the archive (os-skills, agent-sec-core) and uploads it as a GitHub Actions artifact.
 
 inputs:
   component:
@@ -26,6 +26,11 @@ inputs:
     description: 'ASCII-armored GPG public key for signature verification (skills only). Pass vars.SKILL_SIGN_PUBLIC_KEY from the caller workflow.'
     required: false
     default: ''
+
+outputs:
+  archive-sha256:
+    description: 'SHA256 checksum of the produced archive'
+    value: ${{ steps.checksum.outputs.sha256 }}
 
 runs:
   using: composite
@@ -160,6 +165,12 @@ runs:
 
         echo "ARCHIVE_SIGNED=true" >> $GITHUB_ENV
 
+    - name: Warn if os-skills signing skipped
+      if: inputs.component == 'os-skills' && inputs.skill-sign-private-key == ''
+      shell: bash
+      run: |
+        echo "::warning::SKILL_SIGN_PRIVATE_KEY is not set; os-skills archive will be published UNSIGNED."
+
     # -----------------------------------------------------------------
     # Step 5: Sign archive (agent-sec-core only)
     #
@@ -178,6 +189,12 @@ runs:
           -C /tmp/build "${ARCHIVE_NAME}"
 
         echo "ARCHIVE_SIGNED=true" >> $GITHUB_ENV
+
+    - name: Warn if agent-sec-core signing skipped
+      if: inputs.component == 'agent-sec-core' && inputs.skill-sign-private-key == ''
+      shell: bash
+      run: |
+        echo "::warning::SKILL_SIGN_PRIVATE_KEY is not set; agent-sec-core archive will be published UNSIGNED."
 
     # -----------------------------------------------------------------
     # Step 6: Summarize
@@ -205,7 +222,18 @@ runs:
         echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
 
     # -----------------------------------------------------------------
-    # Step 7: Upload artifact
+    # Step 7: Compute checksum
+    # -----------------------------------------------------------------
+    - name: Compute checksum
+      id: checksum
+      shell: bash
+      run: |
+        SHA256=$(sha256sum "/tmp/archives/${ARCHIVE_FILE}" | awk '{print $1}')
+        echo "sha256=${SHA256}" >> $GITHUB_OUTPUT
+        echo "Archive SHA256: ${SHA256}"
+
+    # -----------------------------------------------------------------
+    # Step 8: Upload artifact
     # -----------------------------------------------------------------
     - name: Upload artifact
       uses: actions/upload-artifact@v4
