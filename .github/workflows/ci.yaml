@@ -241,6 +241,23 @@ jobs:
           fi
           echo "Code style check passed."
 
+      - name: Check uv.lock in sync with pyproject.toml
+        run: |
+          cd src/agent-sec-core/agent-sec-cli
+          uv lock --check
+
+      - name: Check requirements.txt in sync with uv.lock
+        run: |
+          cd src/agent-sec-core
+          make export-requirements
+          if ! git diff --quiet -- agent-sec-cli/requirements.txt; then
+              echo "ERROR: agent-sec-cli/requirements.txt is out of sync with uv.lock." >&2
+              echo "Please run 'make export-requirements' locally and commit the result." >&2
+              git diff -- agent-sec-cli/requirements.txt >&2
+              exit 1
+          fi
+          echo "requirements.txt is in sync with uv.lock."
+
       - name: Run Python tests
         run: |
           cd src/agent-sec-core

@@ -41,7 +41,8 @@ build-sandbox: ## Build linux-sandbox binary
 
 .PHONY: build-cli
 build-cli: ## Build agent-sec-cli wheel with maturin (Rust + Python)
-	cd agent-sec-cli && uv run maturin build --release -i python3.11
+	cd agent-sec-cli && uv sync --only-group dev --no-install-project && \
+		uv run --no-sync maturin build --release -i python3.11 --manylinux off
 
 .PHONY: setup
 setup: ## Install all dependencies (including dev), create .venv
@@ -52,7 +53,27 @@ build-openclaw-plugin: ## Build openclaw-plugin TypeScript sources
 	cd openclaw-plugin && npm install && npm run build
 
 .PHONY: build-all
-build-all: build-sandbox build-cli build-openclaw-plugin ## Build all components
+build-all: build-sandbox build-cli build-openclaw-plugin ## Build all components (used by rpmbuild)
+
+.PHONY: export-requirements
+export-requirements: ## Re-export agent-sec-cli/requirements.txt from uv.lock
+	cd agent-sec-cli && uv export --frozen --no-dev --no-hashes --no-emit-project -o requirements.txt
+
+.PHONY: download-deps
+download-deps: ## Download ALL Python deps for agent-sec-cli (requires network)
+	pip3 download --dest agent-sec-cli/target/wheels/ --no-cache-dir \
+		--python-version 3.11.6 --only-binary=:all: \
+		--timeout 60 \
+		--index-url https://pypi.org/simple/ \
+		--extra-index-url https://download.pytorch.org/whl/cpu \
+		-r agent-sec-cli/requirements.txt
+
+.PHONY: stage-cli
+stage-cli: ## Install all wheels to local staging dir (requires uv)
+	install -d -m 0755 $(CLI_STAGED_SITE)
+	uv pip install --target $(CLI_STAGED_SITE) --no-deps --no-cache --link-mode copy \
+		agent-sec-cli/target/wheels/*.whl
+	rm -f $(CLI_STAGED_SITE)/.lock
 
 # =============================================================================
 # INSTALL
@@ -61,6 +82,9 @@ build-all: build-sandbox build-cli build-openclaw-plugin ## Build all components
 PREFIX             ?= /usr/local
 SKILL_DIR          ?= /usr/share/anolisa/skills
 OPENCLAW_PLUGIN_DIR ?= /opt/agent-sec/openclaw-plugin
+WHEEL_DIR          ?= /opt/agent-sec/wheels
+CLI_STAGED_SITE    ?= _staged/site-packages
+PYTHON_SITEARCH    ?= /usr/lib64/python3.11/site-packages
 
 .PHONY: install-sandbox
 install-sandbox: ## Install linux-sandbox binary only
@@ -76,8 +100,17 @@ install-tool: ## Install sign-skill.sh to PREFIX/bin
 install: install-all ## Install all components (alias for install-all)
 
 .PHONY: install-cli
-install-cli: ## Install agent-sec-cli wheel
+install-cli: ## Install agent-sec-cli wheel (for dev/debug)
 	pip3 install agent-sec-cli/target/wheels/agent_sec_cli-*.whl
+
+.PHONY: install-cli-site
+install-cli-site: ## Copy staged agent-sec-cli + deps to system site-packages
+	install -d -m 0755 $(DESTDIR)$(PYTHON_SITEARCH)
+	cp -rp $(CLI_STAGED_SITE)/. $(DESTDIR)$(PYTHON_SITEARCH)/
+	# Move uv-generated entry point from site-packages/bin/ to /usr/bin/
+	install -d -m 0755 $(DESTDIR)/usr/bin
+	install -p -m 0755 $(DESTDIR)$(PYTHON_SITEARCH)/bin/agent-sec-cli $(DESTDIR)/usr/bin/agent-sec-cli
+	rm -rf $(DESTDIR)$(PYTHON_SITEARCH)/bin
 
 .PHONY: install-skills
 install-skills: ## Install skill files to SKILL_DIR
@@ -97,8 +130,18 @@ install-openclaw-plugin: ## Install openclaw-plugin to target directory
 	cp -r openclaw-plugin/scripts/* $(DESTDIR)$(OPENCLAW_PLUGIN_DIR)/scripts/
 	chmod 0755 $(DESTDIR)$(OPENCLAW_PLUGIN_DIR)/scripts/*.sh
 
+.PHONY: install-cosh-hook
+install-cosh-hook: ## Install cosh hooks (linux-sandbox + code_scanner_hook)
+	install -d -m 0755 $(DESTDIR)$(PREFIX)/bin
+	install -p -m 0755 linux-sandbox/target/release/linux-sandbox $(DESTDIR)$(PREFIX)/bin/
+	install -d -m 0755 $(DESTDIR)/usr/local/lib/anolisa/cosh_hooks
+	cp -rp cosh_hooks/. $(DESTDIR)/usr/local/lib/anolisa/cosh_hooks/
+
 .PHONY: install-all
-install-all: install-sandbox install-cli install-skills install-tool install-openclaw-plugin ## Install all components
+install-all: install-cli install-cosh-hook install-openclaw-plugin install-skills ## Install all components (local dev)
+
+.PHONY: install-all-for-rpmbuild
+install-all-for-rpmbuild: install-cli-site install-cosh-hook install-openclaw-plugin install-skills ## Install all components (used by rpmbuild)
 
 .PHONY: help
 help: ## Show this help message
