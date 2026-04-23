@@ -58,43 +58,51 @@ jobs:
             rpm2cpio "$rpm" | (cd "$RPM_EXTRACT" && cpio -idm 2>/dev/null)
           done
 
-          # Hash all regular files from RPM extraction
-          (cd "$RPM_EXTRACT" && find . -type f | sort | xargs -r sha256sum) > /tmp/rpm-manifest-all.txt
+          # Hash all regular files from RPM extraction (null-delimited for spaces in names)
+          (cd "$RPM_EXTRACT" && find . -type f -print0 | sort -z | xargs -0 -r sha256sum) > /tmp/rpm-manifest-all.txt
 
           echo "=== Check 1: pre-brp vs RPM (brp tampering detection) ==="
-          echo "Baseline: pre-brp manifest (files from %install)"
+          echo "Baseline: pre-brp manifest (files from the install section)"
           MISMATCHED=0
           VERIFIED=0
           EXTRA=0
-          # Check every pre-brp file exists in RPM with same hash
+
+          # Build associative array from RPM manifest
+          # sha256sum output format: <64-char-hash><space><space><filename>
+          declare -A rpm_hashes
           while IFS= read -r line; do
-            pre_hash=$(echo "$line" | awk '{print $1}')
-            pre_file=$(echo "$line" | awk '{print $2}')
-            rpm_line=$(grep -F -- "$pre_file" /tmp/rpm-manifest-all.txt | grep -F " ${pre_file}$" || true)
-            if [ -z "$rpm_line" ]; then
+            hash="${line:0:64}"
+            file="${line:66}"
+            rpm_hashes["$file"]="$hash"
+          done < /tmp/rpm-manifest-all.txt
+
+          # Check every pre-brp file exists in RPM with same hash
+          declare -A pre_brp_files
+          while IFS= read -r line; do
+            pre_hash="${line:0:64}"
+            pre_file="${line:66}"
+            pre_brp_files["$pre_file"]=1
+            rpm_hash="${rpm_hashes[$pre_file]:-}"
+            if [ -z "$rpm_hash" ]; then
               echo "MISSING in RPM: $pre_file"
               MISMATCHED=$((MISMATCHED + 1))
+            elif [ "$pre_hash" != "$rpm_hash" ]; then
+              echo "BRP MODIFIED: $pre_file"
+              echo "  pre-brp: $pre_hash"
+              echo "  RPM:     $rpm_hash"
+              MISMATCHED=$((MISMATCHED + 1))
             else
-              rpm_hash=$(echo "$rpm_line" | awk '{print $1}')
-              if [ "$pre_hash" != "$rpm_hash" ]; then
-                echo "BRP MODIFIED: $pre_file"
-                echo "  pre-brp: $pre_hash"
-                echo "  RPM:     $rpm_hash"
-                MISMATCHED=$((MISMATCHED + 1))
-              else
-                VERIFIED=$((VERIFIED + 1))
-              fi
+              VERIFIED=$((VERIFIED + 1))
             fi
           done < /tmp/pre-brp-manifest.txt
 
           # Report files in RPM but not in pre-brp (brp-generated, e.g. .pyc)
-          while IFS= read -r line; do
-            rpm_file=$(echo "$line" | awk '{print $2}')
-            if ! grep -qF " ${rpm_file}$" /tmp/pre-brp-manifest.txt; then
+          for rpm_file in "${!rpm_hashes[@]}"; do
+            if [ -z "${pre_brp_files[$rpm_file]:-}" ]; then
               echo "EXTRA (brp-generated): $rpm_file"
               EXTRA=$((EXTRA + 1))
             fi
-          done < /tmp/rpm-manifest-all.txt
+          done
 
           rm -rf "$RPM_EXTRACT"
           echo ""
@@ -144,19 +152,19 @@ jobs:
           fi
 
           echo "=== Check 2: pre-brp vs installed files ==="
-          echo "Baseline: pre-brp manifest (files from %install)"
+          echo "Baseline: pre-brp manifest (files from the install section)"
           MISMATCHED=0
           VERIFIED=0
           while IFS= read -r line; do
-            pre_hash=$(echo "$line" | awk '{print $1}')
-            pre_file=$(echo "$line" | awk '{print $2}')
+            pre_hash="${line:0:64}"
+            pre_file="${line:66}"
             # pre_file is like ./opt/agent-sec/... -> installed at /opt/agent-sec/...
             installed_file="${pre_file#.}"
             if [ ! -f "$installed_file" ]; then
               echo "MISSING on disk: $installed_file"
               MISMATCHED=$((MISMATCHED + 1))
             else
-              installed_hash=$(sha256sum "$installed_file" | awk '{print $1}')
+              installed_hash=$(sha256sum "$installed_file" | cut -c1-64)
               if [ "$pre_hash" != "$installed_hash" ]; then
                 echo "INSTALL MODIFIED: $installed_file"
                 echo "  pre-brp:   $pre_hash"

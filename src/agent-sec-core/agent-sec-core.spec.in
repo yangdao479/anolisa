@@ -158,7 +158,7 @@ make install-all-for-rpmbuild DESTDIR=$RPM_BUILD_ROOT
 # Record pre-brp file hashes for integrity verification.
 # brp scripts (strip, mangle-shebangs, bytecompile) run AFTER the install
 # section, so this manifest captures the pristine state before any brp mods.
-(cd $RPM_BUILD_ROOT && find . -type f | sort | xargs sha256sum) > /tmp/pre-brp-manifest.txt
+(cd $RPM_BUILD_ROOT && find . -type f -print0 | sort -z | xargs -0 sha256sum) > /tmp/pre-brp-manifest.txt
 
 %changelog
 * Tue Apr 14 2026 Xingdong Li <XingDong.Li@linux.alibaba.com> - 0.3.0-1
