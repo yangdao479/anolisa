@@ -155,6 +155,11 @@ export QA_RPATHS=$(( 0x0002 | 0x0010 ))
 rm -rf $RPM_BUILD_ROOT
 make install-all-for-rpmbuild DESTDIR=$RPM_BUILD_ROOT
 
+# Record pre-brp file hashes for integrity verification.
+# brp scripts (strip, mangle-shebangs, bytecompile) run AFTER %install,
+# so this manifest captures the pristine state before any brp modifications.
+(cd $RPM_BUILD_ROOT && find . -type f | sort | xargs sha256sum) > /tmp/pre-brp-manifest.txt
+
 %changelog
 * Tue Apr 14 2026 Xingdong Li <XingDong.Li@linux.alibaba.com> - 0.3.0-1
 - Switch agent-sec-cli build to maturin for Rust native extension support
