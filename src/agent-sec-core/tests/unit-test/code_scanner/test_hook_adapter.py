@@ -187,7 +187,7 @@ class TestCoshHook:
 
 
 class TestOpenClawHook:
-    """Integration tests: call `agent-sec-cli code-scan --code ... --language bash`
+    """Integration tests: call `agent-sec-cli scan-code --code ... --language bash`
     and verify ScanResult JSON output (mirrors what index.js does)."""
 
     def _run_scan(self, command: str) -> dict:
@@ -196,7 +196,7 @@ class TestOpenClawHook:
                 sys.executable,
                 "-m",
                 "agent_sec_cli.cli",
-                "code-scan",
+                "scan-code",
                 "--code",
                 command,
                 "--language",
