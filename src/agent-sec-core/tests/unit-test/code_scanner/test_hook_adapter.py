@@ -117,6 +117,30 @@ class TestExtractInlineCode:
         assert code == "whoami"
         assert lang == Language.BASH
 
+    def test_empty_c_content(self) -> None:
+        """bash -c \"\" matches but extracts empty string."""
+        result = extract_inline_code('bash -c ""')
+        assert result is not None
+        code, lang = result
+        assert code == ""
+        assert lang == Language.BASH
+
+    def test_multiple_c_calls_takes_first(self) -> None:
+        """Multiple -c calls — regex search returns the first match."""
+        result = extract_inline_code('bash -c "cmd1" && python3 -c "cmd2"')
+        assert result is not None
+        code, lang = result
+        assert code == "cmd1"
+        assert lang == Language.BASH
+
+    def test_prefix_command_with_python(self) -> None:
+        """Interpreter appearing after cd/export should still match."""
+        result = extract_inline_code('cd /tmp && python3 -c "print(1)"')
+        assert result is not None
+        code, lang = result
+        assert code == "print(1)"
+        assert lang == Language.PYTHON
+
 
 # ---------------------------------------------------------------------------
 # Tests for cosh/hook.py (integration via subprocess of standalone hook script)
