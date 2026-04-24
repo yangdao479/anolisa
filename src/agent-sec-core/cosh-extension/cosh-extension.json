@@ -1,4 +1,20 @@
 {
   "name": "agent-sec-core",
-  "version": "0.3.0"
+  "version": "0.3.0",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "run_shell_command",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 /usr/share/anolisa/extensions/agent-sec-core/hooks/code_scanner_hook.py",
+            "name": "code-scanner",
+            "description": "Scans tool code for security vulnerabilities",
+            "timeout": 5000
+          }
+        ]
+      }
+    ]
+  }
 }
