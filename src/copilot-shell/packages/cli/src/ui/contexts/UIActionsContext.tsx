@@ -14,6 +14,7 @@ import {
   type EditorType,
   type ApprovalMode,
   type AliyunCredentialsExtended,
+  type SkillLevel,
 } from '@copilot-shell/core';
 import { type SettingScope } from '../../config/settings.js';
 import type { AuthState } from '../types.js';
@@ -38,7 +39,7 @@ export interface UIActions {
   ) => Promise<void>;
   handleContinueToBash: () => void;
   setAuthState: (state: AuthState) => void;
-  onAuthError: (error: string) => void;
+  onAuthError: (error: string | null) => void;
   cancelAuthentication: () => void;
   handleEditorSelect: (
     editorType: EditorType | undefined,
@@ -66,6 +67,10 @@ export interface UIActions {
   // Subagent dialogs
   closeSubagentCreateDialog: () => void;
   closeAgentsManagerDialog: () => void;
+  // Skills dialog
+  openSkillsDialog: () => void;
+  closeSkillsDialog: () => void;
+  toggleSkillDisabled: (skillName: string, level: SkillLevel) => Promise<void>;
   // Resume session dialog
   openResumeDialog: () => void;
   closeResumeDialog: () => void;

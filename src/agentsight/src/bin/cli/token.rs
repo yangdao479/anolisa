@@ -120,5 +120,6 @@ fn print_human_readable(
             format_tokens_with_commas(result.output_tokens)
         );
     }
+
 }
 

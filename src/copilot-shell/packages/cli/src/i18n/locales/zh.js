@@ -989,6 +989,15 @@ export default {
   'Failed to authenticate. Message: {{message}}': '认证失败。消息：{{message}}',
   'Authenticated successfully with {{authType}} credentials.':
     '使用 {{authType}} 凭据成功认证。',
+  // OpenAI API key validation errors
+  'Invalid API key. Please check your API key and try again.':
+    '无效的 API 密钥。请检查您的 API 密钥并重试。',
+  'API key does not have permission to access this resource.':
+    'API 密钥没有访问此资源的权限。',
+  'Rate limit exceeded. Please check your quota.':
+    '超出速率限制。请检查您的配额。',
+  'Model "{{model}}" is not available. Please check if the model name is correct.':
+    '模型 "{{model}}" 不可用。请检查模型名称是否正确。',
   'Invalid QWEN_DEFAULT_AUTH_TYPE value: "{{value}}". Valid values are: {{validValues}}':
     '无效的 QWEN_DEFAULT_AUTH_TYPE 值："{{value}}"。有效值为：{{validValues}}',
   'Custom Provider Configuration Required': '需要配置 OpenAI',
@@ -1334,4 +1343,68 @@ export default {
   'Press Enter or wait 2s to continue': '按 Enter 或等待 2 秒继续',
   '↑↓ or j/k to navigate · 1/2/3 select · Enter confirm · Esc cancel':
     '↑↓ 或 j/k 导航 · 1/2/3 选择 · Enter 确认 · Esc 取消',
+  "Set up Copilot Shell's status line UI": '设置 Copilot Shell 的状态栏 UI',
+  'Toggle compact mode': '切换紧凑模式',
+  'Hide tool output and thinking for a cleaner view (toggle with Ctrl+O)':
+    '隐藏工具输出和思考过程，获得更清晰的视图（通过 Ctrl+O 切换）',
+  verbose: '详细',
+  // 导出命令
+  'Export current session message history to a file':
+    '将当前会话消息历史导出到文件',
+  'Export to Markdown format': '导出为 Markdown 格式',
+  'Export to HTML format': '导出为 HTML 格式',
+  'Export to JSON format': '导出为 JSON 格式',
+  'Export to JSONL format': '导出为 JSONL 格式',
+  'Could not determine current working directory.': '无法确定当前工作目录。',
+  'No active session found to export.': '未找到可导出的活跃会话。',
+  'Session exported to markdown: {{filename}}':
+    '会话已导出为 Markdown：{{filename}}',
+  'Session exported to HTML: {{filename}}': '会话已导出为 HTML：{{filename}}',
+  'Session exported to JSON: {{filename}}': '会话已导出为 JSON：{{filename}}',
+  'Session exported to JSONL: {{filename}}': '会话已导出为 JSONL：{{filename}}',
+  'Failed to export session: {{error}}': '导出会话失败：{{error}}',
+  // Clawhub
+  'Manage skills via clawhub CLI': '通过 clawhub CLI 管理技能',
+  'Search skills in the registry': '在注册表中搜索技能',
+  'Install a skill': '安装技能',
+  'Uninstall a skill': '卸载技能',
+  'Update skill(s). Usage: update <slug> | update --all':
+    '更新技能。用法：update <slug> | update --all',
+  'List installed skills': '列出已安装的技能',
+  'View skill details': '查看技能详情',
+  'Login to clawhub': '登录 clawhub',
+  'Usage: /clawhub login <token>': '用法: /clawhub login <token>',
+  'Show current identity': '显示当前身份',
+  'clawhub CLI is not installed. Install it now via npm install -g clawhub?':
+    'clawhub CLI 尚未安装。是否立即通过 npm install -g clawhub 安装？',
+  'Installing clawhub via npm install -g clawhub …':
+    '正在通过 npm install -g clawhub 安装……',
+  'clawhub installed successfully.': 'clawhub 安装成功。',
+  'Failed to install clawhub: {{error}}\nPlease install manually: npm install -g clawhub':
+    'clawhub 安装失败：{{error}}\n请手动安装：npm install -g clawhub',
+  'clawhub exited with code {{code}}.': 'clawhub 退出，退出码 {{code}}。',
+  'Hint: Run `clawhub login` to authenticate and bypass rate limits.':
+    '提示：运行 `clawhub login` 进行认证以绕过速率限制。',
+  'No results.': '无结果。',
+  'Command completed successfully.': '命令执行成功。',
+  'Clawhub Search': 'Clawhub 搜索',
+  'Clawhub Install': 'Clawhub 安装',
+  'Clawhub Uninstall': 'Clawhub 卸载',
+  'Clawhub Update': 'Clawhub 更新',
+  'Clawhub Installed Skills': 'Clawhub 已安装技能',
+  'Clawhub Inspect': 'Clawhub 详情',
+  'Clawhub Login': 'Clawhub 登录',
+  'Clawhub Identity': 'Clawhub 身份',
+  'Usage: /clawhub <subcommand> [args]': '用法：/clawhub <子命令> [参数]',
+  'Subcommands:': '子命令：',
+  'Search skills in the registry (subcommand help)':
+    '  search <关键词>        在注册表中搜索技能',
+  'Install a skill (subcommand help)': '  install <slug>          安装技能',
+  'Uninstall a skill (subcommand help)': '  uninstall <slug>        卸载技能',
+  'Update skills (subcommand help)': '  update <slug|--all>     更新技能',
+  'List installed skills (subcommand help)':
+    '  list                    列出已安装技能',
+  'View details (subcommand help)': '  inspect <slug>          查看技能详情',
+  'Login (subcommand help)': '  login <token>           登录 clawhub',
+  'Show identity (subcommand help)': '  whoami                  显示当前身份',
 };

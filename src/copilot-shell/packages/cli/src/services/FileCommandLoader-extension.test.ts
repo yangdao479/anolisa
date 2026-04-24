@@ -8,8 +8,10 @@ import { describe, it, expect, afterEach, vi } from 'vitest';
 import * as path from 'node:path';
 import mock from 'mock-fs';
 import { FileCommandLoader } from './FileCommandLoader.js';
+import { _spawnImpl } from './command-factory.js';
 import type { Config } from '@copilot-shell/core';
 import { Storage } from '@copilot-shell/core';
+import type { MessageActionReturn } from '../ui/commands/types.js';
 
 describe('FileCommandLoader - Extension Commands Support', () => {
   const projectRoot = '/test/project';
@@ -353,5 +355,177 @@ describe('FileCommandLoader - Extension Commands Support', () => {
     // Extensions are sorted alphabetically, so ext-a comes before ext-b
     expect(commands[0].extensionName).toBe('ext-a');
     expect(commands[1].extensionName).toBe('ext-b');
+  });
+
+  it('regression: cosh-extension.json + run command substitutes ${extensionPath} and omits $ prefix by default', async () => {
+    const extensionDir = path.join(
+      projectRoot,
+      '.copilot-shell',
+      'extensions',
+      'cosh-ext',
+    );
+
+    mock({
+      [userCommandsDir]: {},
+      [projectCommandsDir]: {},
+      [extensionDir]: {
+        'cosh-extension.json': JSON.stringify({
+          name: 'cosh-ext',
+          version: '1.0.0',
+        }),
+        commands: {
+          // ${extensionPath} should be replaced with the real extension dir path
+          'status.toml': 'run = "echo ${extensionPath}/status"\n',
+        },
+      },
+    });
+
+    const mockConfig = {
+      getFolderTrustFeature: vi.fn(() => false),
+      getFolderTrust: vi.fn(() => true),
+      getProjectRoot: vi.fn(() => projectRoot),
+      storage: new Storage(projectRoot),
+      getExtensions: vi.fn(() => [
+        {
+          id: 'cosh-ext',
+          config: { name: 'cosh-ext', version: '1.0.0' },
+          contextFiles: [],
+          name: 'cosh-ext',
+          version: '1.0.0',
+          isActive: true,
+          path: extensionDir,
+        },
+      ]),
+    } as unknown as Config;
+
+    const loader = new FileCommandLoader(mockConfig);
+    const commands = await loader.loadCommands(new AbortController().signal);
+    expect(commands).toHaveLength(1);
+
+    // Set up a fake spawn that captures the shell command and controls lifecycle
+    let capturedCmd = '';
+    const procHandlers: Record<string, Array<(arg: unknown) => void>> = {};
+    const fakeStream = { on: vi.fn(), destroy: vi.fn() };
+    const fakeProc = {
+      stdout: fakeStream,
+      stderr: fakeStream,
+      on(ev: string, cb: (arg: unknown) => void) {
+        procHandlers[ev] = [...(procHandlers[ev] ?? []), cb];
+        return this;
+      },
+      kill: vi.fn(),
+    };
+    const spawnSpy = vi
+      .spyOn(_spawnImpl, 'fn')
+      .mockImplementation((_shell, args) => {
+        capturedCmd = (args as string[])[1]; // sh -c <command>
+        return fakeProc as never;
+      });
+
+    const actionPromise = commands[0].action!(
+      null as never,
+      '',
+    ) as Promise<MessageActionReturn>;
+
+    // All proc.on handlers are now registered; trigger close(0)
+    (procHandlers['close'] ?? []).forEach((h) => h(0));
+    const result = await actionPromise;
+
+    // ${extensionPath} must be substituted with the actual extension directory
+    expect(capturedCmd).toBe(`echo ${extensionDir}/status`);
+
+    // show_command defaults to false — no $ prefix in output
+    expect(result.content).not.toContain('$');
+
+    spawnSpy.mockRestore();
+  });
+
+  it('run mode substitutes {{args}} at execution time, not at load time', async () => {
+    const extensionDir = path.join(
+      projectRoot,
+      '.copilot-shell',
+      'extensions',
+      'args-ext',
+    );
+
+    mock({
+      [userCommandsDir]: {},
+      [projectCommandsDir]: {},
+      [extensionDir]: {
+        'cosh-extension.json': JSON.stringify({
+          name: 'args-ext',
+          version: '1.0.0',
+        }),
+        commands: {
+          'greet.toml': 'run = "echo hello {{args}}"\n',
+        },
+      },
+    });
+
+    const mockConfig = {
+      getFolderTrustFeature: vi.fn(() => false),
+      getFolderTrust: vi.fn(() => true),
+      getProjectRoot: vi.fn(() => projectRoot),
+      storage: new Storage(projectRoot),
+      getExtensions: vi.fn(() => [
+        {
+          id: 'args-ext',
+          config: { name: 'args-ext', version: '1.0.0' },
+          contextFiles: [],
+          name: 'args-ext',
+          version: '1.0.0',
+          isActive: true,
+          path: extensionDir,
+        },
+      ]),
+    } as unknown as Config;
+
+    const loader = new FileCommandLoader(mockConfig);
+    const commands = await loader.loadCommands(new AbortController().signal);
+    expect(commands).toHaveLength(1);
+
+    // Set up a fake spawn that captures the exact shell command
+    let capturedCmd = '';
+    const procHandlers: Record<string, Array<(arg: unknown) => void>> = {};
+    const fakeStream = { on: vi.fn(), destroy: vi.fn() };
+    const fakeProc = {
+      stdout: fakeStream,
+      stderr: fakeStream,
+      on(ev: string, cb: (arg: unknown) => void) {
+        procHandlers[ev] = [...(procHandlers[ev] ?? []), cb];
+        return this;
+      },
+      kill: vi.fn(),
+    };
+    const spawnSpy = vi
+      .spyOn(_spawnImpl, 'fn')
+      .mockImplementation((_shell, args) => {
+        capturedCmd = (args as string[])[1];
+        return fakeProc as never;
+      });
+
+    // Invoke with actual user args: 'world'
+    const actionPromise = commands[0].action!(
+      null as never,
+      'world',
+    ) as Promise<MessageActionReturn>;
+
+    (procHandlers['close'] ?? []).forEach((h) => h(0));
+    await actionPromise;
+
+    // {{args}} must be replaced with 'world' at execution time
+    expect(capturedCmd).toBe('echo hello world');
+
+    // Call again with different args to prove it's runtime substitution
+    capturedCmd = '';
+    const actionPromise2 = commands[0].action!(
+      null as never,
+      'alice bob',
+    ) as Promise<MessageActionReturn>;
+    (procHandlers['close'] ?? []).forEach((h) => h(0));
+    await actionPromise2;
+    expect(capturedCmd).toBe('echo hello alice bob');
+
+    spawnSpy.mockRestore();
   });
 });

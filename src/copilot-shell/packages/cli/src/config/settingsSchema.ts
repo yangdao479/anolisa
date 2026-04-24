@@ -289,6 +289,17 @@ const SETTINGS_SCHEMA = {
         description: 'The color theme for the UI.',
         showInDialog: true,
       },
+      statusLine: {
+        type: 'object',
+        label: 'Status Line',
+        category: 'UI',
+        requiresRestart: false,
+        default: undefined as
+          | { type: 'command'; command: string; padding?: number }
+          | undefined,
+        description: 'Custom status line display configuration.',
+        showInDialog: true,
+      },
       customThemes: {
         type: 'object',
         label: 'Custom Themes',
@@ -420,6 +431,16 @@ const SETTINGS_SCHEMA = {
         requiresRestart: false,
         default: 0,
         description: 'The last time the feedback dialog was shown.',
+        showInDialog: false,
+      },
+      compactMode: {
+        type: 'boolean',
+        label: 'Compact Mode',
+        category: 'UI',
+        requiresRestart: false,
+        default: false,
+        description:
+          'Hide tool output and thinking for a cleaner view (toggle with Ctrl+O).',
         showInDialog: false,
       },
     },
@@ -1160,6 +1181,29 @@ const SETTINGS_SCHEMA = {
       | undefined,
     description: 'Configuration for web search providers.',
     showInDialog: false,
+  },
+
+  clawhub: {
+    type: 'object',
+    label: 'Clawhub',
+    category: 'Skills',
+    requiresRestart: false,
+    default: {},
+    description:
+      'Configuration for the clawhub skill management CLI. Defaults to https://cn.clawhub-mirror.com.',
+    showInDialog: false,
+    properties: {
+      registry: {
+        type: 'string',
+        label: 'Clawhub Registry',
+        category: 'Skills',
+        requiresRestart: false,
+        default: undefined as string | undefined,
+        description:
+          'Registry URL for clawhub commands (search, install, update, etc.). Defaults to https://cn.clawhub-mirror.com if not set.',
+        showInDialog: false,
+      },
+    },
   },
 
   experimental: {

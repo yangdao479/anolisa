@@ -301,6 +301,42 @@ async function installAction(context: CommandContext, args: string) {
       },
       Date.now(),
     );
+    // Full cache refresh pipeline: reload extensions from disk first so that
+    // the newly installed extension's skills/agents and commands are picked up,
+    // then refresh skill and subagent caches so /skills and /agents reflect the
+    // change immediately without requiring a restart.
+    try {
+      // Step 1: Reload extension cache from disk (ensures the new extension
+      // and its skills/agents are present with the correct isActive state).
+      await extensionManager.refreshCache();
+
+      // Step 2: Propagate into skill and subagent caches.
+      const config = context.services.config;
+      if (config) {
+        await config.getSkillManager()?.refreshCache();
+        await config.getSubagentManager().refreshCache();
+      }
+    } catch (cacheErr) {
+      console.warn(
+        '[extensions] skill/subagent cache refresh failed after install:',
+        cacheErr,
+      );
+    }
+    // Hook rebuild is best-effort: failure must not make install appear to fail.
+    try {
+      const hookSystem = context.services.config?.getHookSystem?.();
+      if (hookSystem && extension.hooks) {
+        await hookSystem.initialize();
+      }
+    } catch (hookErr) {
+      console.warn(
+        '[extensions] hook re-initialization failed after install:',
+        hookErr,
+      );
+    }
+    // Reload commands AFTER all async cache operations complete, so the
+    // FileCommandLoader sees a fully-populated extensionCache rather than
+    // a partially-rebuilt one (refreshCache() clears then repopulates).
     // FIXME: refresh command controlled by ui for now, cannot be auto refreshed by extensionManager
     context.ui.reloadCommands();
   } catch (error) {
@@ -356,6 +392,30 @@ async function uninstallAction(context: CommandContext, args: string) {
       },
       Date.now(),
     );
+    // Cache refresh is unconditional: keeps disk state consistent even when the
+    // hook system is unavailable. Hook rebuild is best-effort afterwards.
+    // Each step has its own catch so the warn message accurately identifies the
+    // failing step and does not mask a refreshCache error as a hook-init error.
+    try {
+      await extensionManager.refreshCache();
+    } catch (cacheErr) {
+      console.warn(
+        '[extensions] cache refresh failed after uninstall:',
+        cacheErr,
+      );
+    }
+    try {
+      const hookSystem = context.services.config?.getHookSystem?.();
+      if (hookSystem) {
+        await hookSystem.initialize();
+      }
+    } catch (hookErr) {
+      console.warn(
+        '[extensions] hook re-initialization failed after uninstall:',
+        hookErr,
+      );
+    }
+    // Reload commands AFTER all async cache operations complete.
     context.ui.reloadCommands();
   } catch (error) {
     context.ui.addItem(
@@ -477,6 +537,15 @@ async function disableAction(context: CommandContext, args: string) {
     );
     context.ui.reloadCommands();
   }
+  // Re-initialize the hook system so disabled extensions' hooks are removed
+  // from the registry. HookRegistry.initialize() clears entries before
+  // reloading, so calling it again is idempotent and safe.
+  // Best-effort: hook registry failure must not surface as a disable failure.
+  try {
+    await context.services.config?.getHookSystem()?.initialize();
+  } catch (e) {
+    console.warn('Hook registry re-initialization failed after disable:', e);
+  }
 }
 
 async function enableAction(context: CommandContext, args: string) {
@@ -497,6 +566,14 @@ async function enableAction(context: CommandContext, args: string) {
       Date.now(),
     );
     context.ui.reloadCommands();
+  }
+  // Re-initialize the hook system so newly enabled extensions' hooks are
+  // reflected in the registry immediately.
+  // Best-effort: hook registry failure must not surface as an enable failure.
+  try {
+    await context.services.config?.getHookSystem()?.initialize();
+  } catch (e) {
+    console.warn('Hook registry re-initialization failed after enable:', e);
   }
 }
 

@@ -5,7 +5,7 @@
 #   ./scripts/rpm-build.sh <package>        Build a single package
 #   ./scripts/rpm-build.sh all              Build all packages
 #
-# Packages: copilot-shell, agent-sec-core, anolisa-skills, agentsight
+# Packages: copilot-shell, agent-sec-core, os-skills, agentsight, tokenless
 #
 # Environment variables:
 #   VERSION    Override version for .spec.in templates (default: auto-detect)
@@ -24,6 +24,7 @@ SHELL_DIR="${ROOT_DIR}/src/copilot-shell"
 SEC_DIR="${ROOT_DIR}/src/agent-sec-core"
 SKILLS_DIR="${ROOT_DIR}/src/os-skills"
 SIGHT_DIR="${ROOT_DIR}/src/agentsight"
+TOKEN_DIR="${ROOT_DIR}/src/tokenless"
 
 # Colors
 RED='\033[0;31m'
@@ -250,14 +251,14 @@ build_agent_sec_core() {
 }
 
 # =============================================================================
-# anolisa-skills
+# os-skills
 # =============================================================================
 build_agentic_os_skills() {
     log "=========================================="
-    log "Building RPM: anolisa-skills"
+    log "Building RPM: os-skills"
     log "=========================================="
 
-    local spec_in="${SKILLS_DIR}/anolisa-skills.spec.in"
+    local spec_in="${SKILLS_DIR}/os-skills.spec.in"
     if [ ! -f "$spec_in" ]; then
         err "Spec template not found: $spec_in"
         return 1
@@ -271,7 +272,7 @@ build_agentic_os_skills() {
     fi
     if [ -z "$version" ]; then
         version="0.0.1"
-        warn "No version specified for anolisa-skills, using default: ${version}"
+        warn "No version specified for os-skills, using default: ${version}"
     fi
 
     local pkg_name
@@ -309,7 +310,7 @@ build_agentic_os_skills() {
         --define "_topdir ${BUILD_DIR}" \
         "$spec_file"
 
-    ok "anolisa-skills RPM built successfully"
+    ok "os-skills RPM built successfully"
 }
 
 # =============================================================================
@@ -320,16 +321,28 @@ build_agentsight() {
     log "Building RPM: agentsight"
     log "=========================================="
 
-    local spec_file="${SIGHT_DIR}/agentsight.spec"
-    if [ ! -f "$spec_file" ]; then
-        err "Spec file not found: $spec_file"
+    local spec_in="${SIGHT_DIR}/agentsight.spec.in"
+    if [ ! -f "$spec_in" ]; then
+        err "Spec template not found: $spec_in"
         return 1
     fi
 
-    local pkg_name pkg_version
-    pkg_name=$(parse_spec_name "$spec_file")
-    pkg_version=$(parse_spec_version "$spec_file")
-    local tarball_name="${pkg_name}-${pkg_version}.tar.gz"
+    # Version from env or Cargo.toml
+    local version="${VERSION:-}"
+    if [ -z "$version" ]; then
+        version=$(grep -m1 '^version' "${SIGHT_DIR}/Cargo.toml" | sed 's/version = "\(.*\)"/\1/' 2>/dev/null || true)
+    fi
+    if [ -z "$version" ]; then
+        version=$(grep -m1 -oE '[0-9]+\.[0-9]+\.[0-9]+' "$spec_in" | head -1)
+    fi
+    if [ -z "$version" ]; then
+        version="0.0.1"
+        warn "No version specified for agentsight, using default: ${version}"
+    fi
+
+    local pkg_name
+    pkg_name=$(parse_spec_name "$spec_in")
+    local tarball_name="${pkg_name}-${version}.tar.gz"
 
     log "Step 1/3: Building agentsight..."
     if ! command -v clang &>/dev/null; then
@@ -341,12 +354,14 @@ build_agentsight() {
         cargo build --release
     )
 
+    # Step 2: Process spec template and create tarball
     log "Step 2/3: Preparing spec and source tarball..."
-    cp "$spec_file" "${BUILD_DIR}/SPECS/"
+    local spec_file
+    spec_file=$(process_spec_template "$spec_in" "$version")
 
     local tmp_dir
     tmp_dir=$(mktemp -d)
-    local pkg_dir="${tmp_dir}/${pkg_name}-${pkg_version}"
+    local pkg_dir="${tmp_dir}/${pkg_name}-${version}"
     mkdir -p "$pkg_dir"
 
     # Copy relevant files
@@ -355,15 +370,98 @@ build_agentsight() {
     [ -f "${SIGHT_DIR}/README_CN.md" ] && cp "${SIGHT_DIR}/README_CN.md" "$pkg_dir/"
     [ -f "${SIGHT_DIR}/LICENSE" ] && cp "${SIGHT_DIR}/LICENSE" "$pkg_dir/"
 
+    tar -czf "${BUILD_DIR}/SOURCES/${tarball_name}" -C "$tmp_dir" "${pkg_name}-${version}"
+    rm -rf "$tmp_dir"
+
+    log "Step 3/3: Running rpmbuild..."
+    "$RPMBUILD" -ba --nodeps \
+        --define "_topdir ${BUILD_DIR}" \
+        "$spec_file"
+
+    ok "agentsight RPM built successfully"
+}
+
+# =============================================================================
+# tokenless
+# =============================================================================
+build_tokenless() {
+    log "=========================================="
+    log "Building RPM: tokenless"
+    log "=========================================="
+
+    local spec_file="${TOKEN_DIR}/tokenless.spec"
+    if [ ! -f "$spec_file" ]; then
+        err "Spec file not found: $spec_file"
+        return 1
+    fi
+
+    local pkg_name pkg_version
+    pkg_name=$(parse_spec_name "$spec_file")
+    pkg_version=$(parse_spec_version "$spec_file")
+    local tarball_name="${pkg_name}-${pkg_version}.tar.gz"
+
+    log "Step 1/3: Building tokenless and rtk..."
+    (
+        cd "$TOKEN_DIR"
+        # Initialize submodules if not already done
+        if [ ! -d "third_party/rtk/.git" ]; then
+            log "Initializing git submodules..."
+            git submodule update --init --recursive
+        fi
+        # Build tokenless
+        cargo build --release --workspace
+        # Build rtk from submodule
+        cargo build --release --manifest-path third_party/rtk/Cargo.toml
+    )
+
+    log "Step 2/3: Preparing spec and source tarball..."
+    cp "$spec_file" "${BUILD_DIR}/SPECS/"
+
+    local tmp_dir
+    tmp_dir=$(mktemp -d)
+    local pkg_dir="${tmp_dir}/${pkg_name}-${pkg_version}"
+    mkdir -p "$pkg_dir"/{openclaw,hooks/copilot-shell,scripts}
+
+    # Copy binaries
+    cp -rp "${TOKEN_DIR}/target/release/tokenless" "$pkg_dir/" 2>/dev/null || warn "tokenless binary missing"
+    cp -rp "${TOKEN_DIR}/third_party/rtk/target/release/rtk" "$pkg_dir/" 2>/dev/null || warn "rtk binary missing"
+
+    # Copy documentation (user manuals from docs/ directory)
+    mkdir -p "$pkg_dir/docs"
+    [ -f "${TOKEN_DIR}/docs/tokenless-user-manual-en.md" ] && cp "${TOKEN_DIR}/docs/tokenless-user-manual-en.md" "$pkg_dir/docs/"
+    [ -f "${TOKEN_DIR}/docs/tokenless-user-manual-zh.md" ] && cp "${TOKEN_DIR}/docs/tokenless-user-manual-zh.md" "$pkg_dir/docs/"
+    [ -f "${TOKEN_DIR}/docs/response-compression.md" ] && cp "${TOKEN_DIR}/docs/response-compression.md" "$pkg_dir/docs/"
+    # LICENSE from project root
+    [ -f "${TOKEN_DIR}/LICENSE" ] && cp "${TOKEN_DIR}/LICENSE" "$pkg_dir/docs/" || \
+    [ -f "${ROOT_DIR}/LICENSE" ] && cp "${ROOT_DIR}/LICENSE" "$pkg_dir/docs/"
+
+    # Copy OpenClaw plugin files
+    [ -f "${TOKEN_DIR}/openclaw/index.ts" ] && cp "${TOKEN_DIR}/openclaw/index.ts" "$pkg_dir/openclaw/"
+    [ -f "${TOKEN_DIR}/openclaw/openclaw.plugin.json" ] && cp "${TOKEN_DIR}/openclaw/openclaw.plugin.json" "$pkg_dir/openclaw/"
+    [ -f "${TOKEN_DIR}/openclaw/package.json" ] && cp "${TOKEN_DIR}/openclaw/package.json" "$pkg_dir/openclaw/"
+    [ -f "${TOKEN_DIR}/openclaw/README.md" ] && cp "${TOKEN_DIR}/openclaw/README.md" "$pkg_dir/openclaw/"
+
+    # Copy copilot-shell hook files (preserve permissions)
+    if [ -d "${TOKEN_DIR}/hooks/copilot-shell" ]; then
+        cp -p "${TOKEN_DIR}/hooks/copilot-shell"/* "$pkg_dir/hooks/copilot-shell/" 2>/dev/null || warn "Hook files missing"
+        chmod 0755 "$pkg_dir/hooks/copilot-shell"/tokenless-*.sh 2>/dev/null || true
+    fi
+
+    # Copy installation script (preserve permissions)
+    if [ -f "${TOKEN_DIR}/scripts/install.sh" ]; then
+        cp -p "${TOKEN_DIR}/scripts/install.sh" "$pkg_dir/scripts/"
+        chmod 0755 "$pkg_dir/scripts/install.sh"
+    fi
+
     tar -czf "${BUILD_DIR}/SOURCES/${tarball_name}" -C "$tmp_dir" "${pkg_name}-${pkg_version}"
     rm -rf "$tmp_dir"
 
     log "Step 3/3: Running rpmbuild..."
     "$RPMBUILD" -ba --nodeps \
         --define "_topdir ${BUILD_DIR}" \
-        "${BUILD_DIR}/SPECS/agentsight.spec"
+        "${BUILD_DIR}/SPECS/tokenless.spec"
 
-    ok "agentsight RPM built successfully"
+    ok "tokenless RPM built successfully"
 }
 
 # =============================================================================
@@ -375,8 +473,9 @@ usage() {
     echo "Packages:"
     echo "  copilot-shell       Build copilot-shell RPM"
     echo "  agent-sec-core      Build agent-sec-core RPM"
-    echo "  anolisa-skills   Build anolisa-skills RPM"
+    echo "  os-skills           Build os-skills RPM"
     echo "  agentsight          Build agentsight RPM"
+    echo "  tokenless           Build tokenless RPM"
     echo "  all                 Build all RPM packages"
     echo ""
     echo "Environment variables:"
@@ -408,17 +507,21 @@ case "$TARGET" in
     agent-sec-core)
         build_agent_sec_core
         ;;
-    anolisa-skills)
+    os-skills)
         build_agentic_os_skills
         ;;
     agentsight)
         build_agentsight
+        ;;
+    tokenless)
+        build_tokenless
         ;;
     all)
         build_copilot_shell
         build_agent_sec_core
         build_agentic_os_skills
         build_agentsight
+        build_tokenless
         ;;
     *)
         err "Unknown package: $TARGET"

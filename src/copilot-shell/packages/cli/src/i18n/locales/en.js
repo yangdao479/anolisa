@@ -1044,6 +1044,15 @@ export default {
     'Failed to authenticate. Message: {{message}}',
   'Authenticated successfully with {{authType}} credentials.':
     'Authenticated successfully with {{authType}} credentials.',
+  // OpenAI API key validation errors
+  'Invalid API key. Please check your API key and try again.':
+    'Invalid API key. Please check your API key and try again.',
+  'API key does not have permission to access this resource.':
+    'API key does not have permission to access this resource.',
+  'Rate limit exceeded. Please check your quota.':
+    'Rate limit exceeded. Please check your quota.',
+  'Model "{{model}}" is not available. Please check if the model name is correct.':
+    'Model "{{model}}" is not available. Please check if the model name is correct.',
   'Invalid QWEN_DEFAULT_AUTH_TYPE value: "{{value}}". Valid values are: {{validValues}}':
     'Invalid QWEN_DEFAULT_AUTH_TYPE value: "{{value}}". Valid values are: {{validValues}}',
   'Custom Provider Configuration Required':
@@ -1503,4 +1512,78 @@ export default {
   'Press Enter or wait 2s to continue': 'Press Enter or wait 2s to continue',
   '↑↓ or j/k to navigate · 1/2/3 select · Enter confirm · Esc cancel':
     '↑↓ or j/k to navigate · 1/2/3 select · Enter confirm · Esc cancel',
+  "Set up Copilot Shell's status line UI":
+    "Set up Copilot Shell's status line UI",
+  'Toggle compact mode': 'Toggle compact mode',
+  'Hide tool output and thinking for a cleaner view (toggle with Ctrl+O)':
+    'Hide tool output and thinking for a cleaner view (toggle with Ctrl+O)',
+  verbose: 'verbose',
+  // Export command
+  'Export current session message history to a file':
+    'Export current session message history to a file',
+  'Export to Markdown format': 'Export to Markdown format',
+  'Export to HTML format': 'Export to HTML format',
+  'Export to JSON format': 'Export to JSON format',
+  'Export to JSONL format': 'Export to JSONL format',
+  'Could not determine current working directory.':
+    'Could not determine current working directory.',
+  'No active session found to export.': 'No active session found to export.',
+  'Session exported to markdown: {{filename}}':
+    'Session exported to markdown: {{filename}}',
+  'Session exported to HTML: {{filename}}':
+    'Session exported to HTML: {{filename}}',
+  'Session exported to JSON: {{filename}}':
+    'Session exported to JSON: {{filename}}',
+  'Session exported to JSONL: {{filename}}':
+    'Session exported to JSONL: {{filename}}',
+  'Failed to export session: {{error}}': 'Failed to export session: {{error}}',
+  // Clawhub
+  'Manage skills via clawhub CLI': 'Manage skills via clawhub CLI',
+  'Search skills in the registry': 'Search skills in the registry',
+  'Install a skill': 'Install a skill',
+  'Uninstall a skill': 'Uninstall a skill',
+  'Update skill(s). Usage: update <slug> | update --all':
+    'Update skill(s). Usage: update <slug> | update --all',
+  'List installed skills': 'List installed skills',
+  'View skill details': 'View skill details',
+  'Login to clawhub': 'Login to clawhub',
+  'Usage: /clawhub login <token>': 'Usage: /clawhub login <token>',
+  'Show current identity': 'Show current identity',
+  'clawhub CLI is not installed. Install it now via npm install -g clawhub?':
+    'clawhub CLI is not installed. Install it now via npm install -g clawhub?',
+  'Installing clawhub via npm install -g clawhub …':
+    'Installing clawhub via npm install -g clawhub …',
+  'clawhub installed successfully.': 'clawhub installed successfully.',
+  'Failed to install clawhub: {{error}}\nPlease install manually: npm install -g clawhub':
+    'Failed to install clawhub: {{error}}\nPlease install manually: npm install -g clawhub',
+  'clawhub exited with code {{code}}.': 'clawhub exited with code {{code}}.',
+  'Hint: Run `clawhub login` to authenticate and bypass rate limits.':
+    'Hint: Run `clawhub login` to authenticate and bypass rate limits.',
+  'No results.': 'No results.',
+  'Command completed successfully.': 'Command completed successfully.',
+  'Clawhub Search': 'Clawhub Search',
+  'Clawhub Install': 'Clawhub Install',
+  'Clawhub Uninstall': 'Clawhub Uninstall',
+  'Clawhub Update': 'Clawhub Update',
+  'Clawhub Installed Skills': 'Clawhub Installed Skills',
+  'Clawhub Inspect': 'Clawhub Inspect',
+  'Clawhub Login': 'Clawhub Login',
+  'Clawhub Identity': 'Clawhub Identity',
+  'Usage: /clawhub <subcommand> [args]': 'Usage: /clawhub <subcommand> [args]',
+  'Subcommands:': 'Subcommands:',
+  'Search skills in the registry (subcommand help)':
+    '  search <keyword>        Search skills in the registry',
+  'Install a skill (subcommand help)':
+    '  install <slug>          Install a skill',
+  'Uninstall a skill (subcommand help)':
+    '  uninstall <slug>        Uninstall a skill',
+  'Update skills (subcommand help)':
+    '  update <slug|--all>     Update skill(s)',
+  'List installed skills (subcommand help)':
+    '  list                    List installed skills',
+  'View details (subcommand help)':
+    '  inspect <slug>          View skill details',
+  'Login (subcommand help)': '  login <token>           Login to clawhub',
+  'Show identity (subcommand help)':
+    '  whoami                  Show current identity',
 };

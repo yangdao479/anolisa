@@ -51,6 +51,7 @@ import { WelcomeBackDialog } from './WelcomeBackDialog.js';
 import { ModelSwitchDialog } from './ModelSwitchDialog.js';
 import { AgentCreationWizard } from './subagents/create/AgentCreationWizard.js';
 import { AgentsManagerDialog } from './subagents/manage/AgentsManagerDialog.js';
+import { SkillsDialog } from './SkillsDialog.js';
 import { SessionPicker } from './SessionPicker.js';
 import {
   readOpenClawConfig,
@@ -344,7 +345,15 @@ export const DialogManager = ({
     return <ModelSwitchDialog onSelect={uiActions.handleVisionSwitchSelect} />;
   }
 
-  if (uiState.isAuthDialogOpen || uiState.authError) {
+  // For OpenAI authentication, show errors in OpenAIKeyPrompt instead of AuthDialog
+  // So we check if user is authenticating with OpenAI before rendering AuthDialog
+  const isOpenAIAuthenticating =
+    uiState.isAuthenticating && uiState.pendingAuthType === AuthType.USE_OPENAI;
+
+  if (
+    uiState.isAuthDialogOpen ||
+    (uiState.authError && !isOpenAIAuthenticating)
+  ) {
     return (
       <Box flexDirection="column">
         <AuthDialog />
@@ -432,6 +441,8 @@ export const DialogManager = ({
       return (
         <OpenAIKeyPrompt
           onSubmit={(apiKey, baseUrl, model) => {
+            // Clear previous auth error before submitting new credentials
+            uiActions.onAuthError(null);
             uiActions.handleAuthSelect(AuthType.USE_OPENAI, {
               apiKey,
               baseUrl,
@@ -445,6 +456,7 @@ export const DialogManager = ({
           defaultApiKey={defaults.apiKey}
           defaultBaseUrl={defaults.baseUrl}
           defaultModel={defaults.model}
+          authError={uiState.authError}
         />
       );
     }
@@ -556,6 +568,21 @@ export const DialogManager = ({
         currentBranch={uiState.branchName}
         onSelect={uiActions.handleResume}
         onCancel={uiActions.closeResumeDialog}
+      />
+    );
+  }
+
+  if (uiState.isSkillsDialogOpen) {
+    return (
+      <SkillsDialog
+        skillsByLevel={uiState.skillsByLevel}
+        onToggle={uiActions.toggleSkillDisabled}
+        onInvoke={(skillName) => {
+          uiActions.closeSkillsDialog();
+          uiActions.handleFinalSubmit(`/skills ${skillName}`);
+        }}
+        onClose={uiActions.closeSkillsDialog}
+        isLoading={uiState.isSkillsLoading}
       />
     );
   }

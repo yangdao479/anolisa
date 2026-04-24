@@ -202,6 +202,9 @@ export interface ToolDefinition {
 
 export interface SkillDefinition {
   name: string;
+  description?: string;
+  level?: import('@copilot-shell/core').SkillLevel;
+  disabled?: boolean;
 }
 
 export type HistoryItemToolsList = HistoryItemBase & {
@@ -210,9 +213,18 @@ export type HistoryItemToolsList = HistoryItemBase & {
   showDescriptions: boolean;
 };
 
-export type HistoryItemSkillsList = HistoryItemBase & {
-  type: 'skills_list';
-  skills: SkillDefinition[];
+export interface ClawhubResultItem {
+  slug: string;
+  description: string;
+  score?: string;
+}
+
+export type HistoryItemClawhubOutput = HistoryItemBase & {
+  type: 'clawhub_output';
+  title: string;
+  items?: ClawhubResultItem[];
+  text?: string;
+  isError?: boolean;
 };
 
 // JSON-friendly types for using as a simple data model showing info about an
@@ -276,7 +288,7 @@ export type HistoryItemWithoutId =
   | HistoryItemCompression
   | HistoryItemExtensionsList
   | HistoryItemToolsList
-  | HistoryItemSkillsList
+  | HistoryItemClawhubOutput
   | HistoryItemMcpStatus;
 
 export type HistoryItem = HistoryItemWithoutId & { id: number };
@@ -298,7 +310,7 @@ export enum MessageType {
   SUMMARY = 'summary',
   EXTENSIONS_LIST = 'extensions_list',
   TOOLS_LIST = 'tools_list',
-  SKILLS_LIST = 'skills_list',
+  CLAWHUB_OUTPUT = 'clawhub_output',
   MCP_STATUS = 'mcp_status',
 }
 
