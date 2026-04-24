@@ -1,6 +1,7 @@
 name: sec-core-rpmbuild
 
 on:
+  push:
   pull_request:
     branches:
       - 'release/agent-sec-core/**'
