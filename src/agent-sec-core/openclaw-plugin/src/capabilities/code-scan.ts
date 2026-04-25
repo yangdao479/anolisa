@@ -38,6 +38,10 @@ export const codeScan: SecurityCapability = {
         const msg = `[code-scanner] Detected ${findings.length} issue(s):\n${descs.join("\n")}\n\nCommand: ${command}`;
 
         if (verdict === "deny") {
+          if (!ctx?.gateway) {
+            api.logger.info(`[scan-code] 🚫 DENY — no gateway, auto-allowing`);
+            return undefined;
+          }
           api.logger.info(`[scan-code] 🚫 DENY — requiring user approval`);
           return {
             requireApproval: {
@@ -49,6 +53,10 @@ export const codeScan: SecurityCapability = {
         }
 
         if (verdict === "warn") {
+          if (!ctx?.gateway) {
+            api.logger.info(`[scan-code] ⚠️ WARN — no gateway, auto-allowing`);
+            return undefined;
+          }
           api.logger.info(`[scan-code] ⚠️ WARN — requiring user approval`);
           return {
             requireApproval: {
