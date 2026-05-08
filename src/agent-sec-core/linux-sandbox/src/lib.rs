@@ -4,6 +4,7 @@
 //! - in-process restrictions (`no_new_privs` + seccomp), and
 //! - bubblewrap for filesystem isolation.
 
+pub mod demo_coverage;
 pub mod error;
 pub mod path;
 pub mod policy;
