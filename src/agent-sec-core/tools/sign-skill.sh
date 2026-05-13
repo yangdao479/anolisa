@@ -54,8 +54,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 AGENT_SEC_CORE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # Default path for trusted public keys in the verifier package data.
-DEFAULT_TRUSTED_KEYS_DIR="$AGENT_SEC_CORE_DIR/agent-sec-cli/src/agent_sec_cli/asset_verify/trusted-keys"
-DEFAULT_CONFIG_FILE="$AGENT_SEC_CORE_DIR/agent-sec-cli/src/agent_sec_cli/asset_verify/config.conf"
+SOURCE_ASSET_VERIFY_DIR="$AGENT_SEC_CORE_DIR/agent-sec-cli/src/agent_sec_cli/asset_verify"
+DEFAULT_TRUSTED_KEYS_DIR="$SOURCE_ASSET_VERIFY_DIR/trusted-keys"
+DEFAULT_CONFIG_FILE="$SOURCE_ASSET_VERIFY_DIR/config.conf"
 VERIFIER_PATH_SOURCE="source"
 VERIFIER_PATHS_RESOLVED=false
 
@@ -72,41 +73,42 @@ fi
 # or GPG_PRIVATE_KEY import; empty means "let gpg pick its default".
 GPG_SIGN_KEY=""
 
+try_verifier_asset_dir() {
+    local asset_dir="$1"
+
+    if [[ ! -d "$asset_dir" || ! -f "$asset_dir/config.conf" ]]; then
+        return 1
+    fi
+
+    DEFAULT_TRUSTED_KEYS_DIR="$asset_dir/trusted-keys"
+    DEFAULT_CONFIG_FILE="$asset_dir/config.conf"
+    VERIFIER_PATH_SOURCE="$asset_dir"
+    return 0
+}
+
 resolve_verifier_paths() {
     if [[ "$VERIFIER_PATHS_RESOLVED" == true ]]; then
         return 0
     fi
     VERIFIER_PATHS_RESOLVED=true
 
-    local py
-    local out
-    local trusted_keys_dir
-    local config_file
-    local candidates=("/opt/agent-sec/venv/bin/python" "python3")
+    local asset_dir
 
-    for py in "${candidates[@]}"; do
-        if [[ "$py" == */* ]]; then
-            [[ -x "$py" ]] || continue
-        else
-            command -v "$py" &>/dev/null || continue
-        fi
-
-        out=$("$py" - <<'PY' 2>/dev/null || true
-from agent_sec_cli.asset_verify import verifier
-print(verifier.DEFAULT_TRUSTED_KEYS_DIR)
-print(verifier.DEFAULT_CONFIG)
-PY
-)
-        trusted_keys_dir=$(printf '%s\n' "$out" | sed -n '1p')
-        config_file=$(printf '%s\n' "$out" | sed -n '2p')
-
-        if [[ -n "$trusted_keys_dir" && -n "$config_file" ]]; then
-            DEFAULT_TRUSTED_KEYS_DIR="$trusted_keys_dir"
-            DEFAULT_CONFIG_FILE="$config_file"
-            VERIFIER_PATH_SOURCE="$py"
+    for asset_dir in /opt/agent-sec/venv/lib/python*/site-packages/agent_sec_cli/asset_verify; do
+        if try_verifier_asset_dir "$asset_dir"; then
             return 0
         fi
     done
+
+    for asset_dir in /opt/agent-sec/lib/python*/site-packages/agent_sec_cli/asset_verify; do
+        if try_verifier_asset_dir "$asset_dir"; then
+            return 0
+        fi
+    done
+
+    if try_verifier_asset_dir "$SOURCE_ASSET_VERIFY_DIR"; then
+        VERIFIER_PATH_SOURCE="source"
+    fi
 
     return 0
 }

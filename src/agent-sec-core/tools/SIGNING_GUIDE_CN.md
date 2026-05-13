@@ -50,15 +50,19 @@ agent-sec-cli verify
 #    trusted-keys 目录。
 /usr/local/bin/sign-skill.sh --init
 
-# 2. 签名已安装的 agent-sec-core skills。
+# 2. 签名已安装的 agent-sec-core skills。若自定义了 SKILL_DIR 或安装布局，
+#    请替换为实际 skill 目录。
 /usr/local/bin/sign-skill.sh --batch /usr/share/anolisa/skills --force
 
 # 3. 验证所有已配置的 skill 目录。
 agent-sec-cli verify
 ```
 
-默认源码构建安装场景下，`agent-sec-cli verify` 已经从随包安装的
-`config.conf` 读取 `/usr/share/anolisa/skills`，因此不需要再指定验签目录。
+默认源码构建安装场景下，`/usr/share/anolisa/skills` 是已安装的 skill 根目录，
+`agent-sec-cli verify` 已经从随包安装的 `config.conf` 读取该目录，因此不需要
+再指定验签目录。若使用自定义 `SKILL_DIR` 或不同的包布局，请将实际 skill 目录
+传给 `--batch`；非默认 verifier 布局可通过 `--config-file` 指定对应的
+`config.conf`。
 
 ## 手动逐步操作
 
@@ -87,9 +91,9 @@ gpg --list-secret-keys me@example.com
 ### 2. 导出公钥
 
 校验器从打包后的 `agent_sec_cli/asset_verify/trusted-keys/` 目录加载受信公钥。
-当 `agent-sec-cli` 已安装时，`sign-skill.sh` 会从
-`agent_sec_cli.asset_verify.verifier` 自动识别该目录；仅在源码树中运行时，
-会回退到 `agent-sec-cli/src/agent_sec_cli/asset_verify/trusted-keys/`。
+当 `agent-sec-cli` 已安装时，`sign-skill.sh` 会通过文件系统探测 `/opt/agent-sec`
+下的包内数据目录；仅在源码树中运行时，会回退到
+`agent-sec-cli/src/agent_sec_cli/asset_verify/trusted-keys/`。
 手动重新导出：
 
 ```bash
@@ -136,10 +140,10 @@ tools/sign-skill.sh --batch /usr/share/anolisa/skills --force
 
 ### 4. 配置校验器
 
-当使用已安装的 `agent-sec-cli` 时，`--batch` 会使用自动识别到的 verifier
-`config.conf`，并在签名前注册 skill 根目录。对于仅源码树运行或自定义布局，请确保
-skill 根目录已配置在随 CLI 打包的校验器配置中（当前源码树中的路径为
-`agent-sec-cli/src/agent_sec_cli/asset_verify/config.conf`）。也可以显式指定配置文件：
+当使用已安装的 `agent-sec-cli` 时，`--batch` 会使用自动识别到的已安装 verifier
+`config.conf`，并在签名前注册 skill 根目录。源码树 fallback 不会自动修改源码树中的
+`config.conf`。对于仅源码树运行或自定义布局，请确保实际 skill 根目录已配置在随 CLI
+打包的校验器配置中；也可以显式指定配置文件：
 
 ```bash
 tools/sign-skill.sh --batch /custom/skills --force \
