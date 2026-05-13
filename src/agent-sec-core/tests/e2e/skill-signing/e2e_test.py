@@ -28,6 +28,7 @@ import pytest
 # ---------------------------------------------------------------------------
 
 REPO_ROOT = Path(__file__).resolve().parents[3]  # agent-sec-core/
+PROJECT_ROOT = Path(__file__).resolve().parents[5]  # repository root
 SIGN_SKILL_SH = REPO_ROOT / "tools" / "sign-skill.sh"
 SOURCE_PYTHONPATH = REPO_ROOT / "agent-sec-cli" / "src"
 
@@ -88,6 +89,7 @@ def require_passwordless_sudo() -> None:
 def run_command(
     args: Iterable[str | Path],
     *,
+    cwd: Optional[Path] = None,
     env: Optional[dict[str, str]] = None,
     input_text: Optional[str] = None,
     timeout: int = 120,
@@ -96,6 +98,7 @@ def run_command(
         [str(arg) for arg in args],
         capture_output=True,
         text=True,
+        cwd=str(cwd) if cwd else None,
         env=env,
         input=input_text,
         timeout=timeout,
@@ -280,6 +283,101 @@ def test_batch_sign_registers_explicit_config_and_verifies(
         ok, name = verify_skill(str(batch_root / skill_name), keys)
         assert ok, f"verify_skill failed for {skill_name}"
         assert name == skill_name
+
+
+def test_legacy_ci_batch_invocation_with_private_key(signing_ws: Workspace) -> None:
+    """Package-source CI's historical --batch call remains compatible."""
+    archive_skills = signing_ws.root / "tmp_build" / "anolisa-ci" / "skills"
+    archive_skills.mkdir(parents=True)
+    for skill_name, content in [("ci-alpha", "A"), ("ci-beta", "B")]:
+        make_skill(archive_skills, skill_name, {"SKILL.md": f"# {content}\n"})
+
+    ci_key_home = signing_ws.root / "ci_key_gpg"
+    ci_key_home.mkdir(mode=0o700)
+    env = signing_ws.env()
+    generate = run_command(
+        ["gpg", "--homedir", ci_key_home, "--batch", "--gen-key"],
+        env=env,
+        input_text=(
+            "Key-Type: RSA\n"
+            "Key-Length: 2048\n"
+            "Name-Real: CI Signing Key\n"
+            "Name-Email: ci-sign@test.local\n"
+            "Expire-Date: 0\n"
+            "%no-protection\n"
+            "%commit\n"
+        ),
+    )
+    assert_success(generate, "generate CI signing key")
+
+    private_key = run_command(
+        [
+            "gpg",
+            "--homedir",
+            ci_key_home,
+            "--armor",
+            "--export-secret-keys",
+            "ci-sign@test.local",
+        ],
+        env=env,
+    )
+    assert_success(private_key, "export CI private key")
+
+    public_key = run_command(
+        ["gpg", "--homedir", ci_key_home, "--armor", "--export", "ci-sign@test.local"],
+        env=env,
+    )
+    assert_success(public_key, "export CI public key")
+    ci_trusted_keys = signing_ws.root / "ci_trusted_keys"
+    ci_trusted_keys.mkdir()
+    (ci_trusted_keys / "ci-sign.asc").write_text(public_key.stdout)
+
+    blank_home = signing_ws.root / "legacy_ci_gpg"
+    blank_home.mkdir(mode=0o700)
+    ci_env = signing_ws.env(
+        {
+            "GNUPGHOME": str(blank_home),
+            "GPG_PRIVATE_KEY": private_key.stdout,
+        }
+    )
+
+    installed_config = Path(
+        "/opt/agent-sec/venv/lib/python3.11/site-packages/"
+        "agent_sec_cli/asset_verify/config.conf"
+    )
+    original_installed_config = (
+        installed_config.read_text()
+        if installed_config.is_file() and os.access(installed_config, os.W_OK)
+        else None
+    )
+
+    try:
+        result = run_command(
+            [
+                "bash",
+                "src/agent-sec-core/tools/sign-skill.sh",
+                "--batch",
+                archive_skills,
+            ],
+            cwd=PROJECT_ROOT,
+            env=ci_env,
+            timeout=180,
+        )
+        assert_success(result, "legacy CI batch invocation")
+        assert "GPG private key imported and trusted" in result.stdout + result.stderr
+        assert "2/2 skills signed successfully" in result.stdout + result.stderr
+
+        keys = load_trusted_keys(ci_trusted_keys)
+        for skill_name in ("ci-alpha", "ci-beta"):
+            skill_dir = archive_skills / skill_name
+            assert (skill_dir / SIGNING_DIR / "Manifest.json").is_file()
+            assert (skill_dir / SIGNING_DIR / ".skill.sig").is_file()
+            ok, name = verify_skill(str(skill_dir), keys)
+            assert ok
+            assert name == skill_name
+    finally:
+        if original_installed_config is not None:
+            installed_config.write_text(original_installed_config)
 
 
 def test_force_overwrite(signing_ws: Workspace) -> None:
