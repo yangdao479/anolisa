@@ -16,7 +16,6 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional
@@ -149,6 +148,25 @@ def run_maybe_sudo(
         env=run_env,
         timeout=timeout,
     )
+
+
+def resolve_installed_asset_verify_dir() -> Optional[Path]:
+    """Resolve installed verifier package data without importing agent_sec_cli."""
+    search_roots = [
+        Path("/opt/agent-sec/venv/lib"),
+        Path("/opt/agent-sec/lib"),
+    ]
+
+    for root in search_roots:
+        if not root.is_dir():
+            continue
+        for asset_dir in sorted(
+            root.glob("python*/site-packages/agent_sec_cli/asset_verify")
+        ):
+            if asset_dir.is_dir() and (asset_dir / "config.conf").is_file():
+                return asset_dir
+
+    return None
 
 
 def make_skill(parent: Path, name: str, files: dict[str, str]) -> Path:
@@ -341,13 +359,17 @@ def test_legacy_ci_batch_invocation_with_private_key(signing_ws: Workspace) -> N
         }
     )
 
-    installed_config = Path(
-        "/opt/agent-sec/venv/lib/python3.11/site-packages/"
-        "agent_sec_cli/asset_verify/config.conf"
+    installed_asset_verify_dir = resolve_installed_asset_verify_dir()
+    installed_config = (
+        installed_asset_verify_dir / "config.conf"
+        if installed_asset_verify_dir is not None
+        else None
     )
     original_installed_config = (
         installed_config.read_text()
-        if installed_config.is_file() and os.access(installed_config, os.W_OK)
+        if installed_config is not None
+        and installed_config.is_file()
+        and os.access(installed_config, os.W_OK)
         else None
     )
 
@@ -376,7 +398,7 @@ def test_legacy_ci_batch_invocation_with_private_key(signing_ws: Workspace) -> N
             assert ok
             assert name == skill_name
     finally:
-        if original_installed_config is not None:
+        if original_installed_config is not None and installed_config is not None:
             installed_config.write_text(original_installed_config)
 
 
@@ -686,35 +708,22 @@ def test_source_build_installed_signing_and_verify() -> None:
     skills_root = Path(
         os.environ.get("ANOLISA_INSTALLED_SKILLS_DIR", "/usr/share/anolisa/skills")
     )
-    venv_python = Path(os.environ.get("VENV_PYTHON", "/opt/agent-sec/venv/bin/python"))
+    asset_verify_dir = resolve_installed_asset_verify_dir()
     agent_sec_cli = shutil.which("agent-sec-cli") or "/usr/local/bin/agent-sec-cli"
 
-    if not installed_script.exists() and not venv_python.exists():
-        pytest.skip("source-build installed sign-skill.sh and venv are not present")
+    if not installed_script.exists() or asset_verify_dir is None:
+        pytest.skip(
+            "source-build installed sign-skill.sh and verifier asset paths are not present"
+        )
 
     assert installed_script.exists(), f"missing installed script: {installed_script}"
     assert skills_root.is_dir(), f"missing installed skills root: {skills_root}"
-    assert venv_python.exists(), f"missing installed verifier python: {venv_python}"
     assert Path(
         agent_sec_cli
     ).exists(), f"missing agent-sec-cli binary: {agent_sec_cli}"
 
-    verifier_paths = run_command(
-        [
-            venv_python,
-            "-c",
-            (
-                "from agent_sec_cli.asset_verify import verifier\n"
-                "print(verifier.DEFAULT_TRUSTED_KEYS_DIR)\n"
-                "print(verifier.DEFAULT_CONFIG)\n"
-            ),
-        ],
-    )
-    assert_success(verifier_paths, "resolve installed verifier paths")
-    trusted_keys_dir, config_file = [
-        Path(line.strip()) for line in verifier_paths.stdout.splitlines()[:2]
-    ]
-    assert trusted_keys_dir.is_dir(), f"missing trusted-keys dir: {trusted_keys_dir}"
+    trusted_keys_dir = asset_verify_dir / "trusted-keys"
+    config_file = asset_verify_dir / "config.conf"
     assert config_file.is_file(), f"missing verifier config: {config_file}"
 
     expected_skills = {"code-scanner", "prompt-scanner", "skill-ledger"}
@@ -723,15 +732,20 @@ def test_source_build_installed_signing_and_verify() -> None:
             skills_root / skill_name
         ).is_dir(), f"missing installed skill: {skill_name}"
 
+    trusted_keys_write_target = (
+        trusted_keys_dir if trusted_keys_dir.exists() else trusted_keys_dir.parent
+    )
     needs_sudo = os.geteuid() != 0 and (
         not os.access(skills_root, os.W_OK)
-        or not os.access(trusted_keys_dir, os.W_OK)
+        or not os.access(trusted_keys_write_target, os.W_OK)
         or not os.access(config_file, os.W_OK)
     )
     if needs_sudo and os.geteuid() != 0:
         require_passwordless_sudo()
 
-    gnupg_home = Path("/tmp") / f"agent-sec-pytest-gnupg-{uuid.uuid4().hex}"
+    gnupg_home = Path(
+        tempfile.mkdtemp(prefix="agent-sec-pytest-gnupg-", dir=tempfile.gettempdir())
+    )
     env = {
         "GNUPGHOME": str(gnupg_home),
         "LC_ALL": "C",
@@ -747,8 +761,7 @@ def test_source_build_installed_signing_and_verify() -> None:
             )
             assert_success(setup_home, "create root GNUPGHOME")
         else:
-            shutil.rmtree(gnupg_home, ignore_errors=True)
-            gnupg_home.mkdir(mode=0o700)
+            gnupg_home.chmod(0o700)
 
         init = run_maybe_sudo(
             ["bash", installed_script, "--init"],
@@ -758,6 +771,9 @@ def test_source_build_installed_signing_and_verify() -> None:
         )
         assert_success(init, "installed --init")
         assert str(trusted_keys_dir) in init.stdout + init.stderr
+        assert (
+            trusted_keys_dir.is_dir()
+        ), f"trusted-keys dir was not created: {trusted_keys_dir}"
 
         batch = run_maybe_sudo(
             ["bash", installed_script, "--batch", skills_root, "--force"],

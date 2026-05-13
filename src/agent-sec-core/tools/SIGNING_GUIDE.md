@@ -50,16 +50,20 @@ After running the unified source build, use the installed script and verifier:
 #    directory used by agent-sec-cli verify.
 /usr/local/bin/sign-skill.sh --init
 
-# 2. Sign the installed agent-sec-core skills.
+# 2. Sign the installed agent-sec-core skills. Replace this path if your
+#    SKILL_DIR or package layout installs skills elsewhere.
 /usr/local/bin/sign-skill.sh --batch /usr/share/anolisa/skills --force
 
 # 3. Verify all configured skill directories.
 agent-sec-cli verify
 ```
 
-For the default source-build install, `agent-sec-cli verify` already reads
-`/usr/share/anolisa/skills` from its packaged `config.conf`, so no verification
-directory argument is required.
+For the default source-build install, `/usr/share/anolisa/skills` is the
+installed skills root and `agent-sec-cli verify` already reads it from the
+packaged `config.conf`, so no verification directory argument is required. If a
+custom `SKILL_DIR` or package layout is used, pass the actual skills directory
+to `--batch`; for non-default verifier layouts, pass the matching verifier
+`config.conf` with `--config-file`.
 
 ## Step-by-Step (Manual Key Management)
 
@@ -89,8 +93,8 @@ gpg --list-secret-keys me@example.com
 
 The verifier loads trusted public keys from the packaged `agent_sec_cli/asset_verify/trusted-keys/`
 directory. When `agent-sec-cli` is installed, `sign-skill.sh` auto-detects this
-directory from `agent_sec_cli.asset_verify.verifier`. When running only from this
-source checkout, it falls back to
+directory by probing the installed package data under `/opt/agent-sec`. When
+running only from this source checkout, it falls back to
 `agent-sec-cli/src/agent_sec_cli/asset_verify/trusted-keys/`.
 To re-export manually:
 
@@ -138,11 +142,12 @@ Each signed skill directory will contain:
 
 ### 4. Configure the Verifier
 
-For installed `agent-sec-cli`, `--batch` uses the detected verifier
-`config.conf` and registers the skills root before signing. For source-tree-only
-or custom layouts, make sure the skills root is listed in the verifier config
-packaged with the CLI (`agent-sec-cli/src/agent_sec_cli/asset_verify/config.conf`
-in this source tree). You can also choose the config file explicitly:
+For installed `agent-sec-cli`, `--batch` uses the detected installed verifier
+`config.conf` and registers the skills root before signing. Source-tree fallback
+does not modify the source checkout's `config.conf` automatically. For
+source-tree-only or custom layouts, make sure the actual skills root is listed
+in the verifier config packaged with the CLI, or choose the config file
+explicitly:
 
 ```bash
 tools/sign-skill.sh --batch /custom/skills --force \
