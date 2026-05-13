@@ -24,7 +24,7 @@ Requires:       btrfs-progs
 %description
 ws-ckpt is an AI-oriented filesystem snapshot tool. It supports workspace
 initialization, snapshot creation and second-level rollback. Its
-multi-backend architecture (btrfs-base / btrfs-loop / overlayfs) with
+multi-backend architecture (btrfs-base / btrfs-loop) with
 three-tier auto detection picks the optimal backend for efficient
 snapshots.
 
@@ -59,8 +59,6 @@ install -p -m 0644 src/skills/ws-ckpt/SKILL.md %{buildroot}%{_datadir}/anolisa/r
 %{_datadir}/anolisa/runtime/skills/ws-ckpt/
 
 %pre
-modprobe btrfs 2>/dev/null || { echo "ERROR: kernel does not support btrfs"; exit 1; }
-
 # Upgrade-only: migrate legacy image /data/ws-ckpt -> /var/lib/ws-ckpt (FHS)
 if [ $1 -gt 1 ] && [ -f /data/ws-ckpt/btrfs-data.img ] && [ ! -f /var/lib/ws-ckpt/btrfs-data.img ]; then
     systemctl stop ws-ckpt.service 2>/dev/null || true

@@ -15,6 +15,12 @@ pub struct BootstrapResult {
 }
 
 pub async fn bootstrap(config: &DaemonConfig) -> anyhow::Result<BootstrapResult> {
+    // 0. Ensure the kernel exposes btrfs (moved here from RPM %pre so
+    //    install never fails on unsupported kernels).
+    ensure_btrfs_support()
+        .await
+        .context("btrfs kernel support is required")?;
+
     // Derive image directory from configured image path. We deliberately
     // do NOT fall back to a hard-coded path on None/empty parent: a bare
     // filename in `img_path` is a configuration bug and silently writing
@@ -225,6 +231,46 @@ pub async fn ensure_symlinks(state: &DaemonState) {
             }
         }
     }
+}
+
+/// Verify the running kernel can mount btrfs.
+/// Fast path checks `/proc/filesystems`; falls back to best-effort
+/// `modprobe btrfs` then re-checks. Only a final miss is fatal.
+async fn ensure_btrfs_support() -> anyhow::Result<()> {
+    if proc_filesystems_has_btrfs().await? {
+        return Ok(());
+    }
+
+    // Best-effort modprobe; ignore status, the post-check is authoritative.
+    let _ = Command::new("modprobe").arg("btrfs").status().await;
+
+    if proc_filesystems_has_btrfs().await? {
+        info!("Loaded btrfs kernel module");
+        return Ok(());
+    }
+
+    bail!(
+        "Kernel does not support btrfs (no entry in /proc/filesystems and \
+         `modprobe btrfs` did not register the module). Install the matching \
+         kernel-modules-extra package or rebuild the kernel with CONFIG_BTRFS_FS, \
+         then run `systemctl restart ws-ckpt`."
+    );
+}
+
+/// Check whether `/proc/filesystems` already lists btrfs.
+async fn proc_filesystems_has_btrfs() -> anyhow::Result<bool> {
+    let file = File::open("/proc/filesystems")
+        .await
+        .context("Failed to open /proc/filesystems")?;
+    let mut reader = BufReader::new(file).lines();
+    while let Some(line) = reader.next_line().await? {
+        // Each line is either "<fstype>" or "nodev <fstype>". The fs name
+        // is always the last whitespace-separated token.
+        if line.split_whitespace().last() == Some("btrfs") {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 pub async fn is_mounted(mount_path: &str) -> anyhow::Result<bool> {
