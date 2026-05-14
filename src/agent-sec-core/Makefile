@@ -262,7 +262,7 @@ install-cli-site: ## RPM: Copy staged site-packages to private dir + wrapper
 install-cli-venv: ## User: Create venv, install deps from uv.lock, install wheel, symlink
 	@echo "Creating Python venv at $(VENV_DIR) ..."
 	install -d -m 0755 $(VENV_DIR)
-	uv venv --python 3.11.6 $(VENV_DIR)
+	uv venv --python 3.11.6 --allow-existing $(VENV_DIR)
 	@echo "Installing dependencies from uv.lock ..."
 	cd agent-sec-cli && UV_PROJECT_ENVIRONMENT=$(VENV_DIR) uv sync --frozen --no-dev --no-install-project
 	@echo "Installing agent-sec-cli wheel ..."
@@ -298,7 +298,7 @@ install-cosh-hook: ## Install cosh hooks (linux-sandbox + extension)
 	cp -rp $(BUILD_DIR)/cosh-extension/. $(DESTDIR)$(EXTENSIONDIR)/
 
 .PHONY: install-all
-install-all: install-cli-venv install-sandbox install-cosh-hook install-openclaw-plugin install-skills ## Install all (user source build)
+install-all: install-cli-venv install-cosh-hook install-openclaw-plugin install-skills ## Install all (user source build)
 
 .PHONY: install-all-for-rpmbuild
 install-all-for-rpmbuild: install-cli-site install-cosh-hook install-openclaw-plugin install-skills ## Install all (RPM build)
