@@ -71,7 +71,21 @@ jobs:
         run: |
           dnf makecache
           dnf install -y scripts/rpmbuild/RPMS/**/*.rpm
+          echo "=== Verify CLI ==="
           agent-sec-cli --help
+          echo "=== Verify sandbox ==="
+          linux-sandbox --help
+          echo "=== Verify site-packages ==="
+          ls /opt/agent-sec/lib/python3.11/site-packages/agent_sec_cli/
+          echo "=== Verify cosh extension ==="
+          ls /usr/share/anolisa/extensions/agent-sec-core/
+          ls /usr/share/anolisa/extensions/agent-sec-core/hooks/
+          echo "=== Verify openclaw plugin ==="
+          ls /opt/agent-sec/openclaw-plugin/
+          ls /opt/agent-sec/openclaw-plugin/dist/
+          ls /opt/agent-sec/openclaw-plugin/scripts/deploy.sh
+          echo "=== Verify skills ==="
+          ls /usr/share/anolisa/skills/
 
       - name: Verify Python dependencies match requirements.txt
         run: |
