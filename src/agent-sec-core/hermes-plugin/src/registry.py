@@ -6,7 +6,10 @@ import logging
 import time
 import tomllib
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from .capabilities.base import AgentSecCoreCapability
 
 logger = logging.getLogger("agent-sec-core")
 
@@ -50,13 +53,28 @@ def safe_hook_wrapper(callback, capability_id: str):
     return wrapper
 
 
-def register_capabilities(ctx, capabilities: list, config: dict) -> None:
+def register_capabilities(
+    ctx, capabilities: list[AgentSecCoreCapability], config: dict
+) -> None:
     """Register all enabled capabilities with the Hermes plugin context."""
-    caps_config = config.get("capabilities", {})
+    if "capabilities" not in config:
+        logger.error(
+            "config missing [capabilities] section, no capabilities registered"
+        )
+        return
+    caps_config = config["capabilities"]
 
     for cap in capabilities:
-        cap_config = caps_config.get(cap.id, {})
-        if not cap_config.get("enabled", True):
+        if cap.id not in caps_config:
+            logger.error(
+                f"[{cap.id}] config section [capabilities.{cap.id}] not found, skipping"
+            )
+            continue
+        cap_config = caps_config[cap.id]
+        if "enabled" not in cap_config:
+            logger.error(f"[{cap.id}] config missing required key 'enabled', skipping")
+            continue
+        if not cap_config["enabled"]:
             logger.info(f"[{cap.id}] disabled by config, skipping")
             continue
         try:

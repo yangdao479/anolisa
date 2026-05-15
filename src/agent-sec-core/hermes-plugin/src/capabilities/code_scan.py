@@ -6,11 +6,9 @@ import json
 import logging
 
 from ..cli_runner import call_agent_sec_cli
-from ..registry import safe_hook_wrapper
+from .base import AgentSecCoreCapability
 
 logger = logging.getLogger("agent-sec-core")
-
-_DEFAULT_TIMEOUT = 10.0
 
 # Mapping: tool_name -> (args_key, language)
 _TOOL_LANGUAGE_MAP = {
@@ -19,7 +17,7 @@ _TOOL_LANGUAGE_MAP = {
 }
 
 
-class CodeScanCapability:
+class CodeScanCapability(AgentSecCoreCapability):
     """Security capability that scans code before execution.
 
     Intercepts pre_tool_call for 'terminal' and 'execute_code' tools,
@@ -28,18 +26,13 @@ class CodeScanCapability:
 
     id = "code-scan"
     name = "Code Scanner"
-    hooks = ["pre_tool_call"]
 
-    def __init__(self):
-        self._timeout = _DEFAULT_TIMEOUT
-        self._enable_block = False
-
-    def register(self, ctx, config: dict) -> None:
-        """Register pre_tool_call hook with safe wrapper."""
-        self._timeout = config.get("timeout", _DEFAULT_TIMEOUT)
+    def _on_register(self, config: dict) -> None:
+        """Read code-scan specific config."""
         self._enable_block = config.get("enable_block", False)
-        wrapped = safe_hook_wrapper(self._on_pre_tool_call, self.id)
-        ctx.register_hook("pre_tool_call", wrapped)
+
+    def get_hooks_define(self) -> dict:
+        return {"pre_tool_call": self._on_pre_tool_call}
 
     def _on_pre_tool_call(self, tool_name, args, **kwargs):
         """Hook handler: scan terminal/execute_code for security risks."""
@@ -74,15 +67,17 @@ class CodeScanCapability:
 
         # warn and deny are separate branches (coding convention), same behavior
         if verdict == "deny":
-            logger.warning(f"DENY tool={tool_name} code={code[:120]}")
+            msg = self._format_message(scan)
+            logger.warning(f"DENY tool={tool_name} code={code[:120]} | {msg}")
             if self._enable_block:
-                return {"action": "block", "message": self._format_message(scan)}
+                return {"action": "block", "message": msg}
             return None
 
         if verdict == "warn":
-            logger.warning(f"WARN tool={tool_name} code={code[:120]}")
+            msg = self._format_message(scan)
+            logger.warning(f"WARN tool={tool_name} code={code[:120]} | {msg}")
             if self._enable_block:
-                return {"action": "block", "message": self._format_message(scan)}
+                return {"action": "block", "message": msg}
             return None
 
         logger.info(f"PASS tool={tool_name} code={code[:120]}")

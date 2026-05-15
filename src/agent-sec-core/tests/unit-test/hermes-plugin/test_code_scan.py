@@ -17,22 +17,24 @@ from src.capabilities.code_scan import CodeScanCapability  # noqa: E402
 from src.cli_runner import CliResult  # noqa: E402
 
 
+def _make_capability(enable_block: bool = True) -> CodeScanCapability:
+    """Create a CodeScanCapability with test config."""
+    cap = CodeScanCapability()
+    cap._timeout = 5.0
+    cap._enable_block = enable_block
+    return cap
+
+
 @pytest.fixture
 def capability():
     """Create a CodeScanCapability with block enabled."""
-    cap = CodeScanCapability()
-    cap._timeout = 5.0
-    cap._enable_block = True
-    return cap
+    return _make_capability(enable_block=True)
 
 
 @pytest.fixture
 def capability_observe():
     """Create a CodeScanCapability with observe mode (default)."""
-    cap = CodeScanCapability()
-    cap._timeout = 5.0
-    cap._enable_block = False
-    return cap
+    return _make_capability(enable_block=False)
 
 
 class TestCodeScanPreToolCall:

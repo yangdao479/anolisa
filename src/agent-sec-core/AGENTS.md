@@ -291,6 +291,7 @@ hermes-plugin/
 │   ├── cli_runner.py         # agent-sec-cli subprocess 封装
 │   └── capabilities/
 │       ├── __init__.py       # 能力清单
+│       ├── base.py           # AgentSecCoreCapability 抽象基类
 │       └── code_scan.py      # Code Scanner 实现
 └── README.md                 # 开发指南
 tests/unit-test/hermes-plugin/ # 单元测试（位于 agent-sec-core/tests/unit-test/ 下）
@@ -314,7 +315,8 @@ from ..cli_runner import call_agent_sec_cli    # 上级模块（在子包中）
 
 - 底层：`cli_runner.py`（纯 stdlib，无内部依赖）
 - 中间层：`registry.py`（纯 stdlib）
-- 实现层：`capabilities/*.py`（依赖 cli_runner、registry）
+- 基类层：`capabilities/base.py`（依赖 registry）
+- 实现层：`capabilities/*.py`（继承 base，依赖 cli_runner）
 - 顶层：`__init__.py`（依赖 capabilities、registry）
 
 ### 3. 编码风格
@@ -330,22 +332,25 @@ from ..cli_runner import call_agent_sec_cli    # 上级模块（在子包中）
 ### 4. 新增 Capability
 
 1. 在 `src/capabilities/` 下新建 `xxx.py`
-2. 实现类，必须包含 `id`、`name`、`hooks` 属性和 `register(self, ctx, config: dict)` 方法
+2. 继承 `AgentSecCoreCapability`，定义 `id`、`name`（基类通过 `@property` + `@abstractmethod` 强制），实现 `_on_register()`、`get_hooks_define()` 和回调方法
 3. 在 `capabilities/__init__.py` 中导入并加入 `ALL_CAPABILITIES`
-4. 在 `config.toml` 中添加对应配置段 `[capabilities.<id>]`
+4. 在 `config.toml` 中添加对应配置段 `[capabilities.<id>]`（`enabled` 和 `timeout` 必填）
 
 ```python
-class MyCapability:
+from .base import AgentSecCoreCapability
+
+
+class MyCapability(AgentSecCoreCapability):
     id = "my-cap"
     name = "My Capability"
-    hooks = ["pre_tool_call"]
 
-    def register(self, ctx, config: dict) -> None:
-        self._timeout = config.get("timeout", 10.0)
-        wrapped = safe_hook_wrapper(self._handler, self.id)
-        ctx.register_hook("pre_tool_call", wrapped)
+    def _on_register(self, config: dict) -> None:
+        self._my_option = config.get("my_option", "default")
 
-    def _handler(self, tool_name, args, **kwargs):
+    def get_hooks_define(self) -> dict:
+        return {"pre_tool_call": self._on_pre_tool_call}
+
+    def _on_pre_tool_call(self, tool_name, args, **kwargs):
         ...
 ```
 
@@ -361,8 +366,8 @@ class MyCapability:
 
 ```toml
 [capabilities.code-scan]
-enabled = true          # 是否注册该能力
-timeout = 10            # agent-sec-cli 子进程超时（秒）
+enabled = true          # 是否注册该能力（必填）
+timeout = 10            # agent-sec-cli 子进程超时（秒，必填）
 enable_block = false    # false=observe(仅日志), true=block(阻断)
 ```
 
