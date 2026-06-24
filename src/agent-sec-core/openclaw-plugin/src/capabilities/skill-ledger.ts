@@ -2,7 +2,7 @@ import { existsSync } from "node:fs";
 import { resolve, dirname, basename } from "node:path";
 import { homedir } from "node:os";
 import type { SecurityCapability } from "../types.js";
-import { callAgentSecCli } from "../utils.js";
+import { buildTraceContext, callAgentSecCli, type TraceContext } from "../utils.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -19,6 +19,10 @@ type CheckResult = {
   [key: string]: unknown;
 };
 
+type SkillLedgerConfig = {
+  enableBlock: boolean;
+};
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -28,15 +32,23 @@ const PATH_PARAM_NAMES = ["file_path", "path"];
 const DEFAULT_TIMEOUT_MS = 5_000;
 
 // ---------------------------------------------------------------------------
-// Warning messages — per-status, design doc §4
+// Status messages and confirmation policy
 // ---------------------------------------------------------------------------
 
 const WARNING_MESSAGES: Record<string, (name: string) => string> = {
   warn: (n) => `⚠️ Skill '${n}' has low-risk findings — review recommended`,
-  drifted: (n) => `⚠️ Skill '${n}' content has changed since last scan`,
-  none: (n) => `⚠️ Skill '${n}' has not been security-scanned yet`,
-  deny: (n) => `🚨 Skill '${n}' has high-risk findings — immediate review recommended`,
-  tampered: (n) => `🚨 Skill '${n}' metadata signature verification failed`,
+  drifted: (n) => `⚠️ Skill '${n}' content has changed since last scan — confirm before using and run a fresh scan when possible`,
+  none: (n) => `⚠️ Skill '${n}' has not been security-scanned yet — confirm before using`,
+  error: (n) => `⚠️ Skill '${n}' check failed — invalid path or missing SKILL.md`,
+  deny: (n) => `🚨 Skill '${n}' has high-risk findings — confirm only if you trust the skill and intend to review it`,
+  tampered: (n) => `🚨 Skill '${n}' metadata signature verification failed — confirm only if you trust the skill source`,
+};
+
+const CONFIRMATION_SEVERITY: Record<string, "warning" | "critical"> = {
+  none: "warning",
+  drifted: "warning",
+  deny: "critical",
+  tampered: "critical",
 };
 
 // ---------------------------------------------------------------------------
@@ -62,6 +74,16 @@ function keysExist(): boolean {
 // Helpers
 // ---------------------------------------------------------------------------
 
+function expandHomePath(filePath: string): string {
+  if (filePath === "~") {
+    return homedir();
+  }
+  if (filePath.startsWith("~/")) {
+    return homedir() + filePath.slice(1);
+  }
+  return filePath;
+}
+
 /** Extract the file path from a before_tool_call event, or undefined if not a read-SKILL.md call. */
 function extractSkillPath(
   event: { toolName: string; params: Record<string, unknown> },
@@ -79,7 +101,7 @@ function extractSkillPath(
   if (!filePath) return undefined;
 
   // Resolve to canonical absolute path to neutralize ".." traversal
-  const resolved = resolve(filePath);
+  const resolved = resolve(expandHomePath(filePath));
 
   if (!resolved.endsWith("/SKILL.md")) return undefined;
 
@@ -91,6 +113,23 @@ function resolveSkillDir(skillMdPath: string): string {
   return resolve(dirname(skillMdPath));
 }
 
+function formatSkillLedgerMessage(status: string, skillName: string): string {
+  const warnFn = WARNING_MESSAGES[status];
+  if (warnFn) return warnFn(skillName);
+  return `⚠️ Skill '${skillName}' has unknown status '${status}'`;
+}
+
+function confirmationSeverity(status: string): "warning" | "critical" | undefined {
+  return CONFIRMATION_SEVERITY[status];
+}
+
+function readConfig(pluginConfig: Record<string, any>): SkillLedgerConfig {
+  const capabilityConfig = pluginConfig.capabilities?.["skill-ledger"] ?? {};
+  return {
+    enableBlock: capabilityConfig.enableBlock !== false,
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Capability
 // ---------------------------------------------------------------------------
@@ -100,25 +139,31 @@ export const skillLedger: SecurityCapability = {
   name: "Skill Ledger",
   hooks: ["before_tool_call"],
   register(api) {
+    const cfg = readConfig((api.pluginConfig as Record<string, any>) ?? {});
+
     /** Ensure signing keys exist; auto-init if missing. */
     let ensureKeysPromise: Promise<void> | null = null;
 
-    function ensureKeys(): Promise<void> {
+    function ensureKeys(traceContext?: TraceContext): Promise<void> {
       if (ensureKeysPromise) return ensureKeysPromise;
 
       ensureKeysPromise = (async () => {
         if (keysExist()) return;
 
-        api.logger.info("[skill-ledger] signing keys not found — running init-keys");
+        api.logger.info(
+          "[skill-ledger] signing keys not found — running init --no-baseline",
+        );
         const result = await callAgentSecCli(
-          ["skill-ledger", "init-keys"],
-          { timeout: DEFAULT_TIMEOUT_MS },
+          ["skill-ledger", "init", "--no-baseline"],
+          { timeout: DEFAULT_TIMEOUT_MS, traceContext },
         );
 
         if (result.exitCode === 0) {
           api.logger.info("[skill-ledger] signing keys initialized successfully");
         } else if (!keysExist()) {
-          api.logger.warn(`[skill-ledger] init-keys failed: ${result.stderr}`);
+          api.logger.warn(
+            `[skill-ledger] init --no-baseline failed: ${result.stderr}`,
+          );
           ensureKeysPromise = null; // allow retry on next call
         }
       })().catch(() => {
@@ -131,66 +176,83 @@ export const skillLedger: SecurityCapability = {
     // Eager key initialization (fire-and-forget from register)
     ensureKeys().catch(() => {});
 
-    // ── Hook handler ───────────────────────────────────────────────
-    api.on("before_tool_call", async (event: any, ctx: any) => {
-      try {
-        const skillMdPath = extractSkillPath(event);
-        if (!skillMdPath) return undefined;
-
-        const skillDir = resolveSkillDir(skillMdPath);
-        const skillName = basename(skillDir);
-
-        // Ensure keys are ready
-        await ensureKeys();
-
-        // Invoke CLI
-        const result = await callAgentSecCli(
-          ["skill-ledger", "check", skillDir],
-          { timeout: DEFAULT_TIMEOUT_MS },
-        );
-
-        // Parse JSON output — CLI may return exit code 1 for deny/tampered states,
-        // but stdout still contains valid check result with status field.
-        // We should parse stdout even if exit code is non-zero.
-        let checkResult: CheckResult;
+    // ── Hook handlers ───────────────────────────────────────────────
+    api.on(
+      "before_tool_call",
+      async (event: any, ctx: any) => {
         try {
-          checkResult = JSON.parse(result.stdout) as CheckResult;
-        } catch {
-          // Only log warning if parsing fails AND exit code is non-zero
-          if (result.exitCode !== 0) {
-            api.logger.warn(`[skill-ledger] CLI error (exit ${result.exitCode}): ${result.stderr}`);
-          } else {
-            api.logger.warn(`[skill-ledger] failed to parse CLI output: ${result.stdout}`);
+          const skillMdPath = extractSkillPath(event);
+          if (!skillMdPath) return undefined;
+
+          const skillDir = resolveSkillDir(skillMdPath);
+          const skillName = basename(skillDir);
+          const traceContext = buildTraceContext(event, ctx);
+
+          // Ensure keys are ready
+          await ensureKeys(traceContext);
+
+          // Invoke CLI
+          const result = await callAgentSecCli(
+            ["skill-ledger", "check", skillDir],
+            { timeout: DEFAULT_TIMEOUT_MS, traceContext },
+          );
+
+          // Parse JSON output. CLI may return exit code 1 for risky states,
+          // but stdout still contains valid check result with status field.
+          // We should parse stdout even if exit code is non-zero.
+          let checkResult: CheckResult;
+          try {
+            checkResult = JSON.parse(result.stdout) as CheckResult;
+          } catch {
+            // Only log warning if parsing fails AND exit code is non-zero
+            if (result.exitCode !== 0) {
+              api.logger.warn(
+                `[skill-ledger] CLI error (exit ${result.exitCode}): ${result.stderr}`,
+              );
+            } else {
+              api.logger.warn(
+                `[skill-ledger] failed to parse CLI output: ${result.stdout}`,
+              );
+            }
+            return undefined;
           }
+
+          const status = checkResult.status ?? "unknown";
+
+          if (status === "pass") {
+            return undefined;
+          }
+
+          const message = formatSkillLedgerMessage(status, skillName);
+          api.logger.warn(`[skill-ledger] ${message}`);
+
+          const severity = confirmationSeverity(status);
+          if (severity) {
+            if (cfg.enableBlock) {
+              return {
+                requireApproval: {
+                  title: "Skill Ledger Security Check",
+                  description: message,
+                  severity,
+                },
+              };
+            }
+
+            api.logger.warn(
+              `[skill-ledger] ${status.toUpperCase()} (enableBlock=false) — allowing`,
+            );
+          }
+
+          // For warn/error/unknown states, log and allow. Fail-open behavior for
+          // CLI/runtime failures remains handled by the catch/parse branches.
+          return undefined;
+        } catch (err) {
+          // Fail-open: uncaught errors must never block tool calls
+          api.logger.warn(`[skill-ledger] error: ${err}`);
           return undefined;
         }
-
-        const status = checkResult.status ?? "unknown";
-
-        // Emit warning for non-pass statuses
-        if (status === "pass") {
-          api.logger.info(`[skill-ledger] ✅ pass — '${skillName}'`);
-        } else {
-          const warnFn = WARNING_MESSAGES[status];
-          if (warnFn) {
-            api.logger.warn(`[skill-ledger] ${warnFn(skillName)}`);
-          } else {
-            api.logger.warn(`[skill-ledger] unknown status '${status}' for '${skillName}'`);
-          }
-        }
-
-        // Always allow — warning only, never block.
-        //
-        // TODO: When non-pass, display a user-visible warning while still
-        // allowing execution (matching the cosh hook's "allow + reason"
-        // semantics).  Use `requireApproval` with `severity: "warning"` to
-        // surface the message, similar to code-scan's warn path.
-        return undefined;
-      } catch (err) {
-        // Fail-open: uncaught errors must never block tool calls
-        api.logger.warn(`[skill-ledger] error: ${err}`);
-        return undefined;
-      }
-    }, { priority: 80 });
+      },
+      { priority: 80 },
+    );
   },
 };

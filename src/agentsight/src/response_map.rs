@@ -28,6 +28,10 @@ const MAX_RESPONSE_MAP_ENTRIES: usize = 10_000;
 static RESPONSE_ID_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r#"(?:responseId|response_id)":"([^"]+)"#).unwrap());
 
+/// Regex to match Anthropic/Claude Code message id format: `"id":"msg_<uuid>"`.
+/// Only matches values starting with `msg_` to avoid false positives from other "id" fields.
+static ANTHROPIC_MSG_ID_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r#""id":"(msg_[^"]+)"#).unwrap());
+
 /// Processes FileWrite events to build an in-memory responseId → sessionId mapping.
 /// Uses an LRU cache to bound memory usage.
 pub struct ResponseSessionMapper {
@@ -45,9 +49,7 @@ impl ResponseSessionMapper {
     /// Create a new empty mapper with default capacity.
     pub fn new() -> Self {
         ResponseSessionMapper {
-            map: LruCache::new(
-                NonZeroUsize::new(MAX_RESPONSE_MAP_ENTRIES).unwrap(),
-            ),
+            map: LruCache::new(NonZeroUsize::new(MAX_RESPONSE_MAP_ENTRIES).unwrap()),
         }
     }
 
@@ -88,9 +90,7 @@ impl ResponseSessionMapper {
 
             if let Some(response_id) = Self::extract_response_id(line) {
                 log::debug!(
-                    "ResponseSessionMapper: responseId={} → sessionId={}",
-                    response_id,
-                    session_id
+                    "ResponseSessionMapper: responseId={response_id} → sessionId={session_id}"
                 );
                 self.map.put(response_id, session_id.clone());
             }
@@ -122,8 +122,21 @@ impl ResponseSessionMapper {
 
     /// Extract "responseId" or "response_id" value from a single JSONL line using regex.
     /// Matches patterns like `responseId":"chatcmpl-xxxx"` or `response_id":"chatcmpl-xxxx"`.
+    /// Also matches Anthropic/Claude Code format: `"id":"msg_xxxx"`.
     fn extract_response_id(line: &str) -> Option<String> {
-        RESPONSE_ID_RE
+        // Try OpenAI-style responseId / response_id first
+        if let Some(id) = RESPONSE_ID_RE
+            .captures(line)
+            .and_then(|cap| cap.get(1))
+            .map(|m| m.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+        {
+            return Some(id);
+        }
+
+        // Fallback: try Anthropic/Claude Code message id ("id":"msg_xxx")
+        ANTHROPIC_MSG_ID_RE
             .captures(line)
             .and_then(|cap| cap.get(1))
             .map(|m| m.as_str())
@@ -138,9 +151,8 @@ mod tests {
 
     #[test]
     fn test_extract_session_id_simple() {
-        let id = ResponseSessionMapper::extract_session_id(
-            "550e8400-e29b-41d4-a716-446655440000.jsonl",
-        );
+        let id =
+            ResponseSessionMapper::extract_session_id("550e8400-e29b-41d4-a716-446655440000.jsonl");
         assert_eq!(id.as_deref(), Some("550e8400-e29b-41d4-a716-446655440000"));
     }
 
@@ -164,7 +176,8 @@ mod tests {
 
     #[test]
     fn test_extract_response_id() {
-        let line = r#"{"responseId":"chatcmpl-03a158a1-8982-90cd-adb1-6c8a1176f1f8","other":"data"}"#;
+        let line =
+            r#"{"responseId":"chatcmpl-03a158a1-8982-90cd-adb1-6c8a1176f1f8","other":"data"}"#;
         let id = ResponseSessionMapper::extract_response_id(line);
         assert_eq!(
             id.as_deref(),
@@ -211,6 +224,7 @@ mod tests {
             write_size: 0,
             comm: "agent".to_string(),
             filename: "550e8400-e29b-41d4-a716-446655440000.jsonl".to_string(),
+            cgroup_id: 0,
             buf: br#"{"responseId":"chatcmpl-abc123","content":"hello"}
 {"responseId":"chatcmpl-def456","content":"world"}
 "#
@@ -241,6 +255,7 @@ mod tests {
             write_size: 0,
             comm: "node".to_string(),
             filename: "a1b2c3d4-e5f6-7890-abcd-ef1234567890.jsonl".to_string(),
+            cgroup_id: 0,
             buf: br#"{"type":"system","subtype":"ui_telemetry","systemPayload":{"uiEvent":{"event.name":"api_response","response_id":"chatcmpl-f2748a8e-85d0-9058-b28f-c70e6f5fd590","model":"qwen-plus"}}}
 "#
             .to_vec(),
@@ -250,6 +265,49 @@ mod tests {
         assert_eq!(
             mapper.get_session_by_response_id("chatcmpl-f2748a8e-85d0-9058-b28f-c70e6f5fd590"),
             Some("a1b2c3d4-e5f6-7890-abcd-ef1234567890")
+        );
+    }
+
+    #[test]
+    fn test_extract_response_id_anthropic_msg_id() {
+        // Claude Code writes message id as "id":"msg_xxx" inside a "message" object
+        let line = r#"{"message":{"model":"glm-5.1","id":"msg_72b84528-120a-4857-8c20-a3d1747c062b","role":"assistant"}}"#;
+        let id = ResponseSessionMapper::extract_response_id(line);
+        assert_eq!(
+            id.as_deref(),
+            Some("msg_72b84528-120a-4857-8c20-a3d1747c062b")
+        );
+    }
+
+    #[test]
+    fn test_extract_response_id_non_msg_id_ignored() {
+        // Regular "id" fields (not starting with msg_) should NOT be matched
+        let line = r#"{"id":"550e8400-e29b-41d4-a716-446655440000","type":"user"}"#;
+        assert!(ResponseSessionMapper::extract_response_id(line).is_none());
+    }
+
+    #[test]
+    fn test_process_and_query_claude_code() {
+        // Claude Code writes assistant messages with "id":"msg_xxx"
+        let mut mapper = ResponseSessionMapper::new();
+        let event = FileWriteEvent {
+            pid: 9999,
+            tid: 9999,
+            uid: 1000,
+            timestamp_ns: 0,
+            write_size: 0,
+            comm: "claude".to_string(),
+            filename: "002b93c6-fbc3-4c66-9a8e-4a157715c049.jsonl".to_string(),
+            cgroup_id: 0,
+            buf: br#"{"message":{"model":"glm-5.1","id":"msg_72b84528-120a-4857-8c20-a3d1747c062b","role":"assistant","content":[]},"type":"assistant","sessionId":"002b93c6-fbc3-4c66-9a8e-4a157715c049"}
+"#
+            .to_vec(),
+        };
+        mapper.process_filewrite(&event);
+
+        assert_eq!(
+            mapper.get_session_by_response_id("msg_72b84528-120a-4857-8c20-a3d1747c062b"),
+            Some("002b93c6-fbc3-4c66-9a8e-4a157715c049")
         );
     }
 }

@@ -8,6 +8,7 @@ use rusqlite::Connection;
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Result type for stats operations
 pub type StatsResult<T> = Result<T, StatsError>;
@@ -29,7 +30,14 @@ pub struct StatsRecorder {
 impl StatsRecorder {
     /// Create a new recorder with database at the given path
     pub fn new<P: AsRef<Path>>(db_path: P) -> StatsResult<Self> {
-        let conn = Connection::open(db_path)?;
+        let conn = Connection::open(&db_path)?;
+        // Restrict the stats DB to owner-only — before_text/after_text
+        // columns may contain tool output with sensitive content.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(db_path.as_ref(), std::fs::Permissions::from_mode(0o600)).ok();
+        }
 
         conn.execute_batch(
             "
@@ -77,20 +85,51 @@ impl StatsRecorder {
             [],
         )?;
 
+        // Schema migration: add columns introduced in v0.3.0 if missing.
+        // Use PRAGMA table_info to check column existence before ALTER TABLE
+        // instead of relying on error-message string matching, which is
+        // fragile across SQLite versions and locales.
+        for col in &["before_output", "after_output"] {
+            let exists: bool = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('stats') WHERE name = ?",
+                    [col],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map(|c| c > 0)
+                .unwrap_or(false);
+            if !exists {
+                conn.execute(&format!("ALTER TABLE stats ADD COLUMN {} TEXT", col), [])?;
+            }
+        }
+
         Ok(Self {
             conn: Mutex::new(conn),
         })
     }
 
+    /// Acquire the connection guard, recovering from poison rather than failing.
+    ///
+    /// A poisoned mutex means a previous holder panicked while holding the
+    /// lock. For our single-statement workload (no multi-step transactions),
+    /// the SQLite connection itself remains usable — so we clear the poison
+    /// and reuse the underlying guard rather than dropping the call. This
+    /// keeps stats recording fail-soft after a transient panic instead of
+    /// permanently breaking every subsequent query.
+    fn lock_conn(&self) -> std::sync::MutexGuard<'_, Connection> {
+        self.conn.lock().unwrap_or_else(|poisoned| {
+            eprintln!(
+                "[tokenless-stats] WARNING: mutex was poisoned by a previous panic; recovering: {}",
+                poisoned
+            );
+            self.conn.clear_poison();
+            poisoned.into_inner()
+        })
+    }
+
     /// Record a statistics entry
     pub fn record(&self, record: &StatsRecord) -> StatsResult<i64> {
-        let conn = self.conn.lock().map_err(|e| {
-            self.conn.clear_poison();
-            StatsError::Database(rusqlite::Error::SqliteFailure(
-                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
-                Some(format!("Lock poisoned: {}", e)),
-            ))
-        })?;
+        let conn = self.lock_conn();
 
         conn.execute(
             "INSERT INTO stats (
@@ -120,51 +159,48 @@ impl StatsRecorder {
         Ok(conn.last_insert_rowid())
     }
 
+    /// Default limit when no limit is specified — caps memory usage
+    /// from unbounded loads while remaining generous for practical use.
+    const DEFAULT_LIMIT: usize = 10_000;
+
     /// Query all records, newest first, with optional limit
     pub fn all_records(&self, limit: Option<usize>) -> StatsResult<Vec<StatsRecord>> {
-        let conn = self.conn.lock().map_err(|e| {
-            self.conn.clear_poison();
-            StatsError::Database(rusqlite::Error::SqliteFailure(
-                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
-                Some(format!("Lock poisoned: {}", e)),
-            ))
-        })?;
+        let conn = self.lock_conn();
 
-        let sql = match limit {
-            Some(n) => format!(
-                "SELECT id, timestamp, operation, agent_id, source_pid, session_id, tool_use_id,
+        const SELECT_COLS: &str =
+            "id, timestamp, operation, agent_id, source_pid, session_id, tool_use_id,
                         before_chars, before_tokens, after_chars, after_tokens,
-                        before_text, after_text, before_output, after_output
-                 FROM stats ORDER BY timestamp DESC LIMIT {}",
-                n
-            ),
-            None => String::from(
-                "SELECT id, timestamp, operation, agent_id, source_pid, session_id, tool_use_id,
-                        before_chars, before_tokens, after_chars, after_tokens,
-                        before_text, after_text, before_output, after_output
-                 FROM stats ORDER BY timestamp DESC",
-            ),
-        };
+                        before_text, after_text, before_output, after_output";
 
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map([], Self::row_to_record)?;
+        let n = limit.unwrap_or(Self::DEFAULT_LIMIT);
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {} FROM stats ORDER BY timestamp DESC LIMIT ?",
+            SELECT_COLS
+        ))?;
+        let rows = stmt.query_map([n as i64], Self::row_to_record)?;
+        let records: Vec<_> = rows
+            .filter_map(|r| match r {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    static CORRUPT_LOGGED: AtomicBool = AtomicBool::new(false);
+                    if !CORRUPT_LOGGED.swap(true, Ordering::Relaxed) {
+                        eprintln!(
+                            "[tokenless-stats] skipping corrupt row(s): {} \
+                             (further corrupt rows suppressed)",
+                            e
+                        );
+                    }
+                    None
+                }
+            })
+            .collect();
 
-        let mut result = Vec::new();
-        for row in rows {
-            result.push(row?);
-        }
-        Ok(result)
+        Ok(records)
     }
 
     /// Get a single record by database ID
     pub fn record_by_id(&self, id: i64) -> StatsResult<Option<StatsRecord>> {
-        let conn = self.conn.lock().map_err(|e| {
-            self.conn.clear_poison();
-            StatsError::Database(rusqlite::Error::SqliteFailure(
-                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
-                Some(format!("Lock poisoned: {}", e)),
-            ))
-        })?;
+        let conn = self.lock_conn();
 
         let mut stmt = conn.prepare(
             "SELECT id, timestamp, operation, agent_id, source_pid, session_id, tool_use_id,
@@ -184,13 +220,7 @@ impl StatsRecorder {
 
     /// Get record count
     pub fn count(&self) -> StatsResult<usize> {
-        let conn = self.conn.lock().map_err(|e| {
-            self.conn.clear_poison();
-            StatsError::Database(rusqlite::Error::SqliteFailure(
-                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
-                Some(format!("Lock poisoned: {}", e)),
-            ))
-        })?;
+        let conn = self.lock_conn();
 
         let count: i64 = conn.query_row("SELECT COUNT(*) FROM stats", [], |row| row.get(0))?;
         Ok(count as usize)
@@ -198,13 +228,7 @@ impl StatsRecorder {
 
     /// Clear all records and reset auto-increment
     pub fn clear(&self) -> StatsResult<()> {
-        let conn = self.conn.lock().map_err(|e| {
-            self.conn.clear_poison();
-            StatsError::Database(rusqlite::Error::SqliteFailure(
-                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
-                Some(format!("Lock poisoned: {}", e)),
-            ))
-        })?;
+        let conn = self.lock_conn();
 
         conn.execute_batch("DELETE FROM stats; DELETE FROM sqlite_sequence WHERE name='stats';")?;
         Ok(())
@@ -217,9 +241,23 @@ impl StatsRecorder {
             id: row.get(0)?,
             timestamp: DateTime::parse_from_rfc3339(&row.get::<_, String>(1)?)
                 .map(|dt| dt.with_timezone(&chrono::Local))
-                .unwrap_or_else(|_| chrono::Local::now()),
-            operation: OperationType::from_str(&row.get::<_, String>(2)?)
-                .unwrap_or(OperationType::CompressSchema),
+                .unwrap_or_else(|e| {
+                    eprintln!(
+                        "[tokenless-stats] corrupt timestamp, using current time: {}",
+                        e
+                    );
+                    chrono::Local::now()
+                }),
+            operation: OperationType::from_str(&row.get::<_, String>(2)?).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    2,
+                    rusqlite::types::Type::Text,
+                    Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("unknown operation type: {}", e),
+                    )),
+                )
+            })?,
             agent_id,
             source_pid: row.get(4)?,
             session_id: row.get(5)?,
@@ -237,12 +275,17 @@ impl StatsRecorder {
 }
 
 /// Summary statistics
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct StatsSummary {
+    #[serde(rename = "records")]
     pub total_records: usize,
+    #[serde(rename = "before_chars")]
     pub total_before_chars: usize,
+    #[serde(rename = "after_chars")]
     pub total_after_chars: usize,
+    #[serde(rename = "before_tokens")]
     pub total_before_tokens: usize,
+    #[serde(rename = "after_tokens")]
     pub total_after_tokens: usize,
 }
 

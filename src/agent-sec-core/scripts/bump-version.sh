@@ -17,7 +17,10 @@
 #   5. openclaw-plugin/package.json          ("version" field)
 #   6. openclaw-plugin/openclaw.plugin.json  ("version" field)
 #   7. cosh-extension/cosh-extension.json    ("version" field)
-#   8. Lock files: Cargo.lock, uv.lock, package-lock.json (auto-regenerated)
+#   8. hermes-plugin/src/plugin.yaml        (version field)
+#   9. adapters/adapter-manifest.json        ("version" field)
+#  10. adapters/component.toml              (component.version)
+#  11. Lock files: Cargo.lock, uv.lock, package-lock.json (auto-regenerated)
 #
 # Manual update required (not automated):
 #   - agent-sec-core.spec.in  (%changelog entry)
@@ -172,7 +175,31 @@ bump_file "$PROJECT_ROOT/cosh-extension/cosh-extension.json" \
     "cosh-extension/cosh-extension.json"
 
 # -----------------------------------------------------------------------------
-# 8. Regenerate lock files
+# 8. hermes-plugin/src/plugin.yaml
+# -----------------------------------------------------------------------------
+bump_file "$PROJECT_ROOT/hermes-plugin/src/plugin.yaml" \
+    "^version: $OLD_VERSION" \
+    "version: $NEW_VERSION" \
+    "hermes-plugin/src/plugin.yaml"
+
+# -----------------------------------------------------------------------------
+# 9. adapters/adapter-manifest.json
+# -----------------------------------------------------------------------------
+bump_file "$PROJECT_ROOT/adapters/adapter-manifest.json" \
+    "\"version\": \"$OLD_VERSION\"" \
+    "\"version\": \"$NEW_VERSION\"" \
+    "adapters/adapter-manifest.json"
+
+# -----------------------------------------------------------------------------
+# 10. adapters/component.toml
+# -----------------------------------------------------------------------------
+bump_file "$PROJECT_ROOT/adapters/component.toml" \
+    "^version = \"$OLD_VERSION\"" \
+    "version = \"$NEW_VERSION\"" \
+    "adapters/component.toml"
+
+# -----------------------------------------------------------------------------
+# 11. Regenerate lock files
 # -----------------------------------------------------------------------------
 log "Regenerating lock files..."
 

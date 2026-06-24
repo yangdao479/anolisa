@@ -32,6 +32,21 @@ on:
         required: false
         type: boolean
         default: false
+      run_agent_memory:
+        description: 'Force run agent-memory tests (ignore change detection)'
+        required: false
+        type: boolean
+        default: false
+      run_anolisa:
+        description: 'Force run anolisa tests (ignore change detection)'
+        required: false
+        type: boolean
+        default: false
+      run_skillfs:
+        description: 'Force run SkillFS tests (ignore change detection)'
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -42,13 +57,16 @@ jobs:
   # =========================================================================
   detect-changes:
     name: Detect Changes
-    runs-on: ubuntu-22.04
+    runs-on: [self-hosted, ubuntu]
     outputs:
       copilot_shell: ${{ steps.changes.outputs.copilot_shell }}
       agent_sec_core: ${{ steps.changes.outputs.agent_sec_core }}
       agentsight: ${{ steps.changes.outputs.agentsight }}
       tokenless: ${{ steps.changes.outputs.tokenless }}
       ws_ckpt: ${{ steps.changes.outputs.ws_ckpt }}
+      agent_memory: ${{ steps.changes.outputs.agent_memory }}
+      anolisa: ${{ steps.changes.outputs.anolisa }}
+      skillfs: ${{ steps.changes.outputs.skillfs }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -74,6 +92,9 @@ jobs:
           AGENTSIGHT=false
           TOKENLESS=false
           WS_CKPT=false
+          AGENT_MEMORY=false
+          ANOLISA=false
+          SKILLFS=false
 
           # Path-based detection
           if echo "$CHANGED" | grep -q "^src/copilot-shell/"; then
@@ -90,6 +111,15 @@ jobs:
           fi
           if echo "$CHANGED" | grep -q "^src/ws-ckpt/"; then
             WS_CKPT=true
+          fi
+          if echo "$CHANGED" | grep -q "^src/agent-memory/"; then
+            AGENT_MEMORY=true
+          fi
+          if echo "$CHANGED" | grep -q "^src/anolisa/"; then
+            ANOLISA=true
+          fi
+          if echo "$CHANGED" | grep -q "^src/skillfs/"; then
+            SKILLFS=true
           fi
 
           # Manual override via workflow_dispatch
@@ -108,12 +138,24 @@ jobs:
           if [[ "${{ inputs.run_ws_ckpt }}" == "true" ]]; then
             WS_CKPT=true
           fi
+          if [[ "${{ inputs.run_agent_memory }}" == "true" ]]; then
+            AGENT_MEMORY=true
+          fi
+          if [[ "${{ inputs.run_anolisa }}" == "true" ]]; then
+            ANOLISA=true
+          fi
+          if [[ "${{ inputs.run_skillfs }}" == "true" ]]; then
+            SKILLFS=true
+          fi
 
           echo "copilot_shell=$COPILOT_SHELL" >> $GITHUB_OUTPUT
           echo "agent_sec_core=$AGENT_SEC" >> $GITHUB_OUTPUT
           echo "agentsight=$AGENTSIGHT" >> $GITHUB_OUTPUT
           echo "tokenless=$TOKENLESS" >> $GITHUB_OUTPUT
           echo "ws_ckpt=$WS_CKPT" >> $GITHUB_OUTPUT
+          echo "agent_memory=$AGENT_MEMORY" >> $GITHUB_OUTPUT
+          echo "anolisa=$ANOLISA" >> $GITHUB_OUTPUT
+          echo "skillfs=$SKILLFS" >> $GITHUB_OUTPUT
 
           echo "### Change Detection Results" >> $GITHUB_STEP_SUMMARY
           echo "| Component | Changed |" >> $GITHUB_STEP_SUMMARY
@@ -123,6 +165,9 @@ jobs:
           echo "| agentsight | $AGENTSIGHT |" >> $GITHUB_STEP_SUMMARY
           echo "| tokenless | $TOKENLESS |" >> $GITHUB_STEP_SUMMARY
           echo "| ws-ckpt | $WS_CKPT |" >> $GITHUB_STEP_SUMMARY
+          echo "| agent-memory | $AGENT_MEMORY |" >> $GITHUB_STEP_SUMMARY
+          echo "| anolisa | $ANOLISA |" >> $GITHUB_STEP_SUMMARY
+          echo "| SkillFS | $SKILLFS |" >> $GITHUB_STEP_SUMMARY
 
   # =========================================================================
   # Step 2: Build & Lint copilot-shell
@@ -131,7 +176,7 @@ jobs:
     name: Build copilot-shell
     needs: detect-changes
     if: needs.detect-changes.outputs.copilot_shell == 'true'
-    runs-on: ubuntu-22.04
+    runs-on: [self-hosted, ubuntu]
     steps:
       - uses: actions/checkout@v4
 
@@ -175,7 +220,7 @@ jobs:
     name: Test copilot-shell/cli
     needs: [detect-changes, build-copilot-shell]
     if: needs.detect-changes.outputs.copilot_shell == 'true'
-    runs-on: ubuntu-22.04
+    runs-on: [self-hosted, ubuntu]
     steps:
       - uses: actions/checkout@v4
 
@@ -205,7 +250,7 @@ jobs:
     name: Test copilot-shell/core
     needs: [detect-changes, build-copilot-shell]
     if: needs.detect-changes.outputs.copilot_shell == 'true'
-    runs-on: ubuntu-22.04
+    runs-on: [self-hosted, ubuntu]
     steps:
       - uses: actions/checkout@v4
 
@@ -238,7 +283,7 @@ jobs:
     name: Test agent-sec-core
     needs: detect-changes
     if: needs.detect-changes.outputs.agent_sec_core == 'true'
-    runs-on: ubuntu-22.04
+    runs-on: [self-hosted, ubuntu]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -267,7 +312,7 @@ jobs:
           sudo apt-get install -y clang llvm libssl-dev libseccomp-dev bubblewrap
 
       - name: Install diff-cover
-        run: uv tool install diff-cover
+        run: uv tool install --force diff-cover
 
       - name: Check formatting
         run: |
@@ -279,6 +324,33 @@ jobs:
               exit 1
           fi
           echo "Code style check passed."
+
+      - name: Lint check (incremental)
+        if: github.event_name == 'pull_request'
+        run: |
+          cd src/agent-sec-core
+          uv run --project agent-sec-cli ruff check --config agent-sec-cli/pyproject.toml --output-format=concise . > ruff_report.txt || true
+          # Prefix paths to match git-diff repo-root-relative paths
+          sed -i 's|^\([^: ]*\.py\)|src/agent-sec-core/\1|' ruff_report.txt
+          cd "$GITHUB_WORKSPACE"
+          LINT_OUTPUT=$(diff-quality --violations=flake8 --fail-under=100 src/agent-sec-core/ruff_report.txt 2>&1) || true
+          rm -f src/agent-sec-core/ruff_report.txt
+          echo "$LINT_OUTPUT"
+          # Extract violation count from diff-quality output
+          if echo "$LINT_OUTPUT" | grep -q "Failure"; then
+            {
+              echo "### ⚠️ agent-sec-core Lint Warnings (incremental)"
+              echo ""
+              echo '以下为 PR 变更行中的 ruff lint 违规（不卡点，仅提示）：'
+              echo ""
+              echo '```'
+              echo "$LINT_OUTPUT"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::warning::Lint violations found in changed lines. See step summary for details."
+          else
+            echo "### ✅ agent-sec-core Lint Check Passed" >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Run Python tests with coverage
         run: |
@@ -485,13 +557,19 @@ jobs:
     name: Test agentsight
     needs: detect-changes
     if: needs.detect-changes.outputs.agentsight == 'true'
-    runs-on: ubuntu-22.04
+    runs-on: [self-hosted, ubuntu]
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: '1.89.0'
+          components: 'rustfmt, clippy, llvm-tools-preview'
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -503,11 +581,102 @@ jobs:
           sudo apt-get install -y clang llvm libbpf-dev libelf-dev elfutils libssl-dev zlib1g-dev pkg-config
           sudo apt-get install -y perl
 
-      - name: Run tests
+      - name: Check formatting
         run: |
-          rustup component add rustfmt
           cd src/agentsight
-          cargo test
+          cargo fmt --all --check
+
+      - name: Check architecture boundaries
+        run: |
+          cd src/agentsight
+          python3 scripts/check-arch-boundaries.py
+
+      - name: Lint
+        run: |
+          cd src/agentsight
+          cargo clippy --all-targets -- -D warnings
+
+      - name: Run tests with coverage
+        run: |
+          cd src/agentsight
+          cargo llvm-cov --cobertura --output-path coverage.xml \
+            --ignore-filename-regex '(\.skel\.rs|target/debug/build|target/release/build|src/probes/)'
+
+      - name: Generate coverage summary
+        if: always()
+        shell: python3 {0}
+        run: |
+          import xml.etree.ElementTree as ET, os, pathlib
+          cov = pathlib.Path("src/agentsight/coverage.xml")
+          summary = os.environ.get("GITHUB_STEP_SUMMARY", "/dev/null")
+          with open(summary, "a") as f:
+              if cov.exists():
+                  root = ET.parse(cov).getroot()
+                  rate = float(root.get("line-rate", "0"))
+                  valid = root.get("lines-valid", "0")
+                  covered = root.get("lines-covered", "0")
+                  pct = f"{rate * 100:.1f}"
+                  f.write("### agentsight (Rust) Test Coverage\n\n")
+                  f.write("| Metric | Coverage | Detail |\n")
+                  f.write("|--------|----------|--------|\n")
+                  f.write(f"| Line Coverage | **{pct}%** | {covered}/{valid} lines |\n")
+              else:
+                  f.write("### agentsight coverage report not found\n")
+
+      - name: Upload coverage artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agentsight-coverage
+          path: src/agentsight/coverage.xml
+          retention-days: 30
+
+      - name: Install diff-cover
+        if: github.event_name == 'pull_request'
+        run: pip install --break-system-packages diff-cover
+
+      - name: Incremental coverage gate (PR only)
+        if: github.event_name == 'pull_request'
+        env:
+          COMPARE_BRANCH: "origin/${{ github.base_ref }}"
+        run: |
+          cd src/agentsight
+          THRESHOLD=80
+          GATE_FAILED=false
+          echo "=== Diff-cover: comparing against $COMPARE_BRANCH ==="
+          DIFF_OUTPUT=$(diff-cover coverage.xml --compare-branch="$COMPARE_BRANCH" --fail-under=$THRESHOLD 2>&1) || GATE_FAILED=true
+          echo "$DIFF_OUTPUT"
+
+          PCT=$(echo "$DIFF_OUTPUT" | grep -oP 'Coverage:\s*\K[0-9.]+(?=%)' || echo "N/A")
+          TOTAL=$(echo "$DIFF_OUTPUT" | grep -oP 'Total:\s+\K[0-9]+' || echo "-")
+          MISSING=$(echo "$DIFF_OUTPUT" | grep -oP 'Missing:\s*\K[0-9]+' || echo "-")
+
+          {
+            echo "### Incremental Coverage Gate (agentsight)"
+            echo ""
+            echo "| New Code Coverage | Total New Lines | Missing | Threshold |"
+            echo "|-------------------|-----------------|---------|-----------|"
+            echo "| ${PCT}% | ${TOTAL} | ${MISSING} | ${THRESHOLD}% |"
+            if [ "${GATE_FAILED:-}" = "true" ]; then
+              echo ""
+              echo "> **Gate FAILED**: New code coverage is below ${THRESHOLD}%. Please add tests for uncovered changes."
+              echo ""
+              echo "<details><summary>Uncovered files (click to expand)</summary>"
+              echo ""
+              echo '```'
+              echo "$DIFF_OUTPUT" | grep -E '^\S.*Missing lines' || true
+              echo '```'
+              echo "</details>"
+            else
+              echo ""
+              echo "> **Gate PASSED**: All new code meets the ${THRESHOLD}% coverage threshold."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "${GATE_FAILED:-}" = "true" ]; then
+            echo "::error::Incremental coverage gate failed: new code coverage < ${THRESHOLD}%"
+            exit 1
+          fi
 
   # =========================================================================
   # Step 6: Test tokenless
@@ -516,13 +685,13 @@ jobs:
     name: Test tokenless
     needs: detect-changes
     if: needs.detect-changes.outputs.tokenless == 'true'
-    runs-on: ubuntu-22.04
+    runs-on: [self-hosted, ubuntu]
     steps:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: '1.85.0'
+          toolchain: '1.89.0'
           components: 'rustfmt, clippy'
 
       - uses: Swatinem/rust-cache@v2
@@ -532,17 +701,17 @@ jobs:
       - name: Check formatting
         run: |
           cd src/tokenless
-          cargo fmt --all --check
+          cargo fmt -p tokenless-cli -p tokenless-schema -p tokenless-stats -- --check
 
       - name: Lint
         run: |
           cd src/tokenless
-          cargo clippy --workspace -- -D warnings
+          cargo clippy -p tokenless-cli -p tokenless-schema -p tokenless-stats -- -D warnings
 
       - name: Run tests
         run: |
           cd src/tokenless
-          cargo test --workspace
+          cargo test -p tokenless-cli -p tokenless-schema -p tokenless-stats
 
   # =========================================================================
   # Step 7: Test ws-ckpt
@@ -551,7 +720,7 @@ jobs:
     name: Test ws-ckpt
     needs: detect-changes
     if: needs.detect-changes.outputs.ws_ckpt == 'true'
-    runs-on: ubuntu-22.04
+    runs-on: [self-hosted, ubuntu]
     steps:
       - uses: actions/checkout@v4
 
@@ -582,3 +751,153 @@ jobs:
         run: |
           cd src/ws-ckpt/src
           cargo test --workspace
+
+      # ── Rust coverage gate ──────────────────────────────────────────────
+      - name: Rust coverage gate (≥45%)
+        run: |
+          cargo install cargo-tarpaulin --locked
+          cd src/ws-ckpt/src
+          cargo tarpaulin --workspace --out Stdout --fail-under 45
+
+      # ── Plugin tests + coverage gates ───────────────────────────────────
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: OpenClaw plugin coverage gate (≥90%)
+        working-directory: src/ws-ckpt/src/plugins/openclaw
+        run: |
+          npm install -g npm@10.9.0
+          npm ci --registry=https://registry.npmmirror.com --replace-registry-host=always
+          ./node_modules/.bin/vitest run --coverage
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Hermes plugin coverage gate (≥90%)
+        run: |
+          pip install pytest pytest-cov pyyaml
+          cd src/ws-ckpt/src/plugins
+          python -m pytest hermes/tests/ --cov=hermes --cov-report=term --cov-fail-under=90
+
+
+  # =========================================================================
+  # Step 8: Test agent-memory (Linux-only Rust crate)
+  # =========================================================================
+  test-agent-memory:
+    name: Test agent-memory
+    needs: detect-changes
+    if: needs.detect-changes.outputs.agent_memory == 'true'
+    runs-on: [self-hosted, ubuntu]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.89.0'
+          components: 'rustfmt, clippy'
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src/agent-memory
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsystemd-dev cmake
+
+      - name: Check formatting
+        run: |
+          cd src/agent-memory
+          cargo fmt --all --check
+
+      - name: Lint
+        run: |
+          cd src/agent-memory
+          cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Run tests
+        run: |
+          cd src/agent-memory
+          cargo test --locked
+
+  # =========================================================================
+  # Step 9: Test anolisa (Rust workspace)
+  # =========================================================================
+  test-anolisa:
+    name: Test anolisa
+    needs: detect-changes
+    if: needs.detect-changes.outputs.anolisa == 'true'
+    runs-on: [self-hosted, ubuntu]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.88.0'
+          components: 'rustfmt, clippy'
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src/anolisa
+
+      - name: Check formatting
+        run: |
+          cd src/anolisa
+          cargo fmt --all --check
+
+      - name: Lint
+        run: |
+          cd src/anolisa
+          cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Run tests
+        run: |
+          cd src/anolisa
+          cargo test --locked
+
+  # =========================================================================
+  # Step 10: Test SkillFS (Rust workspace)
+  # =========================================================================
+  test-skillfs:
+    name: Test SkillFS
+    needs: detect-changes
+    if: needs.detect-changes.outputs.skillfs == 'true'
+    runs-on: [self-hosted, ubuntu]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.86.0'
+          components: 'rustfmt, clippy'
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src/skillfs
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fuse3 libfuse3-dev pkg-config
+
+      - name: Check formatting
+        run: |
+          cd src/skillfs
+          cargo fmt --all --check
+
+      - name: Lint
+        run: |
+          cd src/skillfs
+          cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Run tests
+        run: |
+          cd src/skillfs
+          cargo test --workspace
+
+      - name: Run FUSE smoke test
+        run: |
+          cd src/skillfs
+          scripts/test.sh

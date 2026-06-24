@@ -27,6 +27,7 @@ Task Progress:
 - [ ] Step 3: Verify installation
 - [ ] Step 4: Configure API provider
 - [ ] Step 5: Test run
+- [ ] Step 6: Tokenless plugin auto-installed
 ```
 
 ### Step 1: Check System & Install Prerequisites
@@ -113,6 +114,8 @@ Or use the automated script (auto-fallback all 3 methods):
 bash scripts/install-claude-code.sh
 ```
 
+Pass `--skip-tokenless` to skip the tokenless Claude Code plugin auto-installation.
+
 ### Step 3: Verify Installation
 
 ```bash
@@ -135,7 +138,7 @@ Write the following to `~/.claude/settings.json`:
 ```json
 {
   "env": {
-    "ANTHROPIC_BASE_URL": "https://dashscope.aliyuncs.com/api/v2/apps/claude-code-proxy",
+    "ANTHROPIC_BASE_URL": "https://dashscope.aliyuncs.com/apps/anthropic",
     "ANTHROPIC_AUTH_TOKEN": "YOUR_API_KEY",
     "ANTHROPIC_MODEL": "qwen3-coder-plus",
     "ANTHROPIC_SMALL_FAST_MODEL": "qwen3-coder-plus"
@@ -150,7 +153,7 @@ Replace `YOUR_API_KEY` with the user's actual API key.
 If the user prefers shell env vars over `settings.json`, append to `~/.bashrc`:
 
 ```bash
-export ANTHROPIC_BASE_URL="https://dashscope.aliyuncs.com/api/v2/apps/claude-code-proxy"
+export ANTHROPIC_BASE_URL="https://dashscope.aliyuncs.com/apps/anthropic"
 export ANTHROPIC_AUTH_TOKEN="YOUR_API_KEY"
 export ANTHROPIC_MODEL="qwen3-coder-plus"
 export ANTHROPIC_SMALL_FAST_MODEL="qwen3-coder-plus"

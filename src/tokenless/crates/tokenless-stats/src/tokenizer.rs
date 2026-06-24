@@ -1,21 +1,51 @@
 //! Tokenizer for estimating token counts.
 
 /// Estimate token count from text using character-based heuristic.
-/// Uses ~4 characters per token for English text as a rough approximation.
+/// CJK characters count as ~1 token each; other characters use ~4 per token.
 pub fn estimate_tokens(text: &str) -> usize {
     if text.is_empty() {
         return 0;
     }
-    text.chars().count().div_ceil(4)
+    let mut cjk = 0usize;
+    let mut other = 0usize;
+    for c in text.chars() {
+        if is_cjk(c) {
+            cjk += 1;
+        } else {
+            other += 1;
+        }
+    }
+    cjk + other.div_ceil(4)
 }
 
-/// Estimate token count from a character count when text is unavailable.
-/// Same heuristic: ~4 characters per token.
-pub fn estimate_tokens_from_chars(chars: usize) -> usize {
-    if chars == 0 {
+fn is_cjk(c: char) -> bool {
+    matches!(c,
+        '\u{4E00}'..='\u{9FFF}'
+        | '\u{3400}'..='\u{4DBF}'
+        | '\u{F900}'..='\u{FAFF}'
+        | '\u{20000}'..='\u{2A6DF}'
+        | '\u{2A700}'..='\u{2B73F}'
+        | '\u{2B740}'..='\u{2B81F}'
+        | '\u{2B820}'..='\u{2CEAF}'
+        | '\u{2CEB0}'..='\u{2EBEF}'
+        | '\u{30000}'..='\u{3134F}'
+        | '\u{3100}'..='\u{312F}'
+        | '\u{AC00}'..='\u{D7AF}'
+        | '\u{3040}'..='\u{309F}'
+        | '\u{30A0}'..='\u{30FF}'
+    )
+}
+
+/// Estimate token count from byte length when text is unavailable.
+/// Uses ~4 bytes per token for ASCII/English text. For UTF-8 multi-byte
+/// characters this overestimates (fewer bytes per token); for CJK text
+/// (~3 bytes/char, ~1-2 chars/token) it underestimates. Use
+/// `estimate_tokens(&str)` when text is available for more accurate results.
+pub fn estimate_tokens_from_bytes(bytes: usize) -> usize {
+    if bytes == 0 {
         return 0;
     }
-    chars.div_ceil(4)
+    bytes.div_ceil(4)
 }
 
 /// Count Unicode characters in text.
@@ -47,5 +77,56 @@ impl Tokenizer {
 impl Default for Tokenizer {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_string() {
+        assert_eq!(estimate_tokens(""), 0);
+        assert_eq!(estimate_tokens_from_bytes(0), 0);
+        assert_eq!(count_chars(""), 0);
+    }
+
+    #[test]
+    fn ascii_text() {
+        // 11 chars / 4 = 3 tokens
+        assert_eq!(estimate_tokens("hello world"), 3);
+        assert_eq!(count_chars("hello world"), 11);
+    }
+
+    #[test]
+    fn cjk_text() {
+        // 4 CJK chars × 1 token/char = 4 tokens
+        assert_eq!(estimate_tokens("你好世界"), 4);
+        assert_eq!(count_chars("你好世界"), 4);
+    }
+
+    #[test]
+    fn emoji() {
+        // 2 emoji chars / 4 = 1 token
+        assert_eq!(estimate_tokens("🎉🎊"), 1);
+        assert_eq!(count_chars("🎉🎊"), 2);
+    }
+
+    #[test]
+    fn mixed_text() {
+        // 5 ASCII chars / 4 = 2 tokens + 2 CJK chars = 2 tokens → 4 total
+        let text = "Hello你好";
+        assert_eq!(count_chars(text), 7);
+        assert_eq!(estimate_tokens(text), 4);
+    }
+
+    #[test]
+    fn byte_estimate_vs_char_estimate() {
+        // For ASCII, byte and char estimates should match
+        let text = "abcdef";
+        assert_eq!(
+            estimate_tokens(text),
+            estimate_tokens_from_bytes(text.len())
+        );
     }
 }

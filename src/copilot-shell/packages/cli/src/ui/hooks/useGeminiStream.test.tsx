@@ -9,7 +9,6 @@ import type { Mock, MockInstance } from 'vitest';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { renderHook, act, waitFor } from '@testing-library/react';
 import { useGeminiStream } from './useGeminiStream.js';
-import { useKeypress } from './useKeypress.js';
 import * as atCommandProcessor from './atCommandProcessor.js';
 import type {
   TrackedToolCall,
@@ -105,10 +104,6 @@ vi.mock('./useVisionAutoSwitch.js', () => ({
     handleVisionSwitch: mockHandleVisionSwitch,
     restoreOriginalModel: mockRestoreOriginalModel,
   })),
-}));
-
-vi.mock('./useKeypress.js', () => ({
-  useKeypress: vi.fn(),
 }));
 
 vi.mock('./shellCommandProcessor.js', () => ({
@@ -851,28 +846,8 @@ describe('useGeminiStream', () => {
     expect(result.current.streamingState).toBe(StreamingState.Responding);
   });
 
-  describe('User Cancellation', () => {
-    let keypressCallback: (key: any) => void;
-    const mockUseKeypress = useKeypress as Mock;
-
-    beforeEach(() => {
-      // Capture the callback passed to useKeypress
-      mockUseKeypress.mockImplementation((callback, options) => {
-        if (options.isActive) {
-          keypressCallback = callback;
-        } else {
-          keypressCallback = () => {};
-        }
-      });
-    });
-
-    const simulateEscapeKeyPress = () => {
-      act(() => {
-        keypressCallback({ name: 'escape' });
-      });
-    };
-
-    it('should cancel an in-progress stream when escape is pressed', async () => {
+  describe('Cancellation', () => {
+    it('should cancel an in-progress stream when cancelOngoingRequest is called', async () => {
       const mockStream = (async function* () {
         yield { type: 'content', value: 'Part 1' };
         // Keep the stream open
@@ -892,8 +867,10 @@ describe('useGeminiStream', () => {
         expect(result.current.streamingState).toBe(StreamingState.Responding);
       });
 
-      // Simulate escape key press
-      simulateEscapeKeyPress();
+      // Call cancelOngoingRequest directly
+      act(() => {
+        result.current.cancelOngoingRequest();
+      });
 
       // Verify cancellation message is added
       await waitFor(() => {
@@ -910,7 +887,7 @@ describe('useGeminiStream', () => {
       expect(result.current.streamingState).toBe(StreamingState.Idle);
     });
 
-    it('should call onCancelSubmit handler when escape is pressed', async () => {
+    it('should call onCancelSubmit handler when cancelOngoingRequest is called', async () => {
       const cancelSubmitSpy = vi.fn();
       const mockStream = (async function* () {
         yield { type: 'content', value: 'Part 1' };
@@ -948,12 +925,14 @@ describe('useGeminiStream', () => {
         result.current.submitQuery('test query');
       });
 
-      simulateEscapeKeyPress();
+      act(() => {
+        result.current.cancelOngoingRequest();
+      });
 
       expect(cancelSubmitSpy).toHaveBeenCalled();
     });
 
-    it('should call setShellInputFocused(false) when escape is pressed', async () => {
+    it('should call setShellInputFocused(false) when cancelOngoingRequest is called', async () => {
       const setShellInputFocusedSpy = vi.fn();
       const mockStream = (async function* () {
         yield { type: 'content', value: 'Part 1' };
@@ -990,18 +969,22 @@ describe('useGeminiStream', () => {
         result.current.submitQuery('test query');
       });
 
-      simulateEscapeKeyPress();
+      act(() => {
+        result.current.cancelOngoingRequest();
+      });
 
       expect(setShellInputFocusedSpy).toHaveBeenCalledWith(false);
     });
 
-    it('should not do anything if escape is pressed when not responding', () => {
+    it('should not do anything if cancelOngoingRequest is called when not responding', () => {
       const { result } = renderTestHook();
 
       expect(result.current.streamingState).toBe(StreamingState.Idle);
 
-      // Simulate escape key press
-      simulateEscapeKeyPress();
+      // Call cancelOngoingRequest directly
+      act(() => {
+        result.current.cancelOngoingRequest();
+      });
 
       // No change should happen, no cancellation message
       expect(mockAddItem).not.toHaveBeenCalledWith(
@@ -1036,7 +1019,9 @@ describe('useGeminiStream', () => {
       });
 
       // Cancel the request
-      simulateEscapeKeyPress();
+      act(() => {
+        result.current.cancelOngoingRequest();
+      });
 
       // Allow the stream to continue
       act(() => {
@@ -1084,7 +1069,9 @@ describe('useGeminiStream', () => {
       expect(result.current.streamingState).toBe(StreamingState.Responding);
 
       // Try to cancel
-      simulateEscapeKeyPress();
+      act(() => {
+        result.current.cancelOngoingRequest();
+      });
 
       // Nothing should happen because the state is not `Responding`
       expect(abortSpy).not.toHaveBeenCalled();
@@ -3315,6 +3302,165 @@ describe('useGeminiStream', () => {
 
       // State stays null.
       expect(result.current.userPromptConfirmationRequest).toBeNull();
+    });
+  });
+
+  // Regression coverage for issue #635: HookSystemMessage must not be
+  // routed through assistant content, and pending content flushes triggered
+  // by Content<->Thought block switches must advance the redaction cursor.
+  describe('HookSystemMessage and Content/Thought interleaving', () => {
+    const geminiTextCalls = () =>
+      mockAddItem.mock.calls
+        .filter(
+          (call) =>
+            call[0].type === 'gemini' || call[0].type === 'gemini_content',
+        )
+        .map((call) => call[0].text as string);
+
+    it('renders HookSystemMessage as an info item and does not duplicate it into later assistant content', async () => {
+      mockSendMessageStream.mockReturnValue(
+        (async function* () {
+          yield {
+            type: ServerGeminiEventType.HookSystemMessage,
+            value: '[test-hook] warning',
+          };
+          yield {
+            type: ServerGeminiEventType.Thought,
+            value: { subject: '', description: 'thinking' },
+          };
+          yield {
+            type: ServerGeminiEventType.Content,
+            value: 'answer',
+          };
+          yield {
+            type: ServerGeminiEventType.Finished,
+            value: { reason: 'STOP', usageMetadata: undefined },
+          };
+        })(),
+      );
+
+      const { result } = renderTestHook();
+
+      await act(async () => {
+        await result.current.submitQuery('hook test');
+      });
+
+      await waitFor(() => {
+        // Hook message must surface as a host/info notification.
+        expect(mockAddItem).toHaveBeenCalledWith(
+          expect.objectContaining({
+            type: MessageType.INFO,
+            text: '[test-hook] warning',
+          }),
+          expect.any(Number),
+        );
+        // The model answer is still committed as a gemini item.
+        expect(mockAddItem).toHaveBeenCalledWith(
+          expect.objectContaining({ type: 'gemini', text: 'answer' }),
+          expect.any(Number),
+        );
+      });
+
+      // No gemini / gemini_content item may carry the hook warning text —
+      // it must never have been treated as assistant content.
+      for (const text of geminiTextCalls()) {
+        expect(text).not.toContain('[test-hook] warning');
+      }
+    });
+
+    it('does not re-emit earlier content when a Thought separates two Content chunks', async () => {
+      mockSendMessageStream.mockReturnValue(
+        (async function* () {
+          yield {
+            type: ServerGeminiEventType.Content,
+            value: 'first',
+          };
+          yield {
+            type: ServerGeminiEventType.Thought,
+            value: { subject: '', description: 'thinking' },
+          };
+          yield {
+            type: ServerGeminiEventType.Content,
+            value: 'second',
+          };
+          yield {
+            type: ServerGeminiEventType.Finished,
+            value: { reason: 'STOP', usageMetadata: undefined },
+          };
+        })(),
+      );
+
+      const { result } = renderTestHook();
+
+      await act(async () => {
+        await result.current.submitQuery('split test');
+      });
+
+      await waitFor(() => {
+        // The post-thought content must commit as just "second", not
+        // "firstsecond" (which would mean the redaction cursor was not
+        // advanced when the thought flushed the pending gemini item).
+        expect(mockAddItem).toHaveBeenCalledWith(
+          expect.objectContaining({ type: 'gemini', text: 'second' }),
+          expect.any(Number),
+        );
+      });
+
+      const texts = geminiTextCalls();
+      // Each text is exactly one chunk, never a concatenation that would
+      // indicate a re-slice of already-committed content.
+      expect(texts).toEqual(expect.arrayContaining(['first', 'second']));
+      for (const text of texts) {
+        expect(text).not.toBe('firstsecond');
+        expect(text).not.toContain('firstfirst');
+      }
+    });
+
+    it('handles repeated Thought -> Content block switches without duplicating prior content', async () => {
+      mockSendMessageStream.mockReturnValue(
+        (async function* () {
+          yield {
+            type: ServerGeminiEventType.Thought,
+            value: { subject: '', description: 't1' },
+          };
+          yield {
+            type: ServerGeminiEventType.Content,
+            value: 'c1',
+          };
+          yield {
+            type: ServerGeminiEventType.Thought,
+            value: { subject: '', description: 't2' },
+          };
+          yield {
+            type: ServerGeminiEventType.Content,
+            value: 'c2',
+          };
+          yield {
+            type: ServerGeminiEventType.Finished,
+            value: { reason: 'STOP', usageMetadata: undefined },
+          };
+        })(),
+      );
+
+      const { result } = renderTestHook();
+
+      await act(async () => {
+        await result.current.submitQuery('multi switch');
+      });
+
+      await waitFor(() => {
+        expect(mockAddItem).toHaveBeenCalledWith(
+          expect.objectContaining({ type: 'gemini', text: 'c2' }),
+          expect.any(Number),
+        );
+      });
+
+      const texts = geminiTextCalls();
+      expect(texts).toEqual(expect.arrayContaining(['c1', 'c2']));
+      for (const text of texts) {
+        expect(text).not.toBe('c1c2');
+        expect(text).not.toContain('c1c1');
+      }
     });
   });
 });

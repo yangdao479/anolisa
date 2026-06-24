@@ -2,12 +2,20 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use chrono::Utc;
 use dashmap::DashMap;
-use tokio::sync::{Notify, OnceCell, RwLock};
-use tracing::{info, warn};
+use tokio::sync::{Mutex, Notify, OnceCell, RwLock, Semaphore};
+use tracing::{error, info, warn};
 
+use ws_ckpt_common::backend::BackendType;
 use ws_ckpt_common::backend::StorageBackend;
-use ws_ckpt_common::{DaemonConfig, ResolveError, SnapshotIndex, WorkspaceInfo, INDEX_FILE};
+use ws_ckpt_common::persist::{
+    self, BackendIdentity, BackendPaths, DaemonStateFile, WorkspaceEntry, DAEMON_STATE_VERSION,
+};
+use ws_ckpt_common::{
+    load_workspace_policy, load_workspace_policy_with_failsafe, DaemonConfig, LoadPolicyOutcome,
+    ResolveError, SnapshotIndex, WorkspaceInfo, WorkspacePolicy, INDEXES_DIR, INDEX_FILE,
+};
 
 use crate::fs_watcher::WorkspaceWatcher;
 use crate::index_store;
@@ -38,18 +46,41 @@ pub struct DaemonState {
     bootstrapped: OnceCell<()>,
     /// File watchers for write-lock detection (ws_id -> watcher)
     watchers: std::sync::Mutex<HashMap<String, WorkspaceWatcher>>,
+    /// State persistence directory path
+    pub state_dir: PathBuf,
+    /// Backend selection method: "auto-detect" | "config" | "persisted"
+    selection_method: String,
+    /// Per-ws-id mutex serializing lifecycle ops (init / adopt / recover) that
+    /// race on the same `index_dir(ws_id)` and `workspaces` slot. Distinct
+    /// from `WorkspaceState::policy_io_mu` (which lives inside an Arc that
+    /// recover would unregister). Held across `await`.
+    wsid_locks: DashMap<String, Arc<Mutex<()>>>,
 }
 
 pub struct WorkspaceState {
     pub ws_id: String,
     pub path: PathBuf,
     pub index: SnapshotIndex,
+    /// Per-workspace policy override; `WorkspacePolicy::default()` when no
+    /// `policy.toml` exists (i.e. inherit everything from global).
+    pub policy: WorkspacePolicy,
+    /// True iff `policy` is a synthetic fail-safe value injected at register
+    /// time because `policy.toml` was unreadable. Blocks PATCH (which would
+    /// silently persist the synthetic value as truth) until reload or reset.
+    pub policy_failsafe: bool,
+    /// Narrow per-ws serializer for PATCH/RESET on `policy.toml`. Decoupled
+    /// from the ws RwLock so checkpoint/list/status are NOT blocked by a slow
+    /// fsync; only competing PATCH/RESET wait. Held across spawn_blocking,
+    /// hence `tokio::sync::Mutex`. The ws write lock itself is taken only to
+    /// commit the in-memory result, never across the disk op.
+    pub policy_io_mu: Arc<Mutex<()>>,
 }
 
 impl DaemonState {
-    pub fn new(config: DaemonConfig, backend: Arc<dyn StorageBackend>) -> Self {
+    pub fn new(config: DaemonConfig, backend: Arc<dyn StorageBackend>, state_dir: PathBuf) -> Self {
         let mount_path = config.mount_path.clone();
         let socket_path = config.socket_path.clone();
+        let selection_method = "auto-detect".to_string();
         Self {
             workspaces: DashMap::new(),
             path_to_wsid: DashMap::new(),
@@ -61,18 +92,220 @@ impl DaemonState {
             start_time: std::time::Instant::now(),
             bootstrapped: OnceCell::new(),
             watchers: std::sync::Mutex::new(HashMap::new()),
+            state_dir,
+            selection_method,
+            wsid_locks: DashMap::new(),
         }
     }
 
-    /// Ensure BtrfsLoop backend is bootstrapped (idempotent, runs at most once).
-    pub async fn ensure_bootstrapped(&self) -> anyhow::Result<()> {
-        if self.backend.backend_type() != ws_ckpt_common::backend::BackendType::BtrfsLoop {
-            return Ok(());
+    /// Acquire (or get-or-create) the per-ws-id lifecycle lock. Held by
+    /// init / adopt_existing_subvol / recover_workspace to serialize the
+    /// register/unregister + index-dir-mutation window. Entries are not
+    /// removed: each is ~few hundred bytes, and removal would race with
+    /// another waiter that just cloned the Arc.
+    pub async fn lock_wsid(&self, ws_id: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        let mtx = self
+            .wsid_locks
+            .entry(ws_id.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone();
+        mtx.lock_owned().await
+    }
+
+    /// get the index storage directory for a workspace
+    pub fn index_dir(&self, ws_id: &str) -> PathBuf {
+        self.state_dir.join(INDEXES_DIR).join(ws_id)
+    }
+
+    /// Poison-safe snapshot of the current daemon config.
+    ///
+    /// A panic under the write lock poisons it, making `.read().unwrap()`
+    /// re-panic and take down every config reader (policy IPCs, scheduler).
+    /// We consume the poison and return the last-written value, which is
+    /// what read-only consumers want. Prefer this over `.read().unwrap()`.
+    pub fn config_snapshot(&self) -> DaemonConfig {
+        let guard = match self.config.read() {
+            Ok(g) => g,
+            Err(poisoned) => {
+                tracing::warn!(
+                    "config RwLock was poisoned by a panicking writer; reading anyway \
+                     to keep policy IPCs and the scheduler alive"
+                );
+                poisoned.into_inner()
+            }
+        };
+        guard.clone()
+    }
+
+    /// Rebuild runtime state from persisted file
+    pub async fn rebuild_from_persisted(
+        state_file: &DaemonStateFile,
+        config: DaemonConfig,
+        backend: Arc<dyn StorageBackend>,
+        state_dir: PathBuf,
+        selection_method: &str,
+    ) -> anyhow::Result<Self> {
+        let mut state = Self::new(config, backend, state_dir);
+        state.selection_method = selection_method.to_string();
+
+        for entry in &state_file.workspaces {
+            let ws_id = &entry.ws_id;
+            let index_dir = state.index_dir(ws_id);
+            let index_path = index_dir.join(INDEX_FILE);
+
+            let index = match tokio::fs::read_to_string(&index_path).await {
+                Ok(content) => match serde_json::from_str::<SnapshotIndex>(&content) {
+                    Ok(idx) => idx,
+                    Err(e) => {
+                        warn!("Failed to parse index file {:?}: {}", index_path, e);
+                        SnapshotIndex::new(entry.workspace_path.clone())
+                    }
+                },
+                Err(e) => {
+                    warn!("Failed to read index file {:?}: {}", index_path, e);
+                    SnapshotIndex::new(entry.workspace_path.clone())
+                }
+            };
+
+            info!(
+                "Restoring workspace from persisted state: {} -> {:?}",
+                ws_id, entry.workspace_path
+            );
+
+            // Start file watcher
+            match WorkspaceWatcher::start(&entry.workspace_path) {
+                Ok(watcher) => {
+                    state.register_watcher(ws_id.clone(), watcher);
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to start file watcher for workspace {}: {}",
+                        ws_id, e
+                    );
+                }
+            }
+            // Shared helper: Missing → inherit-global; Err → fail-safe
+            // (auto_cleanup=false + policy_failsafe=true). See [[ws-failsafe]].
+            let (policy, failsafe) =
+                load_workspace_policy_with_failsafe(&index_dir, ws_id, "rebuild");
+            state.register_workspace_with_policy(
+                ws_id.clone(),
+                entry.workspace_path.clone(),
+                index,
+                policy,
+                failsafe,
+            );
         }
+
+        // Reconcile: mark phantom snapshots whose subvolumes no longer exist
+        let snapshots_root = state.backend.snapshots_root().to_path_buf();
+        let ws_ids: Vec<String> = state.workspaces.iter().map(|e| e.key().clone()).collect();
+        for ws_id in &ws_ids {
+            if let Some(ws_arc) = state.get_by_wsid(ws_id) {
+                let mut ws = ws_arc.write().await;
+                let mut changed = false;
+                // Need to iterate with keys, so use a collected list
+                let snap_ids: Vec<String> = ws.index.snapshots.keys().cloned().collect();
+                for snap_id in &snap_ids {
+                    let snap_path = snapshots_root.join(ws_id).join(snap_id);
+                    if !snap_path.exists() {
+                        if let Some(snap) = ws.index.snapshots.get_mut(snap_id) {
+                            if !snap.missing {
+                                error!(
+                                    "Snapshot {} subvolume missing at {:?}, marking as unavailable",
+                                    snap_id, snap_path
+                                );
+                                snap.missing = true;
+                                changed = true;
+                            }
+                        }
+                    } else if let Some(snap) = ws.index.snapshots.get_mut(snap_id) {
+                        if snap.missing {
+                            info!(
+                                "Snapshot {} subvolume recovered at {:?}",
+                                snap_id, snap_path
+                            );
+                            snap.missing = false;
+                            changed = true;
+                        }
+                    }
+                }
+                if changed {
+                    // Save reconciled index
+                    let index_dir = state.index_dir(ws_id);
+                    if let Err(e) = index_store::save(&index_dir, &ws.index).await {
+                        warn!("Failed to save reconciled index for {}: {}", ws_id, e);
+                    }
+                }
+            }
+        }
+
+        Ok(state)
+    }
+
+    /// Save current runtime state to state.json (atomic write+rename+fsync)
+    pub async fn save_manifest(&self) -> anyhow::Result<()> {
+        let backend_type = self.backend.backend_type();
+        let backend = BackendIdentity {
+            backend_type,
+            selection_method: self.selection_method.clone(),
+            selected_at: Utc::now(),
+        };
+        let paths = match backend_type {
+            BackendType::BtrfsLoop => BackendPaths::BtrfsLoop {
+                mount_path: self.backend.data_root().to_path_buf(),
+                data_root: self.backend.data_root().to_path_buf(),
+                snapshots_root: self.backend.snapshots_root().to_path_buf(),
+                loop_img: self.backend.loop_img_state().await,
+            },
+            BackendType::BtrfsBase => BackendPaths::BtrfsBase {
+                mount_path: self.backend.data_root().to_path_buf(),
+                data_root: self.backend.data_root().to_path_buf(),
+                snapshots_root: self.backend.snapshots_root().to_path_buf(),
+            },
+        };
+        let state_file = DaemonStateFile::new(
+            DAEMON_STATE_VERSION,
+            backend,
+            paths,
+            self.collect_workspace_entries(),
+        );
+
+        // Perform sync IO in a blocking thread
+        let state_dir = self.state_dir.clone();
+        tokio::task::spawn_blocking(move || persist::save_state(&state_dir, &state_file))
+            .await
+            .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {}", e))??;
+
+        Ok(())
+    }
+
+    /// Collect registered workspace entries for state.json. No RwLock taken so
+    /// a write-locked ws is not silently dropped.
+    fn collect_workspace_entries(&self) -> Vec<WorkspaceEntry> {
+        self.path_to_wsid
+            .iter()
+            .filter_map(|entry| {
+                let ws_id = entry.value().clone();
+                if !self.workspaces.contains_key(&ws_id) {
+                    return None;
+                }
+                Some(WorkspaceEntry {
+                    ws_id,
+                    workspace_path: entry.key().clone(),
+                    registered_at: Utc::now(),
+                    origin_backend: self.backend.backend_type(),
+                })
+            })
+            .collect()
+    }
+
+    /// Idempotently call the backend's bootstrap hook (runs at most once).
+    pub async fn ensure_bootstrapped(&self) -> anyhow::Result<()> {
         self.bootstrapped
             .get_or_try_init(|| async {
-                let config = self.config.read().unwrap().clone();
-                crate::bootstrap::bootstrap(&config).await
+                let config = self.config_snapshot();
+                self.backend.bootstrap(&config).await
             })
             .await?;
         Ok(())
@@ -92,6 +325,9 @@ impl DaemonState {
     /// Resolve a workspace by identifier: tries workspace ID first, then filesystem path.
     /// Supports absolute paths, relative paths, and workspace IDs (e.g., "ws-6d5aaa").
     pub async fn resolve_workspace(&self, workspace: &str) -> Option<Arc<RwLock<WorkspaceState>>> {
+        if workspace.trim().is_empty() {
+            return None;
+        }
         // Normalize: strip trailing slashes so "/a/b/" and "/a/b" are equivalent.
         let workspace = {
             let t = workspace.trim_end_matches('/');
@@ -124,16 +360,152 @@ impl DaemonState {
     }
 
     pub fn register_workspace(&self, ws_id: String, path: PathBuf, index: SnapshotIndex) {
+        self.register_workspace_with_policy(ws_id, path, index, WorkspacePolicy::default(), false);
+    }
+
+    pub fn register_workspace_with_policy(
+        &self,
+        ws_id: String,
+        path: PathBuf,
+        index: SnapshotIndex,
+        policy: WorkspacePolicy,
+        failsafe: bool,
+    ) {
         let state = Arc::new(RwLock::new(WorkspaceState {
             ws_id: ws_id.clone(),
             path: path.clone(),
             index,
+            policy,
+            policy_failsafe: failsafe,
+            policy_io_mu: Arc::new(Mutex::new(())),
         }));
-        self.path_to_wsid.insert(path, ws_id.clone());
-        self.workspaces.insert(ws_id, state);
+        self.workspaces.insert(ws_id.clone(), state);
+        self.path_to_wsid.insert(path, ws_id);
+        self.config_notify.notify_waiters();
     }
 
-    pub fn unregister_workspace(&self, ws_id: &str) {
+    /// Reload every `policy.toml` from disk into the in-memory state.
+    /// Called by `handle_reload_config` so out-of-band edits are picked up
+    /// by `ws-ckpt reload` / `systemctl reload`.
+    ///
+    /// Three invariants, each fixing a real bug:
+    /// 1. **fs-serialize via `policy_io_mu`, not the ws RwLock**: a per-ws
+    ///    narrow mutex (the same one PATCH/RESET take around save+commit) is
+    ///    held across the disk read; the ws RwLock is taken only for the
+    ///    few-microsecond memory commit. This still excludes any concurrent
+    ///    SET stomp, but lets checkpoint/list/status keep running while the
+    ///    blocking pool is busy. See [[ws-lock-no-fs-loops]].
+    /// 2. **Blocking I/O on a worker**: `load_workspace_policy` is sync
+    ///    `std::fs`; run it on a blocking thread so N reads don't starve
+    ///    concurrent CLI requests.
+    /// 3. **Strict error handling**: only `Missing` collapses to default;
+    ///    a transient I/O / parse error must NOT erase live policy — we
+    ///    keep it and `warn!`.
+    ///
+    /// Per-ws tasks run concurrently (capped by semaphore) so a 500-ws fleet
+    /// doesn't serialize into a multi-second reload; invariant #1 still holds
+    /// per task because `policy_io_mu` is per-ws, not shared.
+    pub async fn reload_all_workspace_policies(&self) {
+        // Cap to avoid flooding the blocking pool during reload.
+        const RELOAD_CONCURRENCY: usize = 32;
+        let sem = Arc::new(Semaphore::new(RELOAD_CONCURRENCY));
+
+        let ws_ids: Vec<String> = self.workspaces.iter().map(|e| e.key().clone()).collect();
+        let mut set = tokio::task::JoinSet::new();
+        for ws_id in ws_ids {
+            let arc = match self.get_by_wsid(&ws_id) {
+                Some(a) => a,
+                None => continue, // unregistered between snapshot and now
+            };
+            let dir = self.index_dir(&ws_id);
+            let sem = Arc::clone(&sem);
+            set.spawn(async move {
+                let _permit = sem.acquire_owned().await.expect("semaphore not closed");
+                Self::reload_one_workspace_policy_inner(&ws_id, dir, &arc).await;
+            });
+        }
+        // Drain so a panicking task can't abort the reload.
+        while let Some(res) = set.join_next().await {
+            if let Err(e) = res {
+                warn!("reload: per-ws task panicked or was cancelled: {}", e);
+            }
+        }
+    }
+
+    /// Reload a single workspace's `policy.toml`. Returns `false` if the ws is
+    /// no longer registered. Same write-lock-first invariant as the bulk path.
+    pub async fn reload_workspace_policy(&self, ws_id: &str) -> bool {
+        let Some(arc) = self.get_by_wsid(ws_id) else {
+            return false;
+        };
+        let dir = self.index_dir(ws_id);
+        Self::reload_one_workspace_policy_inner(ws_id, dir, &arc).await;
+        true
+    }
+
+    async fn reload_one_workspace_policy_inner(
+        ws_id: &str,
+        dir: PathBuf,
+        arc: &Arc<RwLock<WorkspaceState>>,
+    ) {
+        // (1) Tiny read lock: grab the per-ws fs serializer.
+        let policy_io_mu = {
+            let ws = arc.read().await;
+            ws.policy_io_mu.clone()
+        };
+
+        // (2) Serialize against concurrent PATCH/RESET via the narrow per-ws
+        //     mutex (same one PATCH/RESET hold around save+commit). This gives
+        //     us the original "no SET stomp" guarantee without blocking
+        //     checkpoint/list/status on a slow disk via the ws RwLock.
+        let _io_guard = policy_io_mu.lock().await;
+
+        // (3) Disk read on a blocking worker, with NO ws RwLock held.
+        let outcome = tokio::task::spawn_blocking(move || load_workspace_policy(&dir)).await;
+
+        // (4) Tiny write lock to commit the in-memory result. Disk is the
+        //     source of truth; this just brings memory in sync. PATCH/RESET
+        //     can't have raced here because they're behind `policy_io_mu`.
+        match outcome {
+            // Successful read: real on-disk truth, drop any fail-safe marker.
+            Ok(Ok(LoadPolicyOutcome::Missing)) => {
+                let mut ws = arc.write().await;
+                ws.policy = WorkspacePolicy::default();
+                ws.policy_failsafe = false;
+            }
+            Ok(Ok(LoadPolicyOutcome::Loaded(p))) => {
+                let mut ws = arc.write().await;
+                ws.policy = p;
+                ws.policy_failsafe = false;
+            }
+            Ok(Err(e)) => warn!(
+                "reload: failed to load policy for {}: {}; preserving live in-memory policy",
+                ws_id, e
+            ),
+            Err(join_err) => warn!(
+                "reload: spawn_blocking joined with error for {}: {}; preserving live policy",
+                ws_id, join_err
+            ),
+        }
+    }
+
+    /// True iff at least one workspace's effective policy (local-or-global)
+    /// would do work this tick. Lets `auto_cleanup_loop` decide whether to
+    /// park. Subsumes the legacy global-only short-circuits by checking the
+    /// merged policy of every ws, so a per-ws override that re-enables
+    /// cleanup wins over a globally-off default.
+    pub async fn any_ws_has_effective_cleanup(&self) -> bool {
+        let cfg_snapshot = self.config_snapshot();
+        for arc in self.all_workspaces() {
+            let ws = arc.read().await;
+            if !ws.policy.effective_for(&cfg_snapshot).is_disabled() {
+                return true;
+            }
+        }
+        false
+    }
+
+    pub async fn unregister_workspace(&self, ws_id: &str) {
         // Stop watcher if present
         if let Ok(mut watchers) = self.watchers.lock() {
             if let Some(w) = watchers.remove(ws_id) {
@@ -141,13 +513,15 @@ impl DaemonState {
             }
         }
         if let Some((_, ws_state)) = self.workspaces.remove(ws_id) {
-            // We need the path to remove from path_to_wsid.
-            // Since we can't async here, use try_read or blocking_read.
-            // The RwLock should be uncontested at this point.
-            if let Ok(state) = ws_state.try_read() {
-                self.path_to_wsid.remove(&state.path);
-            }
+            // Await any in-flight writer (e.g. a concurrent checkpoint) so
+            // path_to_wsid is never leaked. After workspaces.remove no new
+            // holders can appear; existing ones drop quickly.
+            let state = ws_state.read().await;
+            self.path_to_wsid.remove(&state.path);
         }
+        // Symmetric with register: re-park/re-evaluate the
+        // scheduler when a ws goes away. No-op when no one is parked.
+        self.config_notify.notify_waiters();
     }
 
     /// Register a file watcher for a workspace.
@@ -189,8 +563,9 @@ impl DaemonState {
     pub async fn rebuild_from_disk(
         config: DaemonConfig,
         backend: Arc<dyn StorageBackend>,
+        state_dir: PathBuf,
     ) -> anyhow::Result<Self> {
-        let state = Self::new(config.clone(), backend);
+        let state = Self::new(config.clone(), backend, state_dir);
 
         // Use backend's snapshots root (not config.mount_path) so BtrfsBase and
         // BtrfsLoop both point at the correct on-disk location.
@@ -283,7 +658,12 @@ impl DaemonState {
                 warn!("Failed to start watcher for {}: {}", ws_id, e);
             }
         }
-        state.register_workspace(ws_id, workspace_path, index);
+        // Shared fail-safe helper; same `(policy, failsafe)` semantics as
+        // every other register entry. See [[ws-failsafe]].
+        let policy_dir = state.index_dir(&ws_id);
+        let (policy, failsafe) =
+            load_workspace_policy_with_failsafe(&policy_dir, &ws_id, "rebuild");
+        state.register_workspace_with_policy(ws_id, workspace_path, index, policy, failsafe);
 
         Ok(())
     }
@@ -322,35 +702,29 @@ impl DaemonState {
         }
     }
 
-    /// Collect summary information about all registered workspaces.
-    pub fn get_all_workspace_info(&self) -> Vec<WorkspaceInfo> {
-        self.workspaces
-            .iter()
-            .map(|entry| {
-                let ws = entry.value();
-                // Use try_read to avoid blocking; the lock should be uncontested.
-                if let Ok(state) = ws.try_read() {
-                    WorkspaceInfo {
-                        ws_id: state.ws_id.clone(),
-                        path: state.path.to_string_lossy().to_string(),
-                        snapshot_count: state.index.snapshots.len() as u32,
-                    }
-                } else {
-                    WorkspaceInfo {
-                        ws_id: entry.key().clone(),
-                        path: "<locked>".to_string(),
-                        snapshot_count: 0,
-                    }
-                }
-            })
-            .collect()
+    /// Collect summary information about all registered workspaces. Awaits the
+    /// read lock so the result reflects real path/snapshot_count even when a
+    /// ws is held under a write lock.
+    pub async fn get_all_workspace_info(&self) -> Vec<WorkspaceInfo> {
+        let mut out = Vec::new();
+        for arc in self.all_workspaces() {
+            let state = arc.read().await;
+            out.push(WorkspaceInfo {
+                ws_id: state.ws_id.clone(),
+                path: state.path.to_string_lossy().to_string(),
+                snapshot_count: state.index.snapshots.len() as u32,
+            });
+        }
+        out
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ws_ckpt_common::{CleanupRetention, DaemonConfig, SnapshotIndex, SnapshotMeta};
+    use ws_ckpt_common::{
+        save_workspace_policy, CleanupRetention, DaemonConfig, SnapshotIndex, SnapshotMeta,
+    };
 
     fn test_backend() -> Arc<dyn StorageBackend> {
         Arc::new(crate::backends::btrfs_loop::BtrfsLoopBackend::new(
@@ -369,7 +743,6 @@ mod tests {
             auto_cleanup_interval_secs: 86_400,
             health_check_interval_secs: 300,
             backend_type: "auto".to_string(),
-            img_path: "/data/ws-ckpt/btrfs-data.img".to_string(),
             img_size: 30,
             img_max_percent: 40.0,
             min_free_bytes: 512 * 1024 * 1024,
@@ -377,15 +750,19 @@ mod tests {
         }
     }
 
+    fn test_state_dir() -> PathBuf {
+        PathBuf::from("/tmp/test-state")
+    }
+
     #[test]
     fn new_state_has_empty_workspaces() {
-        let state = DaemonState::new(test_config(), test_backend());
+        let state = DaemonState::new(test_config(), test_backend(), test_state_dir());
         assert!(state.all_workspaces().is_empty());
     }
 
     #[test]
     fn register_and_get_by_wsid() {
-        let state = DaemonState::new(test_config(), test_backend());
+        let state = DaemonState::new(test_config(), test_backend(), test_state_dir());
         let index = SnapshotIndex::new(PathBuf::from("/home/user/ws"));
         state.register_workspace("ws-abc".to_string(), PathBuf::from("/home/user/ws"), index);
 
@@ -395,7 +772,7 @@ mod tests {
 
     #[test]
     fn register_and_get_by_path() {
-        let state = DaemonState::new(test_config(), test_backend());
+        let state = DaemonState::new(test_config(), test_backend(), test_state_dir());
         let path = PathBuf::from("/home/user/project");
         let index = SnapshotIndex::new(path.clone());
         state.register_workspace("ws-001".to_string(), path.clone(), index);
@@ -406,7 +783,7 @@ mod tests {
 
     #[tokio::test]
     async fn register_and_verify_ws_id_content() {
-        let state = DaemonState::new(test_config(), test_backend());
+        let state = DaemonState::new(test_config(), test_backend(), test_state_dir());
         let path = PathBuf::from("/home/user/ws2");
         let index = SnapshotIndex::new(path.clone());
         state.register_workspace("ws-xyz".to_string(), path.clone(), index);
@@ -420,19 +797,19 @@ mod tests {
 
     #[test]
     fn get_by_wsid_nonexistent_returns_none() {
-        let state = DaemonState::new(test_config(), test_backend());
+        let state = DaemonState::new(test_config(), test_backend(), test_state_dir());
         assert!(state.get_by_wsid("nonexistent").is_none());
     }
 
     #[test]
     fn get_by_path_nonexistent_returns_none() {
-        let state = DaemonState::new(test_config(), test_backend());
+        let state = DaemonState::new(test_config(), test_backend(), test_state_dir());
         assert!(state.get_by_path(&PathBuf::from("/no/such/path")).is_none());
     }
 
     #[tokio::test]
     async fn resolve_workspace_by_wsid() {
-        let state = DaemonState::new(test_config(), test_backend());
+        let state = DaemonState::new(test_config(), test_backend(), test_state_dir());
         let path = PathBuf::from("/home/user/ws");
         let index = SnapshotIndex::new(path.clone());
         state.register_workspace("ws-abc123".to_string(), path, index);
@@ -441,7 +818,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_workspace_by_path() {
-        let state = DaemonState::new(test_config(), test_backend());
+        let state = DaemonState::new(test_config(), test_backend(), test_state_dir());
         let tmpdir = tempfile::tempdir().unwrap();
         let path = tokio::fs::canonicalize(tmpdir.path()).await.unwrap();
         let index = SnapshotIndex::new(path.clone());
@@ -454,14 +831,14 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_workspace_not_found_returns_none() {
-        let state = DaemonState::new(test_config(), test_backend());
+        let state = DaemonState::new(test_config(), test_backend(), test_state_dir());
         assert!(state.resolve_workspace("nonexistent").await.is_none());
         assert!(state.resolve_workspace("/no/such/path").await.is_none());
     }
 
     #[test]
     fn path_to_wsid_bidirectional_mapping() {
-        let state = DaemonState::new(test_config(), test_backend());
+        let state = DaemonState::new(test_config(), test_backend(), test_state_dir());
         let path = PathBuf::from("/home/user/myws");
         let index = SnapshotIndex::new(path.clone());
         state.register_workspace("ws-map".to_string(), path.clone(), index);
@@ -475,7 +852,7 @@ mod tests {
     #[test]
     fn duplicate_register_overwrites() {
         // Registering the same ws_id again should overwrite
-        let state = DaemonState::new(test_config(), test_backend());
+        let state = DaemonState::new(test_config(), test_backend(), test_state_dir());
         let path1 = PathBuf::from("/ws/first");
         let path2 = PathBuf::from("/ws/second");
         let index1 = SnapshotIndex::new(path1.clone());
@@ -490,9 +867,9 @@ mod tests {
         assert_eq!(ws.path, path2);
     }
 
-    #[test]
-    fn unregister_workspace_removes_both_mappings() {
-        let state = DaemonState::new(test_config(), test_backend());
+    #[tokio::test]
+    async fn unregister_workspace_removes_both_mappings() {
+        let state = DaemonState::new(test_config(), test_backend(), test_state_dir());
         let path = PathBuf::from("/home/user/removable");
         let index = SnapshotIndex::new(path.clone());
         state.register_workspace("ws-rm".to_string(), path.clone(), index);
@@ -502,7 +879,7 @@ mod tests {
         assert!(state.get_by_path(&path).is_some());
 
         // Unregister
-        state.unregister_workspace("ws-rm");
+        state.unregister_workspace("ws-rm").await;
 
         // Verify both mappings removed
         assert!(state.get_by_wsid("ws-rm").is_none());
@@ -511,7 +888,7 @@ mod tests {
 
     #[test]
     fn all_workspaces_returns_all_registered() {
-        let state = DaemonState::new(test_config(), test_backend());
+        let state = DaemonState::new(test_config(), test_backend(), test_state_dir());
         state.register_workspace(
             "ws-a".to_string(),
             PathBuf::from("/a"),
@@ -527,7 +904,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_snapshot_globally_exact_match() {
-        let state = DaemonState::new(test_config(), test_backend());
+        let state = DaemonState::new(test_config(), test_backend(), test_state_dir());
         let mut index = SnapshotIndex::new(PathBuf::from("/home/user/ws"));
         index.snapshots.insert(
             "abcdef1234567890abcdef1234567890abcdef12".to_string(),
@@ -536,6 +913,9 @@ mod tests {
                 metadata: None,
                 pinned: false,
                 created_at: chrono::Utc::now(),
+                missing: false,
+                parent_id: None,
+                child_ids: vec![],
             },
         );
         state.register_workspace("ws-abc".to_string(), PathBuf::from("/home/user/ws"), index);
@@ -551,7 +931,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_snapshot_globally_prefix_match() {
-        let state = DaemonState::new(test_config(), test_backend());
+        let state = DaemonState::new(test_config(), test_backend(), test_state_dir());
         let mut index = SnapshotIndex::new(PathBuf::from("/ws1"));
         index.snapshots.insert(
             "abcdef1234567890abcdef1234567890abcdef12".to_string(),
@@ -560,6 +940,9 @@ mod tests {
                 metadata: None,
                 pinned: false,
                 created_at: chrono::Utc::now(),
+                missing: false,
+                parent_id: None,
+                child_ids: vec![],
             },
         );
         state.register_workspace("ws-1".to_string(), PathBuf::from("/ws1"), index);
@@ -572,7 +955,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_snapshot_globally_not_found() {
-        let state = DaemonState::new(test_config(), test_backend());
+        let state = DaemonState::new(test_config(), test_backend(), test_state_dir());
         state.register_workspace(
             "ws-1".to_string(),
             PathBuf::from("/ws1"),
@@ -584,12 +967,15 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_snapshot_globally_ambiguous_cross_workspace() {
-        let state = DaemonState::new(test_config(), test_backend());
+        let state = DaemonState::new(test_config(), test_backend(), test_state_dir());
         let meta = SnapshotMeta {
             message: None,
             metadata: None,
             pinned: false,
             created_at: chrono::Utc::now(),
+            missing: false,
+            parent_id: None,
+            child_ids: vec![],
         };
 
         let mut idx1 = SnapshotIndex::new(PathBuf::from("/ws1"));
@@ -610,15 +996,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ensure_bootstrapped_non_btrfs_loop_is_noop() {
-        // BtrfsBase backend should skip bootstrap entirely
+    async fn ensure_bootstrapped_btrfs_base_runs_default_bootstrap() {
+        // BtrfsBase bootstrap just creates data_root & snapshots dirs; must succeed on a writable mount point.
+        let tmp = tempfile::tempdir().unwrap();
         let backend: Arc<dyn StorageBackend> =
             Arc::new(crate::backends::btrfs_base::BtrfsBaseBackend::new(
-                PathBuf::from("/tmp/test-btrfs-mount"),
+                tmp.path().to_path_buf(),
                 crate::backends::btrfs_base::BtrfsBaseScenario::InPlace,
             ));
-        let state = DaemonState::new(test_config(), backend);
-        // Should return Ok immediately without attempting any bootstrap
+        let state = DaemonState::new(test_config(), backend, test_state_dir());
         state.ensure_bootstrapped().await.unwrap();
     }
 
@@ -627,7 +1013,309 @@ mod tests {
         // For BtrfsLoop backend, the OnceCell ensures bootstrap is called at most once.
         // We can't actually run bootstrap in unit tests (requires root + btrfs),
         // but we can verify the OnceCell is properly initialized.
-        let state = DaemonState::new(test_config(), test_backend());
+        let state = DaemonState::new(test_config(), test_backend(), test_state_dir());
         assert!(state.bootstrapped.get().is_none());
+    }
+
+    #[tokio::test]
+    async fn collect_workspace_entries_does_not_drop_write_locked_ws() {
+        use tokio::sync::oneshot;
+
+        let state = DaemonState::new(test_config(), test_backend(), test_state_dir());
+        let path_a = PathBuf::from("/ws-locked");
+        let path_b = PathBuf::from("/ws-free");
+        state.register_workspace(
+            "ws-a".to_string(),
+            path_a.clone(),
+            SnapshotIndex::new(path_a),
+        );
+        state.register_workspace(
+            "ws-b".to_string(),
+            path_b.clone(),
+            SnapshotIndex::new(path_b),
+        );
+
+        let ws_a = state.get_by_wsid("ws-a").unwrap();
+        let (acquired_tx, acquired_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel::<()>();
+        let holder = tokio::spawn(async move {
+            let _guard = ws_a.write().await;
+            let _ = acquired_tx.send(());
+            let _ = release_rx.await;
+        });
+        acquired_rx.await.unwrap();
+
+        let entries = state.collect_workspace_entries();
+        let ids: std::collections::HashSet<&str> =
+            entries.iter().map(|e| e.ws_id.as_str()).collect();
+        assert_eq!(entries.len(), 2);
+        assert!(ids.contains("ws-a"));
+        assert!(ids.contains("ws-b"));
+
+        let _ = release_tx.send(());
+        holder.await.unwrap();
+    }
+
+    // ── Per-workspace policy plumbing tests ──
+
+    #[tokio::test]
+    async fn register_workspace_default_policy_is_inherit_global() {
+        let state = DaemonState::new(test_config(), test_backend(), test_state_dir());
+        let path = PathBuf::from("/ws/inherit");
+        state.register_workspace("ws-i".to_string(), path.clone(), SnapshotIndex::new(path));
+        let arc = state.get_by_wsid("ws-i").unwrap();
+        let ws = arc.read().await;
+        assert!(ws.policy.is_empty(), "default register sets empty policy");
+    }
+
+    #[tokio::test]
+    async fn any_ws_has_effective_cleanup_covers_global_and_local_paths() {
+        // test_config() has auto_cleanup=false, so a fresh state with no
+        // ws (or only inherit-default ws) should report no effective work.
+        let state = DaemonState::new(test_config(), test_backend(), test_state_dir());
+        assert!(!state.any_ws_has_effective_cleanup().await);
+
+        // Inherit-only ws under a globally-off config → still false.
+        let path_a = PathBuf::from("/ws/a");
+        state.register_workspace_with_policy(
+            "ws-a".to_string(),
+            path_a.clone(),
+            SnapshotIndex::new(path_a),
+            WorkspacePolicy::default(),
+            false,
+        );
+        assert!(!state.any_ws_has_effective_cleanup().await);
+
+        // Per-ws override re-enables on top of globally-off → true.
+        let path_b = PathBuf::from("/ws/b");
+        state.register_workspace_with_policy(
+            "ws-b".to_string(),
+            path_b.clone(),
+            SnapshotIndex::new(path_b),
+            WorkspacePolicy {
+                auto_cleanup: Some(true),
+                auto_cleanup_keep: None,
+            },
+            false,
+        );
+        assert!(state.any_ws_has_effective_cleanup().await);
+
+        // Per-ws auto_cleanup=Some(false) on top of globally-off → still
+        // false (the ws-b override above is what keeps the aggregate true).
+        let path_c = PathBuf::from("/ws/c");
+        state.register_workspace_with_policy(
+            "ws-c".to_string(),
+            path_c.clone(),
+            SnapshotIndex::new(path_c),
+            WorkspacePolicy {
+                auto_cleanup: Some(false),
+                auto_cleanup_keep: None,
+            },
+            false,
+        );
+        assert!(state.any_ws_has_effective_cleanup().await);
+    }
+
+    #[tokio::test]
+    async fn any_ws_has_effective_cleanup_global_keep_disabled_per_ws_overrides() {
+        // Globally on but global keep is disabled (Count(0)). A ws with no
+        // override inherits → effective is_disabled. Aggregate must be false.
+        let mut cfg = test_config();
+        cfg.auto_cleanup = true;
+        cfg.auto_cleanup_keep = ws_ckpt_common::CleanupRetention::Count(0);
+        let state = DaemonState::new(cfg, test_backend(), test_state_dir());
+
+        let path_a = PathBuf::from("/ws/a");
+        state.register_workspace_with_policy(
+            "ws-a".to_string(),
+            path_a.clone(),
+            SnapshotIndex::new(path_a),
+            WorkspacePolicy::default(),
+            false,
+        );
+        assert!(!state.any_ws_has_effective_cleanup().await);
+
+        // ws-b overrides keep with a real number → effective re-enabled.
+        let path_b = PathBuf::from("/ws/b");
+        state.register_workspace_with_policy(
+            "ws-b".to_string(),
+            path_b.clone(),
+            SnapshotIndex::new(path_b),
+            WorkspacePolicy {
+                auto_cleanup: None,
+                auto_cleanup_keep: Some(ws_ckpt_common::CleanupRetention::Count(5)),
+            },
+            false,
+        );
+        assert!(state.any_ws_has_effective_cleanup().await);
+    }
+
+    #[tokio::test]
+    async fn reload_all_workspace_policies_picks_up_disk_changes() {
+        // Use a real state_dir so index_dir() points at writable paths.
+        let tmp = tempfile::tempdir().unwrap();
+        let state_dir = tmp.path().to_path_buf();
+        let state = DaemonState::new(test_config(), test_backend(), state_dir.clone());
+
+        let ws_id = "ws-reload";
+        let path = PathBuf::from("/ws/reload");
+        state.register_workspace_with_policy(
+            ws_id.to_string(),
+            path.clone(),
+            SnapshotIndex::new(path),
+            WorkspacePolicy::default(),
+            false,
+        );
+
+        // Operator hand-edits the policy file out-of-band (no IPC).
+        let ws_index_dir = state.index_dir(ws_id);
+        let new_policy = WorkspacePolicy {
+            auto_cleanup: Some(true),
+            auto_cleanup_keep: Some(CleanupRetention::Count(7)),
+        };
+        save_workspace_policy(&ws_index_dir, &new_policy).unwrap();
+
+        // Before reload, in-memory state still says "inherit".
+        {
+            let ws = state.get_by_wsid(ws_id).unwrap();
+            let g = ws.read().await;
+            assert!(g.policy.is_empty());
+        }
+
+        state.reload_all_workspace_policies().await;
+
+        let ws = state.get_by_wsid(ws_id).unwrap();
+        let g = ws.read().await;
+        assert_eq!(g.policy, new_policy);
+    }
+
+    #[tokio::test]
+    async fn reload_clears_failsafe_when_disk_read_succeeds() {
+        // A ws registered as fail-safe must drop the marker once reload reads
+        // the real policy.toml, so subsequent PATCH is no longer refused.
+        let tmp = tempfile::tempdir().unwrap();
+        let state = DaemonState::new(test_config(), test_backend(), tmp.path().to_path_buf());
+
+        let ws_id = "ws-failsafe-reload";
+        let path = PathBuf::from("/ws/failsafe-reload");
+        state.register_workspace_with_policy(
+            ws_id.to_string(),
+            path.clone(),
+            SnapshotIndex::new(path),
+            WorkspacePolicy {
+                auto_cleanup: Some(false),
+                auto_cleanup_keep: None,
+            },
+            true,
+        );
+
+        let real_policy = WorkspacePolicy {
+            auto_cleanup: Some(true),
+            auto_cleanup_keep: Some(CleanupRetention::Count(100)),
+        };
+        save_workspace_policy(&state.index_dir(ws_id), &real_policy).unwrap();
+
+        state.reload_all_workspace_policies().await;
+
+        let ws = state.get_by_wsid(ws_id).unwrap();
+        let g = ws.read().await;
+        assert_eq!(g.policy, real_policy);
+        assert!(
+            !g.policy_failsafe,
+            "successful reload must drop the fail-safe marker"
+        );
+    }
+
+    // ── lock_wsid: serializes init/adopt/recover on a shared ws_id ──
+
+    #[tokio::test]
+    async fn lock_wsid_serializes_same_id() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+
+        let state = Arc::new(DaemonState::new(
+            test_config(),
+            test_backend(),
+            test_state_dir(),
+        ));
+        let g1 = state.lock_wsid("ws-abc").await;
+
+        let acquired = Arc::new(AtomicBool::new(false));
+        let acquired_c = acquired.clone();
+        let state_c = state.clone();
+        let h = tokio::spawn(async move {
+            let _g = state_c.lock_wsid("ws-abc").await;
+            acquired_c.store(true, Ordering::SeqCst);
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !acquired.load(Ordering::SeqCst),
+            "second lock on same ws_id must block while first guard is held"
+        );
+
+        drop(g1);
+        h.await.unwrap();
+        assert!(acquired.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn lock_wsid_independent_for_different_ids() {
+        use std::time::Duration;
+
+        let state = DaemonState::new(test_config(), test_backend(), test_state_dir());
+        let _g1 = state.lock_wsid("ws-a").await;
+        // Different ws_id must not block.
+        let _g2 = tokio::time::timeout(Duration::from_millis(100), state.lock_wsid("ws-b"))
+            .await
+            .expect("different ws_id must not block on each other");
+    }
+
+    #[test]
+    fn reregister_same_wsid_new_path() {
+        let state = DaemonState::new(test_config(), test_backend(), test_state_dir());
+        let path1 = PathBuf::from("/ws/old");
+        let path2 = PathBuf::from("/ws/new");
+        state.register_workspace(
+            "ws-move".to_string(),
+            path1.clone(),
+            SnapshotIndex::new(path1.clone()),
+        );
+        state.register_workspace(
+            "ws-move".to_string(),
+            path2.clone(),
+            SnapshotIndex::new(path2.clone()),
+        );
+
+        // New path resolves to the workspace
+        let arc = state.get_by_path(&path2).unwrap();
+        let ws = arc.try_read().unwrap();
+        assert_eq!(ws.ws_id, "ws-move");
+        assert_eq!(ws.path, path2);
+    }
+
+    #[test]
+    fn path_count_after_reregister() {
+        let state = DaemonState::new(test_config(), test_backend(), test_state_dir());
+        state.register_workspace(
+            "ws-cnt".to_string(),
+            PathBuf::from("/first"),
+            SnapshotIndex::new(PathBuf::from("/first")),
+        );
+        state.register_workspace(
+            "ws-cnt".to_string(),
+            PathBuf::from("/second"),
+            SnapshotIndex::new(PathBuf::from("/second")),
+        );
+
+        let entries = state.collect_workspace_entries();
+        let matching: Vec<_> = entries.iter().filter(|e| e.ws_id == "ws-cnt").collect();
+        // After re-register, all_workspaces should show exactly 1
+        assert_eq!(state.all_workspaces().len(), 1);
+        // collect_workspace_entries may have stale path entries
+        assert!(
+            !matching.is_empty(),
+            "workspace should appear in collected entries"
+        );
     }
 }

@@ -27,12 +27,13 @@ impl AggregatedResponse {
     }
 
     pub fn body(&self) -> &[u8] {
-        &self.parsed.body()
+        self.parsed.body()
     }
 
     pub fn body_string(&self) -> String {
         let first = std::str::from_utf8(self.body()).unwrap_or("");
-        let sse_body: String = self.sse_events
+        let sse_body: String = self
+            .sse_events
             .iter()
             .map(|event| event.body_str())
             .collect::<Vec<_>>()
@@ -42,7 +43,7 @@ impl AggregatedResponse {
         } else if sse_body.is_empty() {
             first.to_string()
         } else {
-            format!("{}{}", first, sse_body)
+            format!("{first}{sse_body}")
         }
     }
 
@@ -169,12 +170,11 @@ impl TraceArgs for AggregatedResponse {
         if self.parsed.body_len > 0 && !self.parsed.is_sse() {
             args.insert("body_length".to_string(), json!(self.parsed.body_len));
 
-            // Try to parse as JSON first, fallback to string
+            // Try to parse as JSON first (with gzip decompression), fallback to decompressed string
             if let Some(json_body) = self.parsed.json_body() {
                 args.insert("body".to_string(), json_body);
             } else {
-                let body = self.parsed.body();
-                let body_str = String::from_utf8_lossy(body).to_string();
+                let body_str = self.parsed.body_str_decompressed();
                 if !body_str.is_empty() {
                     args.insert("body".to_string(), json!(body_str));
                 }

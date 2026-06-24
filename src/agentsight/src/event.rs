@@ -1,8 +1,9 @@
-use crate::probes::proctrace::VariableEvent as ProcEvent;
-use crate::probes::sslsniff::SslEvent;
-use crate::probes::procmon::Event as ProcMonEvent;
 use crate::probes::filewatch::FileWatchEvent;
 use crate::probes::filewrite::FileWriteEvent;
+use crate::probes::procmon::Event as ProcMonEvent;
+use crate::probes::proctrace::VariableEvent as ProcEvent;
+use crate::probes::sslsniff::SslEvent;
+use crate::probes::udpdns::UdpDnsEvent;
 
 /// Unified event type that can represent any probe event
 ///
@@ -14,6 +15,7 @@ pub enum Event {
     ProcMon(ProcMonEvent),
     FileWatch(FileWatchEvent),
     FileWrite(FileWriteEvent),
+    UdpDns(UdpDnsEvent),
 }
 
 impl Event {
@@ -25,6 +27,7 @@ impl Event {
             Event::ProcMon(_) => "ProcMon",
             Event::FileWatch(_) => "FileWatch",
             Event::FileWrite(_) => "FileWrite",
+            Event::UdpDns(_) => "UdpDns",
         }
     }
 }
@@ -94,6 +97,19 @@ impl Event {
             _ => None,
         }
     }
+
+    /// Check if this is a UDP DNS event
+    pub fn is_udpdns(&self) -> bool {
+        matches!(self, Event::UdpDns(_))
+    }
+
+    /// Get UDP DNS event if this is one
+    pub fn as_udpdns(&self) -> Option<&UdpDnsEvent> {
+        match self {
+            Event::UdpDns(e) => Some(e),
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -126,6 +142,7 @@ mod tests {
             write_size: 10,
             comm: "writer".to_string(),
             filename: "test.jsonl".to_string(),
+            cgroup_id: 0,
             buf: b"content".to_vec(),
         }
     }
@@ -139,6 +156,7 @@ mod tests {
             flags: 0,
             comm: "watcher".to_string(),
             filename: "data.jsonl".to_string(),
+            cgroup_id: 0,
         }
     }
 

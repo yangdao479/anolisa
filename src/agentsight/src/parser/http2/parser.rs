@@ -1,3 +1,4 @@
+#![allow(clippy::vec_init_then_push)]
 //! HTTP/2 Frame Parser - stateless binary frame parser
 //!
 //! Parses HTTP/2 binary frames from raw SSL event data.
@@ -71,18 +72,29 @@ impl Http2Parser {
                 source_event: Rc::clone(&event),
             };
 
-            // Only keep DATA frames for API payload analysis
-            if frame.is_data() {
-                log::debug!(
-                    "HTTP/2 DATA frame: stream={} flags={} len={}, payload={}",
-                    stream_id,
-                    frame.flags_description(),
-                    length,
-                    frame.body_str()
-                );
+            if frame.is_data()
+                || frame.is_headers()
+                || frame.is_continuation()
+                || frame.is_settings()
+            {
+                if frame.is_data() {
+                    log::debug!(
+                        "HTTP/2 DATA frame: stream={} flags={} len={}",
+                        stream_id,
+                        frame.flags_description(),
+                        length,
+                    );
+                } else {
+                    log::trace!(
+                        "HTTP/2 {:?} frame: stream={} flags={} len={}",
+                        frame.frame_type,
+                        stream_id,
+                        frame.flags_description(),
+                        length,
+                    );
+                }
                 frames.push(frame);
             }
-
 
             pos = payload_offset + length;
         }
@@ -151,17 +163,36 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_non_data_frames_filtered() {
-        // SETTINGS frame should be filtered out
+    fn test_parse_headers_and_settings_kept() {
+        // SETTINGS frame is now kept (needed for HPACK table size updates)
         let raw = build_frame(4, 0x01, 0, &[]);
+        let event = create_test_event(raw);
+        let parser = Http2Parser::new();
+        let frames = parser.parse(event);
+        assert_eq!(frames.len(), 1);
+        assert!(frames[0].is_settings());
+
+        // HEADERS frame is now kept (needed for HPACK decode)
+        let hpack_data = vec![0x82, 0x86, 0x84];
+        let raw = build_frame(1, 0x05, 3, &hpack_data);
+        let event = create_test_event(raw);
+        let parser = Http2Parser::new();
+        let frames = parser.parse(event);
+        assert_eq!(frames.len(), 1);
+        assert!(frames[0].is_headers());
+    }
+
+    #[test]
+    fn test_parse_irrelevant_frames_filtered() {
+        // WINDOW_UPDATE (type=8) should still be filtered out
+        let raw = build_frame(8, 0x00, 1, &[0x00, 0x00, 0x00, 0x01]);
         let event = create_test_event(raw);
         let parser = Http2Parser::new();
         let frames = parser.parse(event);
         assert_eq!(frames.len(), 0);
 
-        // HEADERS frame should be filtered out
-        let hpack_data = vec![0x82, 0x86, 0x84];
-        let raw = build_frame(1, 0x05, 3, &hpack_data);
+        // PING (type=6) should still be filtered out
+        let raw = build_frame(6, 0x00, 0, &[0; 8]);
         let event = create_test_event(raw);
         let parser = Http2Parser::new();
         let frames = parser.parse(event);
@@ -169,17 +200,18 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_multiple_frames_only_data_kept() {
+    fn test_parse_multiple_frames_settings_and_data_kept() {
         let mut raw = build_frame(4, 0x00, 0, &[0x00, 0x03, 0x00, 0x00, 0x00, 0x64]); // SETTINGS
         raw.extend(build_frame(0, 0x01, 1, b"{\"ok\":true}")); // DATA END_STREAM
         let event = create_test_event(raw);
         let parser = Http2Parser::new();
         let frames = parser.parse(event);
 
-        // Only DATA frame is kept
-        assert_eq!(frames.len(), 1);
-        assert!(frames[0].is_data());
-        assert_eq!(frames[0].body_str(), "{\"ok\":true}");
+        // Both SETTINGS and DATA frames are kept
+        assert_eq!(frames.len(), 2);
+        assert!(frames[0].is_settings());
+        assert!(frames[1].is_data());
+        assert_eq!(frames[1].body_str(), "{\"ok\":true}");
     }
 
     #[test]
@@ -198,7 +230,9 @@ mod tests {
     fn test_parse_incomplete_frame() {
         // Valid header but truncated payload
         let mut raw = Vec::new();
-        raw.push(0x00); raw.push(0x00); raw.push(0x20); // length = 32
+        raw.push(0x00);
+        raw.push(0x00);
+        raw.push(0x20); // length = 32
         raw.push(0x00); // DATA
         raw.push(0x00); // no flags
         raw.extend(&[0x00, 0x00, 0x00, 0x01]); // stream 1
@@ -220,7 +254,8 @@ mod tests {
 
     #[test]
     fn test_data_frame_json_body() {
-        let json_payload = br#"{"model":"qwen3.5-plus","messages":[{"role":"user","content":"hello"}]}"#;
+        let json_payload =
+            br#"{"model":"qwen3.5-plus","messages":[{"role":"user","content":"hello"}]}"#;
         let raw = build_frame(0, 0x01, 5, json_payload);
         let event = create_test_event(raw);
         let parser = Http2Parser::new();
@@ -254,27 +289,25 @@ mod tests {
     #[test]
     fn test_sample_data_from_python_script() {
         // Test vector from scripts/http2_parser.py
-        // Contains a HEADERS frame (len=83) and an incomplete DATA frame (len=16384, truncated)
-        // Since we only keep DATA frames, and the DATA frame is truncated, result should be empty
+        // Contains a HEADERS frame (len=83, stream=171) and an incomplete DATA frame (len=16384, truncated)
         let sample_data: Vec<u8> = vec![
-            0, 0, 83, 1, 4, 0, 0, 0, 171, 203, 131, 4, 153, 96, 135, 166,
-            177, 164, 209, 208, 85, 169, 60, 133, 99, 184, 88, 36, 227, 75,
-            4, 61, 53, 208, 84, 152, 245, 35, 135, 202, 201, 200, 199, 198,
-            197, 196, 195, 194, 31, 8, 158, 186, 81, 216, 91, 20, 71, 85,
-            156, 11, 196, 1, 28, 117, 240, 180, 86, 138, 208, 227, 145, 151,
-            218, 142, 87, 136, 65, 133, 185, 25, 143, 193, 192, 191, 190, 15,
-            13, 132, 117, 166, 94, 111, 0, 64, 0, 0, 0, 0, 0, 0, 171, 123,
-            34, 109, 111, 100, 101, 108, 34, 58, 34, 113, 119, 101, 110, 51,
-            46, 53, 45, 112, 108, 117, 115, 34, 44, 34, 109, 101, 115, 115,
-            97, 103, 101, 115, 34, 58, 91, 123, 34, 114, 111, 108, 101, 34,
-            58, 34, 115, 121, 115, 116, 101, 109, 34, 44, 34, 99, 111, 110,
-            116, 101, 110, 116, 34, 58, 34, 89, 111, 117,
+            0, 0, 83, 1, 4, 0, 0, 0, 171, 203, 131, 4, 153, 96, 135, 166, 177, 164, 209, 208, 85,
+            169, 60, 133, 99, 184, 88, 36, 227, 75, 4, 61, 53, 208, 84, 152, 245, 35, 135, 202,
+            201, 200, 199, 198, 197, 196, 195, 194, 31, 8, 158, 186, 81, 216, 91, 20, 71, 85, 156,
+            11, 196, 1, 28, 117, 240, 180, 86, 138, 208, 227, 145, 151, 218, 142, 87, 136, 65, 133,
+            185, 25, 143, 193, 192, 191, 190, 15, 13, 132, 117, 166, 94, 111, 0, 64, 0, 0, 0, 0, 0,
+            0, 171, 123, 34, 109, 111, 100, 101, 108, 34, 58, 34, 113, 119, 101, 110, 51, 46, 53,
+            45, 112, 108, 117, 115, 34, 44, 34, 109, 101, 115, 115, 97, 103, 101, 115, 34, 58, 91,
+            123, 34, 114, 111, 108, 101, 34, 58, 34, 115, 121, 115, 116, 101, 109, 34, 44, 34, 99,
+            111, 110, 116, 101, 110, 116, 34, 58, 34, 89, 111, 117,
         ];
         let event = create_test_event(sample_data);
         let parser = Http2Parser::new();
         let frames = parser.parse(event);
 
-        // HEADERS frame is filtered, DATA frame is truncated -> empty result
-        assert_eq!(frames.len(), 0);
+        // HEADERS frame is now kept, DATA frame is truncated -> 1 HEADERS frame
+        assert_eq!(frames.len(), 1);
+        assert!(frames[0].is_headers());
+        assert_eq!(frames[0].stream_id, 171);
     }
 }

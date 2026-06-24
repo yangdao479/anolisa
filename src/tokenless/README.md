@@ -9,10 +9,14 @@ Token-Less combines complementary strategies to minimize LLM token consumption:
 - **Command Rewriting** — Integrates [RTK](https://github.com/rtk-ai/rtk) to filter and rewrite CLI command output, eliminating noise that would otherwise waste 60–90% of tokens.
 - **Tool Ready** — Pre-checks tool execution environments (binaries, configs, permissions, network), auto-fixes missing dependencies, and classifies execution failures as environment issues vs logic errors — reducing wasted retry tokens.
 
-Two integration paths are available:
+Three integration paths are available:
 
-- **OpenClaw plugin** — covers command rewriting and response compression in one plugin. Schema compression is not yet supported by OpenClaw's hook system.
+- **OpenClaw plugin** — covers command rewriting, response compression, and schema compression in one plugin.
 - **copilot-shell hook** — intercepts Shell commands via a PreToolUse hook and delegates to RTK for command rewriting + output filtering.
+- **Hermes Agent plugin** — response compression, TOON encoding, command rewriting (block + suggest), and Tool Ready environment pre-check via Hermes's native plugin system.
+- **Qoder CLI plugin** — Tool Ready, command rewriting, and response compression via Qoder's native hook system.
+- **Claude Code plugin** — RTK command rewriting, response/TOON compression, and Tool Ready via Claude Code's official plugin marketplace.
+- **Codex plugin** — response compression, TOON encoding, Tool Ready, and command rewriting via Codex's native hook system.
 
 ## Features
 
@@ -23,8 +27,12 @@ Two integration paths are available:
 | TOON context compression | 15–40% | Encodes JSON to TOON format for LLMs |
 | Command rewriting | 60–90% | Filters CLI output via RTK (70+ commands supported) |
 | Tool Ready | reduces retry waste | Pre-check env, auto-fix deps, failure attribution |
-| OpenClaw plugin | — | Command rewriting ✅, Response compression ✅, Schema compression ⏳ |
-| copilot-shell hooks | — | Tool Ready ✅, Command rewriting ✅, Response compression ✅, TOON ✅, Schema compression ⏳ |
+| OpenClaw plugin | — | Command rewriting ✅, Response compression ✅, Schema compression ✅ |
+| copilot-shell hooks | — | Tool Ready ✅, Command rewriting ✅, Response compression ✅, TOON ✅, Schema compression ✅ |
+| Hermes Agent plugin | — | Tool Ready ✅, Command rewriting ✅, Response compression ✅, TOON ✅, Schema compression ⏳ |
+| Qoder CLI plugin | — | Tool Ready ✅, Command rewriting ✅, Response compression ✅ |
+| Claude Code plugin | — | Tool Ready ✅, Command rewriting ✅, Response compression ✅, TOON ✅ |
+| Codex plugin | — | Tool Ready ✅, Command rewriting ✅, Response compression ✅, TOON ✅ |
 | Zero runtime deps | — | Pure Rust, single static binary |
 
 ## Architecture
@@ -33,38 +41,37 @@ Two integration paths are available:
 Token-Less/
 ├── crates/tokenless-schema/   # Core library: SchemaCompressor + ResponseCompressor
 ├── crates/tokenless-cli/      # CLI binary: `tokenless` command (env-check, compress, stats)
-├── openclaw/                  # Unified OpenClaw plugin (TypeScript delegate)
-├── cosh-extension/hooks/      # copilot-shell hooks (tool-ready + rewrite + compression + attribution)
-│   ├── tool_ready_hook.sh       # PreToolUse: env readiness check
-│   ├── rewrite_hook.py          # PreToolUse: command rewriting via RTK
-│   ├── compress_response_hook.py # PostToolUse: compress + attribution + TOON
-│   ├── compress_schema_hook.py  # BeforeModel: schema compression
-│   └── compress_toon_hook.py    # TOON encoding helper
-├── core/env-check/            # Shared env-check assets (spec + fix script)
-├── third_party/rtk/           # RTK submodule (command rewriting engine)
-├── third_party/toon/          # TOON submodule (JSON to TOON encoding)
+├── adapters/tokenless/        # FHS adapter bundle (manifest, common, openclaw, hermes, qoder, claude-code, codex)
+│   ├── manifest.json            # Adapter manifest (cosh + openclaw + hermes + qoder + claude-code + codex)
+│   ├── common/                  # Shared: hooks, spec, env-fix, commands, cosh-extension
+│   │   ├── hooks/               # copilot-shell hooks (tool-ready + rewrite + compression)
+│   │   ├── cosh-extension.json  # copilot-shell extension manifest (references common/hooks/)
+│   │   ├── tool-ready-spec.json # Tool dependency spec (4 categories)
+│   │   ├── tokenless-env-fix.sh # Auto-fix script for missing deps
+│   │   └── commands/            # Hook command configs
+│   ├── openclaw/                # OpenClaw plugin + agent scripts
+│   ├── hermes/                  # Hermes Agent plugin + scripts
+│   ├── qoder/                   # Qoder CLI plugin + scripts
+│   ├── claude-code/             # Claude Code plugin + marketplace + hooks
+│   └── codex/                   # Codex plugin + scripts
+├── third_party/rtk/           # RTK vendored source (justfile clone+patch from GitHub)
+├── third_party/patches/      # Patches for vendored third_party sources
 ├── Makefile                   # Unified build system
-└── scripts/install.sh         # One-step installer
+└── scripts/                    # Helper scripts
 ```
 
 ## Quick Start
 
 ```bash
-# Clone with submodules
-git clone --recursive <repo-url>
+# Clone repo (no submodules needed)
+git clone <repo-url>
 cd Token-Less
 
-# Full setup: build + install binaries + deploy OpenClaw plugin
+# Full setup: build + install binaries + deploy all adapters
 make setup
 ```
 
-Or use the install script directly:
-
-```bash
-./scripts/install.sh
-```
-
-Both methods install `tokenless` to `~/.local/bin`, helper binaries `rtk`/`toon` alongside it, deploy the OpenClaw plugin, and install the copilot-shell hooks.
+Both methods install `tokenless` to `~/.local/bin`, helper binaries `rtk`/`toon` alongside it, and deploy the adapters (hooks + OpenClaw plugin + Hermes plugin).
 
 ## CLI Usage
 
@@ -115,7 +122,7 @@ echo 'name: Alice\nage: 30' | tokenless decompress-toon
 
 ## copilot-shell Hooks
 
-The cosh-extension provides hooks that are auto-discovered by copilot-shell:
+The adapter provides hooks that are auto-discovered by copilot-shell via the cosh extension manifest:
 
 | Hook | Event | File | Description |
 |------|-------|------|-------------|
@@ -127,10 +134,10 @@ The cosh-extension provides hooks that are auto-discovered by copilot-shell:
 ### Install
 
 ```bash
-make cosh-install
+make cosh-extension-install  # or: make openclaw-install, make hermes-install
 ```
 
-Hooks are registered via `cosh-extension/cosh-extension.json` and auto-discovered by copilot-shell — no manual `settings.json` configuration needed.
+Hooks are registered via the cosh extension manifest (`cosh-extension.json`) and auto-discovered by copilot-shell — no manual `settings.json` configuration needed.
 
 ## Tool Ready
 
@@ -156,7 +163,7 @@ tokenless env-check --tool Shell --fix
 
 ### Configuration
 
-Per-tool dependencies are declared in `~/.tokenless/tool-ready-spec.json` (user directory, same location as stats.db):
+Per-tool dependencies are declared in `tool-ready-spec.json` (shipped within the adapter bundle at `common/tool-ready-spec.json`):
 
 ```json
 {
@@ -167,7 +174,7 @@ Per-tool dependencies are declared in `~/.tokenless/tool-ready-spec.json` (user 
     "recommended": [
       { "binary": "rtk", "version": ">=0.35", "package": "rtk", "manager": "cargo",
         "fallback": [
-          { "method": "symlink", "binary": "rtk", "source": "/usr/share/tokenless/bin/rtk" }
+          { "method": "symlink", "binary": "rtk", "source": "/usr/libexec/anolisa/tokenless/rtk" }
         ]
       }
     ]
@@ -185,7 +192,7 @@ The plugin hooks into the OpenClaw agent loop at two stages:
 |---|---|---|---|
 | Command rewriting | `before_tool_call` | Rewrites `exec` commands to RTK equivalents for filtered output | ✅ Active |
 | Response compression | `tool_result_persist` | Compresses tool results before they enter the context window | ✅ Active |
-| Schema compression | — | Not supported by OpenClaw's hook system (no hook exposes tool schemas) | ⏳ Blocked |
+| Schema compression | — | Not supported by OpenClaw's hook system | ⏳ → ✅ |
 
 **Response compression details:**
 - Automatically compresses results from all tool types (`web_search`, `web_fetch`, `read_file`, etc.)
@@ -205,34 +212,132 @@ Options in `openclaw.plugin.json`:
 | `response_compression_enabled` | `true` | Enable tool response compression via `tool_result_persist` |
 | `verbose` | `true` | Log detailed rewrite/compression info |
 
+## Hermes Agent Plugin
+
+The plugin registers hooks at three Hermes events, covering five strategies:
+
+| Strategy | Event | Action | Status |
+|---|---|---|---|
+| Tool Ready | `pre_tool_call` | Environment readiness pre-check with auto-fix and skip-retry feedback | ✅ Active |
+| Command rewriting | `pre_tool_call` | Blocks original command, suggests `rtk`-rewritten version (one extra round-trip) | ✅ Active |
+| Response compression | `transform_tool_result` | Compresses tool results via `tokenless compress-response` | ✅ Active |
+| TOON encoding | `transform_tool_result` | Pipeline step after response compression — encodes JSON to TOON format | ✅ Active |
+| Session tracking | `on_session_start` | Propagates agent/session IDs for stats recording | ✅ Active |
+| Schema compression | — | Not supported by Hermes hook system (no hook exposes tool schemas) | ⏳ Blocked |
+
+**How command rewriting works in Hermes**: Hermes's `pre_tool_call` hook can only block tool execution (not modify arguments), so the plugin blocks the original shell command and returns a message suggesting the RTK-rewritten version. The agent then re-executes with the optimized command, adding one extra tool-call round-trip. This is safe — `rtk rewrite` only does text substitution and never executes the command.
+
+Each hook degrades gracefully — if the corresponding binary is not installed, that hook is silently skipped.
+
+### Install
+
+```bash
+make hermes-install
+```
+
+Enable the plugin:
+
+```bash
+hermes plugins enable tokenless
+```
+
+Or add to `~/.hermes/config.yaml`:
+
+```yaml
+plugins:
+  enabled:
+    - tokenless
+```
+
+## Qoder CLI Plugin
+
+The plugin registers hooks at three Qoder events, covering three strategies:
+
+| Strategy | Event | Action | Status |
+|---|---|---|---|
+| Tool Ready | `PreToolUse` | Environment readiness pre-check with auto-fix and skip-retry feedback | ✅ Active |
+| Command rewriting | `PreToolUse` | Rewrites shell commands via RTK for token savings | ✅ Active |
+| Response compression | `PostToolUse` | Compresses tool responses and encodes to TOON format | ✅ Active |
+
+Each hook degrades gracefully — if the corresponding binary is not installed, that hook is silently skipped.
+
+### Install
+
+```bash
+make qoder-install
+```
+
+## Claude Code Plugin
+
+The plugin registers hooks at two Claude Code events, covering four strategies:
+
+| Strategy | Event | Action | Status |
+|---|---|---|---|
+| Tool Ready | `PreToolUse` | Environment readiness pre-check with auto-fix and skip-retry feedback | ✅ Active |
+| Command rewriting | `PreToolUse` (Bash) | Rewrites shell commands via RTK for token savings | ✅ Active |
+| Response compression | `PostToolUse` | Compresses tool responses and encodes to TOON format | ✅ Active |
+| TOON encoding | `PostToolUse` | Pipeline step after response compression — encodes JSON to TOON format | ✅ Active |
+
+Claude Code v2 requires plugins to be sourced from a registered marketplace. We expose the adapter's `claude-code/` directory as a single-plugin marketplace (`anolisa`), then install `tokenless@anolisa` from it.
+
+### Install
+
+```bash
+make claude-code-install
+```
+
+## Codex Plugin
+
+The plugin registers hooks at four Codex events, covering four strategies:
+
+| Strategy | Event | Action | Status |
+|---|---|---|---|
+| Session check | `SessionStart` | Verifies tokenless CLI is installed and functional (non-blocking) | ✅ Active |
+| Tool Ready | `PreToolUse` | Environment readiness pre-check with auto-fix and skip-retry feedback | ✅ Active |
+| Command rewriting | `PreToolUse` | Rewrites shell commands via RTK for token savings | ✅ Active |
+| Response compression | `PostToolUse` | Compresses tool responses and encodes to TOON format, injects compressed summary as `additionalContext` | ✅ Active |
+
+> **Codex Protocol Constraint**: PostToolUse hooks cannot suppress the original tool output. The plugin injects a compressed *summary* as `additionalContext` — the model sees both the original output and the compressed summary.
+
+### Install
+
+```bash
+make codex-install
+```
+
 ## Build
 
 | Target | Description |
 |---|---|
 | `make build` | Build `tokenless` + `rtk` + `toon` (release mode) |
-| `make build-tokenless` | Build `tokenless` only |
-| `make build-rtk` | Build `rtk` only |
-| `make build-toon` | Build `toon` only |
+| `make build-tokenless` | Build `tokenless` + `rtk` (via justfile) |
+| `make build-toon` | Install TOON binary via `cargo install toon-format` |
 | `make install` | Build and install binaries to `BIN_DIR` (default: ~/.local/bin) |
 | `make test` | Run all tests (Rust + hooks) |
 | `make test-hooks` | Run hook integration tests |
 | `make lint` | Run clippy checks |
 | `make fmt` | Format code |
 | `make clean` | Clean build artifacts |
+| `make adapter-install` | Install all adapters (cosh + openclaw + hermes) |
+| `make adapter-uninstall` | Remove all adapters |
+| `make cosh-extension-install` | Install Copilot Shell extension |
+| `make cosh-extension-uninstall` | Remove Copilot Shell extension |
 | `make openclaw-install` | Install OpenClaw plugin |
 | `make openclaw-uninstall` | Remove OpenClaw plugin |
-| `make core-install` | Install core env-check |
-| `make copilot-shell-install` | Install copilot-shell hooks |
-| `make copilot-shell-uninstall` | Remove copilot-shell hooks |
-| `make cosh-install` | Install copilot-shell extension |
-| `make cosh-uninstall` | Uninstall copilot-shell extension |
-| `make setup` | Full setup: build + install + core + OpenClaw + hooks |
+| `make hermes-install` | Install Hermes Agent plugin |
+| `make hermes-uninstall` | Remove Hermes Agent plugin |
+| `make qoder-install` | Install Qoder CLI plugin |
+| `make qoder-uninstall` | Remove Qoder CLI plugin |
+| `make claude-code-install` | Install Claude Code plugin |
+| `make claude-code-uninstall` | Remove Claude Code plugin |
+| `make codex-install` | Install Codex plugin |
+| `make codex-uninstall` | Remove Codex plugin |
+| `make setup` | Full setup: build + install + all adapters |
 
 Override install paths:
 
 ```bash
 make install BIN_DIR=/usr/local/bin
-make openclaw-install OPENCLAW_DIR=~/.openclaw/extensions/tokenless
 ```
 
 ## Project Structure
@@ -241,17 +346,20 @@ make openclaw-install OPENCLAW_DIR=~/.openclaw/extensions/tokenless
 |---|---|
 | `crates/tokenless-cli/` | CLI binary — `tokenless` command (compress, stats, env-check) |
 | `crates/tokenless-schema/` | Core Rust library — `SchemaCompressor` and `ResponseCompressor` |
-| `openclaw/` | OpenClaw plugin — TypeScript delegate calling `tokenless` and `rtk` |
-| `cosh-extension/hooks/` | copilot-shell hooks — tool-ready, rewrite, response & schema compression |
-| `third_party/rtk/` | RTK git submodule — command rewriting engine (70+ commands) |
-| `third_party/toon/` | TOON git submodule — JSON to TOON format encoding |
-| `scripts/install.sh` | One-step build + install + plugin deployment script |
+| `adapters/tokenless/` | FHS adapter bundle — manifest, env-check spec/fix, hooks, OpenClaw plugin |
+| `adapters/tokenless/hermes/` | Hermes Agent adapter — plugin + detect/install/uninstall scripts |
+| `adapters/tokenless/qoder/` | Qoder CLI adapter — plugin + detect/install/uninstall scripts |
+| `adapters/tokenless/claude-code/` | Claude Code adapter — marketplace + plugin + hooks dispatcher |
+| `adapters/tokenless/codex/` | Codex adapter — plugin + Python hook scripts |
+| `third_party/rtk/` | RTK vendored source — command rewriting engine (justfile clone+patch) |
+| `third_party/patches/` | Patches for vendored third_party sources |
 | `Makefile` | Unified build system for the entire workspace |
 
 ## Prerequisites
 
-- **Rust** toolchain >= 1.88 — required by toon submodule (darling, image, time crates). Install via [rustup](https://rustup.rs)
-- **Git** — for submodule management
+- **Rust** toolchain >= 1.89 — required by rtk (edition 2024) and toon-format (is_multiple_of). Install via [rustup](https://rustup.rs)
+- **just** — build runner for rtk setup (clone + patch orchestration)
+- **Git** — for rtk source download via justfile
 
 ## License
 

@@ -1,6 +1,6 @@
 # Skill Ledger 用户使用手册
 
-Skill Ledger 是 agent-sec-core 的安全子系统，为 AI Agent Skill 提供密码学签名的版本链，防止 Skill 被篡改或注入恶意内容。安全扫描能力由外部扫描器提供（当前内置 `skill-vetter` 协议定义，扫描由 Agent 驱动执行）。
+Skill Ledger 是 agent-sec-core 的安全子系统，为 AI Agent Skill 提供文件哈希、扫描结果和密码学签名的版本链，帮助发现 Skill 被篡改或注入恶意内容。默认快速扫描由内置静态扫描器自动执行；可选深度扫描由 Agent 按 `skill-vetter` 协议驱动执行。
 
 ---
 
@@ -10,32 +10,32 @@ Skill Ledger 是 agent-sec-core 的安全子系统，为 AI Agent Skill 提供�
 
 | 概念 | 说明 |
 |------|------|
-| **Manifest** | 签名的 JSON 记录（`.skill-meta/latest.json`），包含文件哈希、扫描结果和数字签名 |
+| **Manifest** | JSON 记录（`.skill-meta/latest.json`），包含文件哈希、扫描结果和数字签名；由 `scan`、`certify` 或 `init` baseline 创建和更新 |
 | **版本链** | 只追加的账本——每个版本通过 `previousManifestSignature` 链接上一版本，形成防篡改历史 |
 | **状态** | 每个 Skill 的安全状态：`pass` ✅ · `none` 🆕 · `drifted` 🔄 · `warn` ⚠️ · `deny` 🚨 · `tampered` 🔴 |
 
 ### 1. 初始化签名密钥
 
 ```bash
-# 生成 Ed25519 签名密钥对（默认无口令，零交互）
-agent-sec-cli skill-ledger init-keys
+# 初始化密钥，并为已覆盖目录中的 Skill 建立快速扫描 baseline
+agent-sec-cli skill-ledger init
 ```
 
 密钥存放位置：
 
 | 文件 | 路径 | 权限 |
 |------|------|------|
-| 加密私钥 | `~/.local/share/agent-sec/skill-ledger/key.enc` | 0600 |
+| 私钥文件 | `~/.local/share/agent-sec/skill-ledger/key.enc` | 0600；默认未加密，`--passphrase` 时加密 |
 | 公钥 | `~/.local/share/agent-sec/skill-ledger/key.pub` | 0644 |
 
 如需口令保护私钥：
 
 ```bash
 # 交互式输入口令
-agent-sec-cli skill-ledger init-keys --passphrase
+agent-sec-cli skill-ledger init --passphrase
 
 # 或通过环境变量（适用于 CI）
-SKILL_LEDGER_PASSPHRASE="your-secret" agent-sec-cli skill-ledger init-keys
+SKILL_LEDGER_PASSPHRASE="your-secret" agent-sec-cli skill-ledger init --passphrase
 ```
 
 ### 2. 检查 Skill 完整性
@@ -48,26 +48,37 @@ agent-sec-cli skill-ledger check /path/to/your-skill
 
 | 状态 | 含义 |
 |------|------|
-| `none` 🆕 | 从未扫描——首次检查时自动创建基线 manifest |
+| `none` 🆕 | 从未扫描——没有可验证的签名 manifest |
 | `pass` ✅ | 文件未变 + 签名有效 + 扫描通过 |
 | `drifted` 🔄 | Skill 文件已变更（fileHashes 不匹配） |
 | `warn` ⚠️ | 签名有效，但上次扫描存在低风险发现 |
 | `deny` 🚨 | 签名有效，但上次扫描存在高危发现 |
 | `tampered` 🔴 | manifest 签名校验失败——元数据可能被伪造 |
 
-### 3. 安全扫描 + 签名认证
+### 3. 快速扫描 + 签名认证
 
-安全扫描由 AI Agent 加载 `skill-ledger` Skill 后驱动执行——Agent 读取内置的 `skill-vetter-protocol.md` 扫描协议，逐文件对目标 Skill 进行四阶段审查（来源验证 → 代码审查 → 权限边界评估 → 风险分级），将结果写入 findings JSON 文件。详见[第二部分：Agent 驱动深度扫描](#第二层agent-驱动深度扫描)。
+默认认证路径使用内置快速扫描器，不依赖 LLM。对单个 Skill 执行：
 
-扫描完成后，将 findings 文件传入 `certify` 完成签名认证：
+```bash
+agent-sec-cli skill-ledger scan /path/to/your-skill
+```
+
+扫描完成后，可重新检查状态：
+
+```bash
+agent-sec-cli skill-ledger check /path/to/your-skill
+```
+
+如需更完整的语义审查，可通过 Agent 触发深度扫描。Agent 读取内置的 `skill-vetter-protocol.md` 扫描协议，逐文件对目标 Skill 进行四阶段审查（来源验证 → 代码审查 → 权限边界评估 → 风险分级），将结果写入 findings JSON 文件。随后将 findings 文件传入 `certify` 完成签名认证：
 
 ```bash
 agent-sec-cli skill-ledger certify /path/to/your-skill \
   --findings /tmp/skill-vetter-findings-your-skill.json \
-  --scanner skill-vetter
+  --scanner skill-vetter \
+  --delete-findings
 ```
 
-`certify` 会依次：
+`scan` 会运行内置快速扫描器并签名入账；`certify` 则只导入外部 findings。`certify` 会依次：
 
 1. 验证文件一致性（文件变更时自动创建新版本）
 2. 规范化 findings 并合并到 manifest 的 `scans[]` 数组
@@ -100,10 +111,10 @@ agent-sec-cli skill-ledger status --verbose
 | 区块 | 说明 |
 |------|------|
 | `keys` | 签名密钥状态（是否初始化、指纹、是否加密、归档密钥数） |
-| `config` | 配置摘要（skillDirs 模式数、已注册扫描器） |
+| `config` | 配置摘要（默认目录、managedSkillDirs 模式数、已注册扫描器） |
 | `skills` | 聚合健康度（已发现 Skill 数、各状态计数、整体 health 标签） |
 
-`health` 标签含义：`healthy`（全部 pass）、`unscanned`（全部 none）、`attention`（存在 drifted/warn）、`critical`（存在 deny/tampered/error）、`empty`（无已注册 Skill）。
+`health` 标签含义：`healthy`（没有 critical/attention 状态，且不是全部 none；可能包含 pass/none 混合）、`unscanned`（全部 none）、`attention`（存在 drifted/warn）、`critical`（存在 deny/tampered/error）、`empty`（无已注册 Skill）。
 
 使用 `--verbose` 时会额外输出 `results` 数组，包含每个 Skill 的详细检查结果。
 
@@ -118,21 +129,22 @@ agent-sec-cli skill-ledger audit /path/to/your-skill
 agent-sec-cli skill-ledger audit /path/to/your-skill --verify-snapshots
 ```
 
-### 6. Agent 驱动的完整扫描（推荐方式）
+### 6. Agent 驱动扫描（推荐方式）
 
-最强大的使用方式是通过 AI Agent 自然语言触发。Agent 会自动编排 Phase 0 → 1 → 2 全流程：
+最自然的使用方式是通过 AI Agent 自然语言触发。默认“扫描”会执行快速扫描；只有用户明确要求深度扫描，或在快速扫描后确认继续，才执行 `skill-vetter` 深度扫描：
 
 | 说法 | 效果 |
 |------|------|
-| "扫描 /path/to/skill" | 对指定 Skill 执行完整扫描 |
-| "扫描所有 skill" | 批量扫描 `config.json` 中配置的所有 Skill |
+| "扫描 /path/to/skill" | 对指定 Skill 执行快速扫描认证 |
+| "扫描所有 skill" | 批量快速扫描 `config.json` 中配置的所有 Skill |
+| "深度扫描 /path/to/skill" | 按 `skill-vetter` 协议执行逐文件深度审查并认证 |
 | "检查 skill 状态" | 仅输出状态分诊表，不执行扫描 |
 
-三阶段工作流：
+Skill 工作流：
 
-- **Phase 0**（环境准备）：校验 CLI、密钥、自身完整性，解析目标 Skill，输出分诊表
-- **Phase 1**（安全扫描）：`skill-vetter` 四阶段审查——来源验证 → 代码审查 → 权限边界评估 → 风险分级
-- **Phase 2**（建版签名）：调用 `certify` 将扫描结果写入版本链并签名
+- **Phase 1**（环境准备与状态查看）：校验 CLI、密钥，解析目标 Skill，输出分诊表
+- **Phase 2**（快速扫描认证）：调用内置 `code-scanner` 与 `static-scanner`，再签名写入 manifest
+- **Phase 3**（可选深度扫描）：`skill-vetter` 四阶段审查——来源验证 → 代码审查 → 权限边界评估 → 风险分级，再通过 `certify --findings` 写入版本链
 
 ---
 
@@ -161,7 +173,7 @@ Skill Ledger 提供**两层防护**协同工作：
 │         ▼                         ▼               │
 │  ┌──────────────────────────────────────────┐     │
 │  │       agent-sec-cli skill-ledger          │     │
-│  │   check / certify / audit / status        │     │
+│  │   check / scan / certify / audit / status │     │
 │  └──────────────────────────────────────────┘     │
 │                      │                            │
 │                      ▼                            │
@@ -173,10 +185,10 @@ Skill Ledger 提供**两层防护**协同工作：
 - **第一层——自动 Hook（实时守卫）**：
   - **OpenClaw**：插件拦截所有对 `SKILL.md` 的 `read` 调用，在 Skill 加载前自动运行 `check`。
   - **copilot-shell**：Python hook 脚本（`cosh-extension/hooks/skill_ledger_hook.py`）通过 `PreToolUse` 事件在 Skill 调用前自动运行 `check`。
-  - 两者均对非 `pass` 状态输出警告。**零配置、始终启用。**
-- **第二层——Agent 驱动扫描（深度审计）**：`skill-ledger` Skill 驱动完整的四阶段安全扫描并生成签名认证。**按需触发**，由用户请求发起。
+  - 两者采用相同默认策略：`pass` 静默放行，`warn`/`error`/`unknown` 告警放行，`none`/`drifted`/`deny`/`tampered` 要求用户确认。插件或扩展加载且能力未禁用时生效。
+- **第二层——Agent 驱动扫描**：`scan` 执行内置快速扫描并签名；`skill-ledger` Skill 在用户要求深度扫描时驱动完整的四阶段安全审查，并通过 `certify --findings` 导入结果。**按需触发**，由用户请求发起。
 
-### 第一层：自动 Hook 防护（零配置）
+### 第一层：自动 Hook 防护
 
 **工作原理：**
 
@@ -185,18 +197,24 @@ OpenClaw 安全插件注册了一个 `before_tool_call` hook（优先级 80）�
 1. Hook 从文件路径提取 Skill 目录
 2. 确保签名密钥存在（缺失时自动初始化）
 3. 执行 `agent-sec-cli skill-ledger check <skill_dir>`
-4. 根据状态输出日志：
+4. 根据状态执行默认策略：
 
-| 状态 | 日志输出 |
-|------|---------|
-| `pass` | `✅ pass — 'skill-name'` |
-| `none` | `⚠️ Skill 'skill-name' has not been security-scanned yet` |
-| `drifted` | `⚠️ Skill 'skill-name' content has changed since last scan` |
-| `warn` | `⚠️ Skill 'skill-name' has low-risk findings — review recommended` |
-| `deny` | `🚨 Skill 'skill-name' has high-risk findings — immediate review recommended` |
-| `tampered` | `🚨 Skill 'skill-name' metadata signature verification failed` |
+| 状态 | 默认行为 | 输出 |
+|------|---------|------|
+| `pass` | 静默放行 | 无 |
+| `warn` | 放行 + 告警 | `⚠️ Skill 'skill-name' has low-risk findings — review recommended` |
+| `error` | 放行 + 告警 | `⚠️ Skill 'skill-name' check returned an error — review recommended` |
+| `unknown` | 放行 + 告警 | `⚠️ Skill 'skill-name' returned an unknown status — review recommended` |
+| `none` | 用户确认 | `⚠️ Skill 'skill-name' has not been security-scanned yet` |
+| `drifted` | 用户确认 | `⚠️ Skill 'skill-name' content has changed since last scan` |
+| `deny` | 用户确认 | `🚨 Skill 'skill-name' has high-risk findings — immediate review recommended` |
+| `tampered` | 用户确认 | `🚨 Skill 'skill-name' metadata signature verification failed` |
 
-**设计原则：fail-open**——Hook 仅发出警告，永不阻断 Skill 加载，确保 Agent 可用性不受 CLI 错误或密钥缺失影响。
+OpenClaw 在需要确认时返回 `requireApproval`；copilot-shell 在需要确认时返回 `decision: "ask"`。CLI 不可用、执行失败、超时或输出不可解析时保持 fail-open，避免基础设施异常阻断 Skill 加载。
+
+copilot-shell hook 当前仅覆盖 project / user / system 三类目录：`<cwd>/.copilot-shell/skills/`、`~/.copilot-shell/skills/`、`/usr/share/anolisa/skills/`。若 Skill 来自 custom、extension、remote 或其它路径，hook 会 fail-open 并跳过 skill-ledger 检查；OpenClaw 插件则按读取到的 `SKILL.md` 路径提取 Skill 目录。
+
+批量认证或安装后认证场景中，建议先完成目录定位和认证，再让 Agent 读取未认证 Skill 内容：批量认证前避免主动读取未认证 Skill 的 `SKILL.md` 或辅助文件；安装成功后应先定位最终本地目录，确认包含 `SKILL.md`，再执行快速扫描认证。
 
 **启用方式**：确保 `agent-sec` 插件已加载，且 `skill-ledger` 能力未被显式禁用。插件配置中可通过以下方式禁用：
 
@@ -216,31 +234,63 @@ OpenClaw 安全插件注册了一个 `before_tool_call` hook（优先级 80）�
 
 ```json
 {
-  "skillDirs": [
-    "~/.copilot-shell/skills/*",
+  "enableDefaultSkillDirs": true,
+  "managedSkillDirs": [
+    "/opt/custom-skills/*",
     "/opt/custom-skills/my-skill"
   ]
 }
 ```
 
-用户配置中的 `skillDirs` 会**追加**到默认目录之后（自动去重），无需重复声明默认目录。
+默认目录默认启用；`managedSkillDirs` 用于 skill-ledger 动态管理或用户额外配置的目录，会追加到默认目录之后（自动去重）。如需隔离运行，可将 `enableDefaultSkillDirs` 设为 `false`。
 
 - `"path/*"` — glob 模式：每个包含 `SKILL.md` 的子目录视为一个 Skill
 - `"path/to/skill"` — 单个 Skill 目录（同样需包含 `SKILL.md`）
 
-不存在的目录会被静默忽略。此外，对 Skill 执行 `check` 或 `certify` 时，未收录的目录会自动追加到配置中，方便后续 `--all` 批量操作。
+不存在的目录会被静默忽略。此外，对 Skill 执行 `scan` 或 `certify` 时，未收录的目录会自动追加到配置中，方便后续 `--all` 批量操作。`check` 是只读状态检查，不会写入配置。
+
+#### 定时执行默认快速扫描
+
+如果希望定期刷新默认快速扫描结果，可以把 `scan --all` 放入 cron。`scan --all` 会自动跳过文件未变且已有完整扫描结果的 Skill，只补扫新增、变更、缺少扫描结果或 manifest 异常的 Skill。
+
+无口令密钥场景：
+
+```bash
+mkdir -p "$HOME/.local/state/agent-sec"
+AGENT_SEC_CLI="$(command -v agent-sec-cli)"
+CRON_LINE="0 3 * * * $AGENT_SEC_CLI skill-ledger scan --all >> $HOME/.local/state/agent-sec/skill-ledger-scan.log 2>&1"
+(crontab -l 2>/dev/null | grep -Fv "skill-ledger scan --all"; echo "$CRON_LINE") | crontab -
+```
+
+使用口令保护私钥时，定时任务需要提供 `SKILL_LEDGER_PASSPHRASE`。下面的命令会把口令以明文写入当前用户的 crontab 和系统 cron spool，请只在可信单用户环境中使用；更安全的做法是使用默认无口令密钥，或通过本机 secret manager / 受限权限文件包装 `scan --all`。
+
+```bash
+read -rsp "SKILL_LEDGER_PASSPHRASE: " SKILL_LEDGER_PASSPHRASE; echo
+mkdir -p "$HOME/.local/state/agent-sec"
+AGENT_SEC_CLI="$(command -v agent-sec-cli)"
+CRON_LINE="0 3 * * * SKILL_LEDGER_PASSPHRASE='$SKILL_LEDGER_PASSPHRASE' $AGENT_SEC_CLI skill-ledger scan --all >> $HOME/.local/state/agent-sec/skill-ledger-scan.log 2>&1"
+(crontab -l 2>/dev/null | grep -Fv "skill-ledger scan --all"; echo "$CRON_LINE") | crontab -
+unset SKILL_LEDGER_PASSPHRASE
+```
+
+查看已安装的定时任务：
+
+```bash
+crontab -l
+```
 
 #### 触发扫描
 
-通过自然语言向 Agent 发出指令即可。Agent 自动执行完整 Phase 0 → 1 → 2 流程。
+通过自然语言向 Agent 发出指令即可。默认扫描执行 Phase 1 → Phase 2；用户明确要求深度扫描时执行 Phase 1 → Phase 3。
 
-**Phase 1 安全扫描规则表（skill-vetter）：**
+**深度扫描规则表（skill-vetter）：**
 
 | 级别 | 规则 ID | 检测目标 |
 |------|---------|---------|
 | deny | `dangerous-exec` | 危险进程执行（`child_process`、`subprocess`） |
 | deny | `dynamic-code-eval` | 动态代码执行（`eval()`、`new Function()`） |
 | deny | `env-harvesting` | 环境变量批量采集 + 网络发送 |
+| deny | `crypto-mining` | 挖矿特征（`stratum`、`xmrig` 等） |
 | deny | `credential-access` | 凭据与敏感文件访问（`~/.ssh/`、`.env`） |
 | deny | `system-modification` | 系统文件篡改（`/etc/`、crontab） |
 | deny | `prompt-override` | Prompt 覆盖指令 |
@@ -292,22 +342,24 @@ agent-sec-cli skill-ledger audit /path/to/my-skill --verify-snapshots
 
 | 命令 | 用途 |
 |------|------|
-| `agent-sec-cli skill-ledger init-keys` | 生成签名密钥对 |
+| `agent-sec-cli skill-ledger init` | 初始化密钥，并为已覆盖 Skill 建立快速扫描 baseline |
+| `agent-sec-cli skill-ledger init --no-baseline` | 只初始化密钥，不扫描 Skill |
 | `agent-sec-cli skill-ledger check <dir>` | 检查完整性状态（JSON 输出） |
-| `agent-sec-cli skill-ledger certify <dir> --findings <file>` | 将扫描结果签名写入 manifest |
+| `agent-sec-cli skill-ledger scan <dir>` | 执行快速扫描并签名写入 manifest |
+| `agent-sec-cli skill-ledger scan --all` | 对所有已发现 Skill 执行补齐式快速扫描 |
+| `agent-sec-cli skill-ledger certify <dir> --findings <file>` | 将深度扫描 findings 签名写入 manifest |
 | `agent-sec-cli skill-ledger status` | 查看整体安全状况（密钥、配置、Skill 健康度） |
 | `agent-sec-cli skill-ledger status --verbose` | 查看整体安全状况（含每个 Skill 详细结果） |
 | `agent-sec-cli skill-ledger audit <dir>` | 深度验证版本链 |
 | `agent-sec-cli skill-ledger list-scanners` | 查看已注册的扫描器列表 |
-| `agent-sec-cli skill-ledger init-keys --force` | 轮换密钥（归档旧密钥） |
 
 ## 关键路径
 
 | 路径 | 用途 |
 |------|------|
-| `~/.local/share/agent-sec/skill-ledger/key.enc` | 加密私钥 |
+| `~/.local/share/agent-sec/skill-ledger/key.enc` | 私钥文件（默认未加密，`--passphrase` 时加密） |
 | `~/.local/share/agent-sec/skill-ledger/key.pub` | 公钥 |
 | `~/.local/share/agent-sec/skill-ledger/keyring/` | 归档的历史公钥（密钥轮换后） |
-| `~/.config/agent-sec/skill-ledger/config.json` | 配置文件（skillDirs、scanners） |
-| `<skill_dir>/.skill-meta/latest.json` | 当前签名 manifest |
+| `~/.config/agent-sec/skill-ledger/config.json` | 配置文件（managedSkillDirs、scanners） |
+| `<skill_dir>/.skill-meta/latest.json` | 当前 manifest（由 `scan`、`certify` 或 `init` baseline 写入） |
 | `<skill_dir>/.skill-meta/versions/` | 版本链历史 |

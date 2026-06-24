@@ -1,10 +1,12 @@
 """Typed repositories backed by the shared SQLite store."""
 
 import json
+import logging
 import sys
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Sequence
 
 from agent_sec_cli.security_events.models import SecurityEventRecord
 from agent_sec_cli.security_events.orm_store import SqliteStore
@@ -12,6 +14,18 @@ from agent_sec_cli.security_events.schema import SecurityEvent
 from sqlalchemy import Select, delete, func, select, text
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import SQLAlchemyError
+
+logger = logging.getLogger(__name__)
+
+_CORRELATION_CANDIDATE_LIMIT = 1000
+
+
+@dataclass(frozen=True)
+class CorrelationCandidate:
+    """Security event row plus the original epoch used for correlation sorting."""
+
+    event: SecurityEvent
+    timestamp_epoch: float
 
 
 class SecurityEventRepository:
@@ -30,13 +44,9 @@ class SecurityEventRepository:
         """Insert an event. Returns False for invalid or skipped writes."""
         try:
             values = self._event_values(event)
-        except (ValueError, TypeError) as exc:
-            print(
-                f"[security_events] invalid event params: {exc}",
-                file=sys.stderr,
-            )
+        except (ValueError, TypeError):
             return False
-        session_factory = self._store.session_factory()
+        session_factory = self._store.session_factory(raise_on_error=True)
         if session_factory is None:
             return False
 
@@ -63,6 +73,9 @@ class SecurityEventRepository:
             "pid": event.pid,
             "uid": event.uid,
             "session_id": event.session_id,
+            "run_id": event.run_id,
+            "call_id": event.call_id,
+            "tool_call_id": event.tool_call_id,
             "details": json.dumps(event.details, ensure_ascii=False),
         }
 
@@ -110,10 +123,87 @@ class SecurityEventRepository:
                 events.append(event)
         return events
 
+    def query_correlation_candidates(
+        self,
+        *,
+        session_id: str,
+        categories: Sequence[str],
+        run_id: str | None = None,
+        tool_call_id: str | None = None,
+        tool_call_ids: Sequence[str] | None = None,
+        since_epoch: float | None = None,
+        until_epoch: float | None = None,
+    ) -> list[CorrelationCandidate]:
+        """Query up to 1000 read-only candidates for observability correlation."""
+        if not categories:
+            return []
+
+        conditions: list[Any] = [
+            SecurityEventRecord.session_id == session_id,
+            SecurityEventRecord.category.in_(tuple(categories)),
+        ]
+        if run_id is not None:
+            conditions.append(SecurityEventRecord.run_id == run_id)
+        if tool_call_ids is not None:
+            normalized_tool_call_ids = tuple(value for value in tool_call_ids if value)
+            if not normalized_tool_call_ids:
+                return []
+            conditions.append(
+                SecurityEventRecord.tool_call_id.in_(normalized_tool_call_ids)
+            )
+        elif tool_call_id is not None:
+            conditions.append(SecurityEventRecord.tool_call_id == tool_call_id)
+        if since_epoch is not None:
+            conditions.append(SecurityEventRecord.timestamp_epoch >= since_epoch)
+        if until_epoch is not None:
+            conditions.append(SecurityEventRecord.timestamp_epoch <= until_epoch)
+
+        stmt = (
+            select(SecurityEventRecord)
+            .where(*conditions)
+            .order_by(
+                SecurityEventRecord.timestamp_epoch.asc(),
+                SecurityEventRecord.event_id.asc(),
+            )
+            .limit(_CORRELATION_CANDIDATE_LIMIT)
+        )
+
+        session_factory = self._store.session_factory()
+        if session_factory is None:
+            return []
+
+        try:
+            with session_factory() as session:
+                records = list(session.scalars(stmt).all())
+        except SQLAlchemyError as exc:
+            logger.warning(
+                "correlation candidate query failed",
+                extra={
+                    "session_id": session_id,
+                    "run_id": run_id,
+                    "data": {"error_type": type(exc).__name__},
+                },
+            )
+            self._store.dispose()
+            return []
+
+        candidates: list[CorrelationCandidate] = []
+        for record in records:
+            event = self._record_to_event(record)
+            if event is not None:
+                candidates.append(
+                    CorrelationCandidate(
+                        event=event,
+                        timestamp_epoch=record.timestamp_epoch,
+                    )
+                )
+        return candidates
+
     def count(
         self,
         event_type: str | None = None,
         category: str | None = None,
+        trace_id: str | None = None,
         since: str | None = None,
         until: str | None = None,
         offset: int = 0,
@@ -122,6 +212,7 @@ class SecurityEventRepository:
         conditions = self._build_filters(
             event_type=event_type,
             category=category,
+            trace_id=trace_id,
             since=since,
             until=until,
         )
@@ -153,6 +244,9 @@ class SecurityEventRepository:
     def count_by(
         self,
         group_field: str,
+        event_type: str | None = None,
+        category: str | None = None,
+        trace_id: str | None = None,
         since: str | None = None,
         until: str | None = None,
         offset: int = 0,
@@ -165,7 +259,13 @@ class SecurityEventRepository:
                 "Must be one of: category, event_type, trace_id"
             )
 
-        conditions = self._build_filters(since=since, until=until)
+        conditions = self._build_filters(
+            event_type=event_type,
+            category=category,
+            trace_id=trace_id,
+            since=since,
+            until=until,
+        )
         if offset == 0:
             stmt = select(column, func.count()).where(*conditions).group_by(column)
         else:
@@ -207,7 +307,7 @@ class SecurityEventRepository:
                     )
                 )
         except SQLAlchemyError:
-            pass
+            self._store.dispose()
 
     def checkpoint(self) -> None:
         """Run a best-effort WAL checkpoint on the current engine."""
@@ -269,6 +369,9 @@ class SecurityEventRepository:
                 pid=record.pid,
                 uid=record.uid,
                 session_id=record.session_id,
+                run_id=record.run_id,
+                call_id=record.call_id,
+                tool_call_id=record.tool_call_id,
                 details=json.loads(record.details),
             )
         except (json.JSONDecodeError, TypeError, ValueError) as exc:

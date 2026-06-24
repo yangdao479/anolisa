@@ -1,11 +1,14 @@
 import type { SecurityCapability } from "../types.js";
-import { callAgentSecCli } from "../utils.js";
+import { buildTraceContext, callAgentSecCli } from "../utils.js";
 
 export const codeScan: SecurityCapability = {
   id: "scan-code",
   name: "Code Scanner",
   hooks: ["before_tool_call"],
   register(api) {
+    const cfg = (api.pluginConfig as Record<string, any>) ?? {};
+    const requireApprovalEnabled = cfg.codeScanRequireApproval === true;
+
     api.on("before_tool_call", async (event: any, ctx: any) => {
       try {
 
@@ -17,7 +20,7 @@ export const codeScan: SecurityCapability = {
 
         const result = await callAgentSecCli(
           ["scan-code", "--code", command, "--language", "bash"],
-          { timeout: 10000 },
+          { timeout: 10000, traceContext: buildTraceContext(event, ctx) },
         );
 
         if (result.exitCode !== 0) {
@@ -27,6 +30,16 @@ export const codeScan: SecurityCapability = {
         const scanResult = JSON.parse(result.stdout);
         const verdict = scanResult.verdict;
         const findings = scanResult.findings ?? [];
+
+        // Self-protect: force block if the command would disable this plugin
+        const selfProtectFinding = findings.find(
+          (f: any) => f.rule_id === "shell-self-protect-openclaw",
+        );
+        if (selfProtectFinding) {
+          const msg = `[agent-sec-core] 自我保护：该命令将禁用 agent-sec 安全插件。如果您确实需要禁用，请手动执行以下命令：\n\n  ${command}\n\n出于安全原因，AI agent 无法执行此操作。`;
+          api.logger.warn(`[scan-code] SELF-PROTECT block — ${command}`);
+          return { block: true, blockReason: msg };
+        }
 
         if (verdict === "pass" || findings.length === 0) {
           api.logger.info(`[scan-code] ✅ pass — allowing command`);
@@ -38,25 +51,31 @@ export const codeScan: SecurityCapability = {
         const msg = `[code-scanner] Detected ${findings.length} issue(s):\n${descs.join("\n")}\n\nCommand: ${command}`;
 
         if (verdict === "deny") {
-          api.logger.info(`[scan-code] 🚫 DENY — requiring user approval`);
-          return {
-            requireApproval: {
-              title: "Code Scanner Security Warning",
-              description: msg,
-              severity: "warning" as const,
-            },
-          };
+          api.logger.warn(`[scan-code] DENY (requireApproval=${requireApprovalEnabled}) — ${msg}`);
+          if (requireApprovalEnabled) {
+            return {
+              requireApproval: {
+                title: "Code Scanner Security Warning",
+                description: msg,
+                severity: "warning" as const,
+              },
+            };
+          }
+          return undefined;
         }
 
         if (verdict === "warn") {
-          api.logger.info(`[scan-code] ⚠️ WARN — requiring user approval`);
-          return {
-            requireApproval: {
-              title: "Code Scanner Security Warning",
-              description: msg,
-              severity: "warning" as const,
-            },
-          };
+          api.logger.warn(`[scan-code] WARN (requireApproval=${requireApprovalEnabled}) — ${msg}`);
+          if (requireApprovalEnabled) {
+            return {
+              requireApproval: {
+                title: "Code Scanner Security Warning",
+                description: msg,
+                severity: "warning" as const,
+              },
+            };
+          }
+          return undefined;
         }
 
         return undefined;

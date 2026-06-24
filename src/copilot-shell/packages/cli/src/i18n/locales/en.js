@@ -66,6 +66,8 @@ export default {
     'Connecting to MCP servers... ({{connected}}/{{total}})',
   'Type your message or @path/to/file': 'Type your message or @path/to/file',
   '? for shortcuts': '? for shortcuts',
+  'Ctrl+C to exit': 'Ctrl+C to exit',
+  '/bash for shell': '/bash for shell',
   "Press 'i' for INSERT mode and 'Esc' for NORMAL mode.":
     "Press 'i' for INSERT mode and 'Esc' for NORMAL mode.",
   'Cancel operation / Clear input (double press)':
@@ -917,6 +919,7 @@ export default {
   'Allow always': 'Allow always',
   No: 'No',
   'No (esc)': 'No (esc)',
+  'Press Esc to interrupt': 'Press Esc to interrupt',
   'Yes, allow always for this session': 'Yes, allow always for this session',
   'Modify in progress:': 'Modify in progress:',
   'Save and close external editor to continue':
@@ -1034,6 +1037,12 @@ export default {
   'Invalid auth method selected.': 'Invalid auth method selected.',
   'Failed to authenticate. Message: {{message}}':
     'Failed to authenticate. Message: {{message}}',
+  'Configuration verification failed. Please check your API Key and model settings.':
+    'Configuration verification failed. Please check your API Key and model settings.',
+  'Verifying and saving configuration...':
+    'Verifying and saving configuration...',
+  '{{authType}} configuration saved successfully, current model: {{model}}':
+    '{{authType}} configuration saved successfully, current model: {{model}}',
   '{{authType}} credentials saved successfully.':
     '{{authType}} credentials saved successfully.',
   // OpenAI API key validation errors
@@ -1104,6 +1113,8 @@ export default {
     'The latest Qwen Coder model from Alibaba Cloud ModelStudio (version: qwen3-coder-plus-2025-09-23)',
   'The latest Qwen Vision model from Alibaba Cloud ModelStudio (version: qwen3-vl-plus-2025-09-23)':
     'The latest Qwen Vision model from Alibaba Cloud ModelStudio (version: qwen3-vl-plus-2025-09-23)',
+  'Current /auth model': 'Current /auth model',
+  'Verified via /auth': 'Verified via /auth',
 
   // ============================================================================
   // Dialogs - Permissions

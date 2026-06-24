@@ -1496,9 +1496,10 @@ dependencies = [
 
 [[package]]
 name = "ws-ckpt-cli"
-version = "0.2.0"
+version = "0.3.3"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
  "serde_json",
  "tokio",
@@ -1509,7 +1510,7 @@ dependencies = [
 
 [[package]]
 name = "ws-ckpt-common"
-version = "0.2.0"
+version = "0.3.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1520,11 +1521,12 @@ dependencies = [
  "tempfile",
  "thiserror",
  "toml",
+ "tracing",
 ]
 
 [[package]]
 name = "ws-ckpt-daemon"
-version = "0.2.0"
+version = "0.3.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1535,6 +1537,7 @@ dependencies = [
  "nix",
  "notify",
  "seccompiler",
+ "serde",
  "serde_json",
  "sha2",
  "tempfile",

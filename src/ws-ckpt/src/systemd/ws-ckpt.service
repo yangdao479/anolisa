@@ -10,11 +10,15 @@ After=local-fs.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/ws-ckpt daemon
-ExecReload=/usr/bin/ws-ckpt reload
+ExecStart=/usr/local/bin/ws-ckpt daemon
+ExecReload=/usr/local/bin/ws-ckpt reload
 Restart=on-failure
 RestartSec=5
 Environment=RUST_LOG=info
+StateDirectory=ws-ckpt
+StateDirectoryMode=0755
+RuntimeDirectory=ws-ckpt
+RuntimeDirectoryMode=0755
 
 [Install]
 WantedBy=multi-user.target

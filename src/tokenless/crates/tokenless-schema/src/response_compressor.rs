@@ -26,10 +26,17 @@ impl Default for ResponseCompressor {
 
         Self {
             drop_fields,
-            truncate_strings_at: 512,
-            truncate_arrays_at: 16,
+            truncate_strings_at: 4096,
+            truncate_arrays_at: 32,
             drop_nulls: true,
             drop_empty_fields: true,
+            // Runtime responses rarely nest beyond a handful of levels in
+            // practice, so 8 trades aggressive token savings (collapsing
+            // deeply-nested structures to a `<...truncated...>` marker) for
+            // a tiny risk of losing useful detail. SchemaCompressor defaults
+            // to 32 because schema definitions stack anyOf/oneOf/allOf
+            // branches that legitimately need the extra depth — see
+            // `SchemaCompressor::default()`.
             max_depth: 8,
             add_truncation_marker: true,
         }
@@ -127,22 +134,39 @@ impl ResponseCompressor {
         }
     }
 
-    /// Compress a string value, truncating if necessary
+    /// Compress a string value, truncating if necessary.
+    /// When a truncation marker is added, the marker length is reserved so the
+    /// final output stays within `truncate_strings_at` characters. If the
+    /// configured limit is too small to fit both the marker and a content
+    /// character, the marker is dropped so the output never exceeds the limit.
     fn compress_string(&self, s: &str) -> Value {
-        if s.len() <= self.truncate_strings_at {
+        let char_count = s.chars().count();
+        if char_count <= self.truncate_strings_at {
             return Value::String(s.to_string());
         }
 
-        // Find a safe UTF-8 boundary
-        let mut truncate_pos = self.truncate_strings_at;
-        while !s.is_char_boundary(truncate_pos) && truncate_pos > 0 {
-            truncate_pos -= 1;
-        }
+        const MARKER: &str = "… (truncated)";
+        let marker_len = MARKER.chars().count();
+        // Only attach the marker when the limit can fit it plus at least one
+        // content character; otherwise dropping the marker is the only way to
+        // honor truncate_strings_at.
+        let attach_marker = self.add_truncation_marker && self.truncate_strings_at > marker_len;
+        let target = if attach_marker {
+            self.truncate_strings_at - marker_len
+        } else {
+            self.truncate_strings_at
+        };
+
+        let truncate_pos = s
+            .char_indices()
+            .nth(target)
+            .map(|(i, _)| i)
+            .unwrap_or(s.len());
 
         let truncated = &s[..truncate_pos];
 
-        if self.add_truncation_marker {
-            Value::String(format!("{}… (truncated)", truncated))
+        if attach_marker {
+            Value::String(format!("{}{}", truncated, MARKER))
         } else {
             Value::String(truncated.to_string())
         }
@@ -243,10 +267,10 @@ mod tests {
     }
 
     #[test]
-    fn test_string_truncation_512_default() {
+    fn test_string_truncation_4096_default() {
         let compressor = ResponseCompressor::new();
 
-        let long_string = "x".repeat(600);
+        let long_string = "x".repeat(5000);
         let result = compressor.compress(&json!(long_string));
 
         let s = result.as_str().unwrap();
@@ -267,15 +291,15 @@ mod tests {
     }
 
     #[test]
-    fn test_array_truncation_16_default() {
+    fn test_array_truncation_32_default() {
         let compressor = ResponseCompressor::new();
 
-        let arr: Vec<i32> = (1..=30).collect();
+        let arr: Vec<i32> = (1..=50).collect();
         let result = compressor.compress(&json!(arr));
 
         let arr_result = result.as_array().unwrap();
-        // 16 items + 1 truncation marker = 17
-        assert_eq!(arr_result.len(), 17);
+        // 32 items + 1 truncation marker = 33
+        assert_eq!(arr_result.len(), 33);
     }
 
     #[test]
@@ -403,7 +427,7 @@ mod tests {
     #[test]
     fn test_nested_object_recursive_compression() {
         let compressor = ResponseCompressor::new()
-            .with_truncate_strings_at(10)
+            .with_truncate_strings_at(20)
             .with_drop_nulls(true);
 
         let nested = json!({
@@ -474,6 +498,6 @@ mod tests {
 
         // Should not panic and should be valid UTF-8
         let s = result.as_str().unwrap();
-        assert!(s.len() > 0);
+        assert!(!s.is_empty());
     }
 }

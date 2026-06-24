@@ -10,7 +10,6 @@ use ws_ckpt_common::DaemonConfig;
 use crate::backends::btrfs_base::{BtrfsBaseBackend, BtrfsBaseScenario};
 use crate::backends::btrfs_common;
 use crate::backends::btrfs_loop::BtrfsLoopBackend;
-use crate::backends::overlayfs::OverlayFsBackend;
 
 /// Result of backend detection, including the backend instance and how it was chosen.
 pub struct DetectResult {
@@ -26,7 +25,9 @@ pub struct DetectResult {
 ///   3. Fallback → BtrfsLoop (creates a loop device)
 ///
 /// When an explicit backend type is configured, creates that backend directly.
-pub async fn detect_and_create_backend(config: &DaemonConfig) -> anyhow::Result<DetectResult> {
+pub(crate) async fn detect_and_create_backend(
+    config: &DaemonConfig,
+) -> anyhow::Result<DetectResult> {
     match config.parse_backend_type() {
         Some(backend_type) => {
             info!(
@@ -78,16 +79,26 @@ async fn auto_detect(_config: &DaemonConfig) -> anyhow::Result<BackendType> {
 }
 
 /// Create a backend instance for the given type.
-async fn create_backend(
+pub(crate) async fn create_backend(
     backend_type: BackendType,
     config: &DaemonConfig,
 ) -> anyhow::Result<Arc<dyn StorageBackend>> {
     match backend_type {
         BackendType::BtrfsLoop => {
-            let backend = BtrfsLoopBackend::new(
-                config.mount_path.clone(),
-                PathBuf::from(ws_ckpt_common::BTRFS_IMG_PATH),
-            );
+            // Decide effective image path before constructing the backend; this
+            // also performs the one-shot legacy → target migration on upgrade.
+            // On migration failure we transparently fall back to legacy so the
+            // daemon keeps serving — see decide_effective_img_path for the tree.
+            let target = PathBuf::from(ws_ckpt_common::BTRFS_IMG_PATH);
+            let legacy = PathBuf::from(ws_ckpt_common::LEGACY_BTRFS_IMG_PATH);
+            let effective = crate::backends::btrfs_loop::decide_effective_img_path(
+                &config.mount_path,
+                &target,
+                &legacy,
+            )
+            .await
+            .context("Failed to resolve effective btrfs image path")?;
+            let backend = BtrfsLoopBackend::new(config.mount_path.clone(), effective);
             Ok(Arc::new(backend))
         }
         BackendType::BtrfsBase => {
@@ -109,15 +120,6 @@ async fn create_backend(
                 mount_info.mount_point, scenario
             );
             let backend = BtrfsBaseBackend::new(PathBuf::from(&mount_info.mount_point), scenario);
-            Ok(Arc::new(backend))
-        }
-        BackendType::OverlayFs => {
-            let data_root = PathBuf::from("/data/agent_workspace");
-            info!(
-                "Creating OverlayFs backend: data_root={}",
-                data_root.display()
-            );
-            let backend = OverlayFsBackend::new(data_root);
             Ok(Arc::new(backend))
         }
     }

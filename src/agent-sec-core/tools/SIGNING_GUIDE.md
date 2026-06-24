@@ -25,19 +25,45 @@ tools/sign-skill.sh --check
 Three commands cover the entire workflow. Step 1 is a one-time setup; step 2 should be re-run whenever skill files change.
 
 ```bash
-# 1. One-time setup — generate GPG key + export public key to trusted-keys
+# 1. One-time setup — generate GPG key + export public key to verifier package data
 tools/sign-skill.sh --init
 
-# 2. Batch-sign all deployed skills (default: ~/.copilot-shell/skills/)
-tools/sign-skill.sh --batch --force
+# 2. Batch-sign all skills in this source checkout
+tools/sign-skill.sh --batch skills --force
 
 # 3. Verify
 agent-sec-cli verify
 ```
 
 `--init` automatically generates a dedicated signing key (`ANOLISA Local Deploy Key`) and
-exports the public key to `~/.copilot-shell/skills/agent-sec-core/scripts/asset-verify/trusted-keys/`.
+exports the public key to `agent-sec-cli/src/agent_sec_cli/asset_verify/trusted-keys/`.
 You can override the export path with `--trusted-keys-dir <DIR>`.
+
+## After Source Build Installation
+
+After running the unified source build, use the installed script and verifier:
+
+```bash
+./scripts/build-all.sh --component sec-core
+
+# 1. One-time setup. The installed script auto-detects the trusted-keys
+#    directory used by agent-sec-cli verify.
+/usr/local/bin/sign-skill.sh --init
+
+# 2. Sign the installed agent-sec-core skills. Replace this path if your
+#    SKILL_DIR or package layout installs skills elsewhere.
+/usr/local/bin/sign-skill.sh --batch /usr/share/anolisa/skills --force
+
+# 3. Verify all configured skill directories.
+agent-sec-cli verify
+```
+
+For the default source-build install, `/usr/share/anolisa/skills` is the
+installed skills root and `agent-sec-cli verify` already reads it from the
+packaged `config.conf`, so no verification directory argument is required. If a
+custom `SKILL_DIR` or package layout is used, pass the actual skills directory
+to `--batch`; for non-default verifier layouts, pass the matching verifier
+`config.conf` with `--config-file`.
 
 ## Step-by-Step (Manual Key Management)
 
@@ -65,8 +91,12 @@ gpg --list-secret-keys me@example.com
 
 ### 2. Export the Public Key
 
-The verifier loads trusted public keys from `~/.copilot-shell/skills/agent-sec-core/scripts/asset-verify/trusted-keys/`.
-`--init` exports there automatically. To re-export manually:
+The verifier loads trusted public keys from the packaged `agent_sec_cli/asset_verify/trusted-keys/`
+directory. When `agent-sec-cli` is installed, `sign-skill.sh` auto-detects this
+directory by probing the installed package data under `/opt/agent-sec`. When
+running only from this source checkout, it falls back to
+`agent-sec-cli/src/agent_sec_cli/asset_verify/trusted-keys/`.
+To re-export manually:
 
 ```bash
 tools/sign-skill.sh --export-key
@@ -82,7 +112,7 @@ Or fully manually:
 
 ```bash
 gpg --armor --export me@example.com \
-    > ~/.copilot-shell/skills/agent-sec-core/scripts/asset-verify/trusted-keys/me-example-com.asc
+    > agent-sec-cli/src/agent_sec_cli/asset_verify/trusted-keys/me-example-com.asc
 ```
 
 ### 3. Sign Skills
@@ -96,10 +126,10 @@ tools/sign-skill.sh /usr/share/anolisa/skills/my-skill --force
 Batch-sign all skills under a directory:
 
 ```bash
-# Uses the default directory (~/.copilot-shell/skills/)
-tools/sign-skill.sh --batch --force
+# Source checkout example
+tools/sign-skill.sh --batch skills --force
 
-# Or specify a custom directory
+# Custom or installed directory
 tools/sign-skill.sh --batch /usr/share/anolisa/skills --force
 ```
 
@@ -112,7 +142,17 @@ Each signed skill directory will contain:
 
 ### 4. Configure the Verifier
 
-When using `--batch`, the script automatically registers the skills directory in `config.conf`. For manual setups, make sure the skills directory is listed in the deployed `config.conf` (e.g. `~/.copilot-shell/skills/agent-sec-core/scripts/asset-verify/config.conf`):
+For installed `agent-sec-cli`, `--batch` uses the detected installed verifier
+`config.conf` and registers the skills root before signing. Source-tree fallback
+does not modify the source checkout's `config.conf` automatically. For
+source-tree-only or custom layouts, make sure the actual skills root is listed
+in the verifier config packaged with the CLI, or choose the config file
+explicitly:
+
+```bash
+tools/sign-skill.sh --batch /custom/skills --force \
+    --config-file /path/to/agent_sec_cli/asset_verify/config.conf
+```
 
 ```ini
 skills_dir = [
@@ -179,7 +219,7 @@ tools/sign-skill.sh --batch /path/to/skills --force
 Whenever skill files are modified, the existing `.skill-meta/Manifest.json` hashes become stale. Re-sign with `--force`:
 
 ```bash
-tools/sign-skill.sh --batch --force
+tools/sign-skill.sh --batch skills --force
 ```
 
 Then verify:
@@ -197,6 +237,7 @@ agent-sec-cli verify
 | 11 | Missing `.skill-meta/Manifest.json` | Skill was never signed |
 | 12 | Invalid signature | Signed with a key not in `trusted-keys/` |
 | 13 | Hash mismatch | Skill files changed after signing |
+| 14 | Unexpected file | Unsigned file added after signing |
 
 ## sign-skill.sh Command Reference
 
@@ -205,8 +246,8 @@ agent-sec-cli verify
 | **Init** | `--init [--trusted-keys-dir DIR]` | Generate GPG key + export public key |
 | **Check** | `--check` | Verify prerequisites (gpg, jq, sha256sum) |
 | **Single** | `<skill_dir> [--force]` | Sign one skill directory |
-| **Batch** | `--batch [parent_dir] [--force]` | Sign all subdirectories under parent (default: `~/.copilot-shell/skills/`). Auto-registers the directory in `config.conf`. |
-| **Export** | `--export-key [DIR]` | Export public key (default: `~/.copilot-shell/skills/agent-sec-core/scripts/asset-verify/trusted-keys/`) |
+| **Batch** | `--batch <parent_dir> [--force]` | Sign all subdirectories under parent. |
+| **Export** | `--export-key [DIR]` | Export public key (default: auto-detected verifier `trusted-keys/`, then source-tree fallback) |
 
 Common options:
 
@@ -215,3 +256,4 @@ Common options:
 | `--force` | Overwrite existing `.skill-meta/Manifest.json` and `.skill-meta/.skill.sig` |
 | `--skill-name NAME` | Override the skill name in the manifest (default: directory name) |
 | `--trusted-keys-dir DIR` | Override the public key export directory (used with `--init`) |
+| `--config-file FILE` | Override the verifier config updated by `--batch` |

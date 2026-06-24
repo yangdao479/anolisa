@@ -9,6 +9,7 @@
 #include <bpf/bpf_tracing.h>
 #include "proctrace.h"
 #include "common.h"
+#include "cgroup_helper.h"
 
 // Target uid filter (optional, -1 means trace all uids)
 const volatile uid_t targ_uid = -1;
@@ -72,19 +73,13 @@ int trace_execve_enter(struct sys_enter_execve_args *args)
     ppid = BPF_CORE_READ(task, real_parent, tgid);
     ptid = BPF_CORE_READ(task, real_parent, pid);
 
-    // Check if we should trace this process:
-    // Trace if parent process (ppid) is in traced_processes
-    // This captures new child processes spawned by tracked processes
+    // Admit exec if parent is traced OR (when cgroup filter is on) task is in an allowed cgroup
     u32 value = 1;
-    u8 *ppid_traced = bpf_map_lookup_elem(&traced_processes, &ppid);
-
-    if (ppid_traced) {
-        // Also track in child_pids for stdout capture
-        bpf_map_update_elem(&child_pids, &pid, &value, BPF_ANY);
-    } else {
-        // Parent is not in the trace list - skip
+    u64 cg_id;
+    if (!traced_pid_cgroup_gate_allow(ppid, &cg_id))
         return 0;
-    }
+
+    bpf_map_update_elem(&child_pids, &pid, &value, BPF_ANY);
 
     // Get scratch space for building event (avoids stack overflow)
     u32 scratch_key = 0;
@@ -197,6 +192,7 @@ int trace_execve_exit(struct sys_exit_execve_args *args)
     u64 pid_tgid = bpf_get_current_pid_tgid();
     u32 pid = pid_tgid >> 32;
     long ret = args->ret;
+    u64 cg_id = get_cgroup_id_compat();
 
     // Look up pending event
     struct proc_event_t *pending = bpf_map_lookup_elem(&pending_exec_events, &pid);
@@ -235,6 +231,7 @@ int trace_execve_exit(struct sys_exit_execve_args *args)
     event->data_len = sizeof(struct proc_exec_data) + args_size;
     for (int i = 0; i < TASK_COMM_LEN; i++)
         event->comm[i] = pending->comm[i];
+    event->cgroup_id = cg_id;
 
     // Fill exec_data
     struct proc_exec_data *exec_data = (void *)(event + 1);
@@ -285,6 +282,12 @@ int trace_write_enter(struct syscall_trace_enter *ctx)
     u8 *traced = bpf_map_lookup_elem(&child_pids, &pid);
     if (!traced)
         return 0;
+    u64 cg_id = get_cgroup_id_compat();
+#ifndef NO_CGROUP_FILTER
+    if (filter_cgroup_enabled &&
+        !bpf_map_lookup_elem(&cgroup_filter, &cg_id))
+        return 0;
+#endif
     
     // Calculate actual payload size (limit to MAX_STDOUT_PAYLOAD)
     u32 payload_len = count;
@@ -307,7 +310,8 @@ int trace_write_enter(struct syscall_trace_enter *ctx)
     event->event_type = PROCTRACE_EVENT_STDOUT;
     event->data_len = sizeof(struct proc_stdout_data) + payload_len;
     bpf_get_current_comm(&event->comm, sizeof(event->comm));
-    
+    event->cgroup_id = cg_id;
+
     // Fill stdout_data
     struct proc_stdout_data *stdout_data = (void *)(event + 1);
     stdout_data->fd = fd;
@@ -315,6 +319,8 @@ int trace_write_enter(struct syscall_trace_enter *ctx)
     
     // Copy variable-length payload
     u8 *payload_dst = (void *)(stdout_data + 1);
+    // Mask payload_len so BPF verifier can prove it's bounded and non-negative
+    payload_len &= (MAX_STDOUT_PAYLOAD - 1);
     int ret = bpf_probe_read_user(payload_dst, payload_len, buf);
     if (ret != 0) {
         // Read failed, submit with zero payload
@@ -344,6 +350,7 @@ int trace_process_exit(void *ctx)
     u8 *traced = bpf_map_lookup_elem(&child_pids, &pid);
     if (!traced)
         return 0;
+    u64 cg_id = get_cgroup_id_compat();
     
     bpf_map_delete_elem(&child_pids, &pid);
     bpf_map_delete_elem(&traced_processes, &pid);
@@ -366,6 +373,7 @@ int trace_process_exit(void *ctx)
     event->event_type = PROCTRACE_EVENT_EXIT;
     event->data_len = sizeof(struct proc_exit_data);
     bpf_get_current_comm(&event->comm, sizeof(event->comm));
+    event->cgroup_id = cg_id;
     
     // Fill exit_data
     struct proc_exit_data *exit_data = (void *)(event + 1);

@@ -111,6 +111,7 @@ export class HookSystem {
     toolName: string,
     toolInput: Record<string, unknown>,
     skillContext?: import('./types.js').SkillToolContext,
+    toolUseId?: string,
   ): Promise<PreToolUseHookOutput | undefined> {
     debugLogger.info(
       `[Hook Debug] hookSystem.firePreToolUseEvent: entering facade, tool=${toolName}`,
@@ -119,6 +120,7 @@ export class HookSystem {
       toolName,
       toolInput,
       skillContext,
+      toolUseId,
     );
     const output = result.finalOutput
       ? (createHookOutput(
@@ -197,6 +199,11 @@ export class HookSystem {
           result.finalOutput,
         ) as PostToolUseHookOutput)
       : undefined;
+    // Carry per-hook notifications from the aggregator so the scheduler can
+    // emit them as structured data to the UI layer (mirrors PreToolUse).
+    if (output && result.notifications?.length) {
+      output.notifications = result.notifications;
+    }
     debugLogger.info(
       `[Hook Debug] hookSystem.firePostToolUseEvent: facade returning, hasOutput=${!!output}`,
     );

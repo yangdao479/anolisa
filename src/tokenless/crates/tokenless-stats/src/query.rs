@@ -1,6 +1,6 @@
 //! Query and formatting utilities for tokenless stats.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::record::StatsRecord;
 use crate::recorder::StatsSummary;
@@ -55,7 +55,7 @@ pub fn format_summary(records: &[StatsRecord], title: Option<&str>) -> String {
     output.push('\n');
 
     let mut ops: Vec<_> = by_op.iter().collect();
-    ops.sort_by(|a, b| b.1.total_records.cmp(&a.1.total_records));
+    ops.sort_by_key(|b| std::cmp::Reverse(b.1.total_records));
 
     for (op, s) in ops {
         output.push_str(&format!("  {}: {} records\n", op, s.total_records));
@@ -74,6 +74,78 @@ pub fn format_summary(records: &[StatsRecord], title: Option<&str>) -> String {
     }
 
     output
+}
+
+/// Format summary as machine-readable JSON.
+///
+/// Output structure:
+/// ```json
+/// {
+///   "total": { "records": N, "before_tokens": N, "after_tokens": N,
+///              "chars_saved_percent": 83.0, "tokens_saved_percent": 83.0, ... },
+///   "by_operation": { "compress-response": { "records": N, ... }, ... }
+/// }
+/// ```
+pub fn format_summary_json(records: &[StatsRecord]) -> String {
+    let total = StatsSummary::from_records(records);
+
+    let mut by_op: BTreeMap<&str, StatsSummary> = BTreeMap::new();
+    for r in records {
+        let entry = by_op.entry(r.operation.as_str()).or_default();
+        entry.total_records += 1;
+        entry.total_before_chars += r.before_chars;
+        entry.total_after_chars += r.after_chars;
+        entry.total_before_tokens += r.before_tokens;
+        entry.total_after_tokens += r.after_tokens;
+    }
+
+    let by_op_json: serde_json::Map<String, serde_json::Value> = by_op
+        .iter()
+        .map(|(op, s)| {
+            (
+                op.to_string(),
+                serde_json::json!({
+                    "records": s.total_records,
+                    "before_chars": s.total_before_chars,
+                    "after_chars": s.total_after_chars,
+                    "chars_saved": s.chars_saved(),
+                    "before_tokens": s.total_before_tokens,
+                    "after_tokens": s.total_after_tokens,
+                    "tokens_saved": s.tokens_saved(),
+                    "chars_saved_percent": s.chars_percent(),
+                    "tokens_saved_percent": s.tokens_percent(),
+                }),
+            )
+        })
+        .collect();
+
+    let mut total_json = serde_json::to_value(&total).unwrap_or_default();
+    if let Some(obj) = total_json.as_object_mut() {
+        obj.insert(
+            "chars_saved".to_string(),
+            serde_json::json!(total.chars_saved()),
+        );
+        obj.insert(
+            "tokens_saved".to_string(),
+            serde_json::json!(total.tokens_saved()),
+        );
+        obj.insert(
+            "chars_saved_percent".to_string(),
+            serde_json::json!(total.chars_percent()),
+        );
+        obj.insert(
+            "tokens_saved_percent".to_string(),
+            serde_json::json!(total.tokens_percent()),
+        );
+    }
+
+    let output = serde_json::json!({
+        "schema_version": "1.0",
+        "total": total_json,
+        "by_operation": by_op_json,
+    });
+
+    serde_json::to_string_pretty(&output).unwrap_or_default()
 }
 
 /// Format a list of records for display
@@ -232,6 +304,104 @@ mod tests {
 
         let output = format_show(&r);
         assert!(output.contains("no text content stored"));
+    }
+
+    #[test]
+    fn test_format_summary_json_valid() {
+        let records = vec![test_record()];
+        let output = format_summary_json(&records);
+        let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
+
+        // schema_version
+        assert_eq!(parsed.get("schema_version").unwrap(), "1.0");
+
+        let total = parsed.get("total").unwrap();
+        // StatsRecord::new(op, agent, before_chars=1000, before_tokens=400,
+        //                  after_chars=500, after_tokens=200)
+        assert_eq!(total.get("records").unwrap(), 1);
+        assert_eq!(total.get("before_chars").unwrap(), 1000);
+        assert_eq!(total.get("after_chars").unwrap(), 500);
+        assert_eq!(total.get("before_tokens").unwrap(), 400);
+        assert_eq!(total.get("after_tokens").unwrap(), 200);
+        // absolute saved values (shiloong review feedback)
+        assert_eq!(total.get("chars_saved").unwrap(), 500);
+        assert_eq!(total.get("tokens_saved").unwrap(), 200);
+        assert!(total.get("chars_saved_percent").unwrap().as_f64().unwrap() > 0.0);
+        assert!(total.get("tokens_saved_percent").unwrap().as_f64().unwrap() > 0.0);
+
+        let ops = parsed.get("by_operation").unwrap().as_object().unwrap();
+        assert!(ops.contains_key("compress-schema"));
+        let op = ops.get("compress-schema").unwrap();
+        assert_eq!(op.get("records").unwrap(), 1);
+        assert_eq!(op.get("chars_saved").unwrap(), 500);
+        assert_eq!(op.get("tokens_saved").unwrap(), 200);
+    }
+
+    #[test]
+    fn test_format_summary_json_empty() {
+        let records: Vec<StatsRecord> = vec![];
+        let output = format_summary_json(&records);
+        let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
+
+        let total = parsed.get("total").unwrap();
+        assert_eq!(total.get("records").unwrap(), 0);
+        assert_eq!(
+            total.get("chars_saved_percent").unwrap().as_f64().unwrap(),
+            0.0
+        );
+        assert_eq!(
+            total.get("tokens_saved_percent").unwrap().as_f64().unwrap(),
+            0.0
+        );
+
+        let ops = parsed.get("by_operation").unwrap().as_object().unwrap();
+        assert!(ops.is_empty());
+    }
+
+    #[test]
+    fn test_format_summary_json_field_consistency() {
+        let records = vec![test_record()];
+        let output = format_summary_json(&records);
+        let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
+
+        let total_keys: std::collections::BTreeSet<String> = parsed
+            .get("total")
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        let ops = parsed.get("by_operation").unwrap().as_object().unwrap();
+        for (_op, val) in ops {
+            let op_keys: std::collections::BTreeSet<String> =
+                val.as_object().unwrap().keys().cloned().collect();
+            assert_eq!(total_keys, op_keys, "field names must be identical");
+        }
+    }
+
+    #[test]
+    fn test_format_summary_json_ordered_operations() {
+        let mut r1 = test_record();
+        r1.operation = OperationType::CompressResponse;
+
+        let mut r2 = test_record();
+        r2.operation = OperationType::RewriteCommand;
+
+        let mut r3 = test_record();
+        r3.operation = OperationType::CompressSchema;
+
+        let records = vec![r2, r1, r3]; // intentionally unordered
+        let output = format_summary_json(&records);
+        let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
+
+        let ops = parsed.get("by_operation").unwrap().as_object().unwrap();
+        let keys: Vec<&String> = ops.keys().collect();
+        // BTreeMap sorts lexicographically
+        assert_eq!(
+            keys,
+            vec!["compress-response", "compress-schema", "rewrite-command"]
+        );
     }
 
     #[test]

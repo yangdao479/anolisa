@@ -65,6 +65,8 @@ export default {
     '正在连接到 MCP 服务器... ({{connected}}/{{total}})',
   'Type your message or @path/to/file': '输入您的消息或 @ 文件路径',
   '? for shortcuts': '按 ? 查看快捷键',
+  'Ctrl+C to exit': 'Ctrl+C 退出',
+  '/bash for shell': '/bash 进入终端',
   "Press 'i' for INSERT mode and 'Esc' for NORMAL mode.":
     "按 'i' 进入插入模式，按 'Esc' 进入普通模式",
   'Cancel operation / Clear input (double press)':
@@ -872,6 +874,7 @@ export default {
   'Allow always': '总是允许',
   No: '否',
   'No (esc)': '否 (esc)',
+  'Press Esc to interrupt': '按 Esc 中断',
   'Yes, allow always for this session': '是，本次会话总是允许',
   'Modify in progress:': '正在修改：',
   'Save and close external editor to continue': '保存并关闭外部编辑器以继续',
@@ -980,6 +983,11 @@ export default {
     '未找到 ANTHROPIC_BASE_URL 环境变量。',
   'Invalid auth method selected.': '选择了无效的认证方式。',
   'Failed to authenticate. Message: {{message}}': '认证失败。消息：{{message}}',
+  'Configuration verification failed. Please check your API Key and model settings.':
+    '配置验证失败。请检查您的 API Key 和模型设置。',
+  'Verifying and saving configuration...': '正在验证并保存配置...',
+  '{{authType}} configuration saved successfully, current model: {{model}}':
+    '{{authType}} 配置已保存，当前模型：{{model}}',
   '{{authType}} credentials saved successfully.':
     '{{authType}} 认证方式凭据已保存。',
   // OpenAI API key validation errors
@@ -1046,6 +1054,8 @@ export default {
     '来自阿里云 ModelStudio 的最新 Qwen Coder 模型（版本：qwen3-coder-plus-2025-09-23）',
   'The latest Qwen Vision model from Alibaba Cloud ModelStudio (version: qwen3-vl-plus-2025-09-23)':
     '来自阿里云 ModelStudio 的最新 Qwen Vision 模型（版本：qwen3-vl-plus-2025-09-23）',
+  'Current /auth model': '当前 /auth 模型',
+  'Verified via /auth': '已通过 /auth 验证',
 
   // ============================================================================
   // Dialogs - Permissions

@@ -8,7 +8,7 @@
 
 | 分类 | 目录 | 说明 |
 |------|------|------|
-| **AI 工具** | `ai/` | AI 编程工具集成（Claude Code、OpenClaw、CoPaw、MCP 配置） |
+| **AI 工具** | `ai/` | AI 编程工具集成（Claude Code、OpenClaw、QwenPaw、MCP 配置） |
 | **系统管理** | `system-admin/` | 包管理、存储、网络、内核、Shell 脚本 |
 | **开发运维** | `devops/` | Git 工作流、CI/CD、内核开发、系统诊断 |
 | **阿里云** | `aliyun/` | ECS 实例管理、云网络、GPU/AI 部署 |
@@ -20,9 +20,9 @@
 
 ### AI 工具
 - **install-claude-code** — 安装和配置 Claude Code IDE
-- **install-copaw** — 部署 CoPaw AI 助手（支持钉钉集成）
+- **install-qwenpaw** — 部署 QwenPaw AI 助手（支持钉钉集成）
 - **install-openclaw** — 安装和配置 OpenClaw
-- **copaw-usage** — CoPaw 使用指南
+- **qwenpaw-usage** — QwenPaw 使用指南
 - **setup-mcp** — 在 Copilot Shell 中配置 MCP 服务器
 
 ### 系统管理

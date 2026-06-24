@@ -17,10 +17,22 @@
 
 set -euo pipefail
 
-PLUGIN_DIR="${1:-/opt/agent-sec/openclaw-plugin}"
+# Default PLUGIN_DIR: resolve relative to this script's location (scripts/ -> parent)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PLUGIN_DIR="${1:-$(dirname "$SCRIPT_DIR")}"
 
 # Convert to absolute path if relative
 PLUGIN_DIR="$(cd "$PLUGIN_DIR" && pwd)"
+OPENCLAW_STATE_DIR="${OPENCLAW_STATE_DIR:-${OPENCLAW_HOME:-}}"
+OPENCLAW_STATE_DIR="${OPENCLAW_STATE_DIR%/}"
+
+openclaw_cli() {
+    if [[ -n "$OPENCLAW_STATE_DIR" ]]; then
+        env -u OPENCLAW_HOME OPENCLAW_STATE_DIR="$OPENCLAW_STATE_DIR" openclaw "$@"
+    else
+        env -u OPENCLAW_HOME openclaw "$@"
+    fi
+}
 
 # 1. 前置检查
 command -v openclaw >/dev/null 2>&1 || { echo "ERROR: openclaw 不在 PATH 中"; exit 1; }
@@ -35,9 +47,12 @@ echo "  路径: $PLUGIN_DIR"
 # 2. 使用官方命令安装插件
 echo ""
 echo "安装插件..."
-openclaw plugins install "$PLUGIN_DIR" --force --dangerously-force-unsafe-install
+openclaw_cli plugins install "$PLUGIN_DIR" --force --dangerously-force-unsafe-install
 
 echo "  ✓ 插件已安装/更新"
+echo "允许 agent-sec 检查大模型输入输出安全"
+echo "  openclaw config set plugins.entries.agent-sec.hooks.allowConversationAccess true"
+openclaw_cli config set plugins.entries.agent-sec.hooks.allowConversationAccess true
 
 echo ""
 echo "提示: 请重启 OpenClaw gateway 以加载插件"
@@ -45,3 +60,5 @@ echo "  openclaw gateway restart"
 echo ""
 echo "拦截 prompt 注入风险请求"
 echo "  openclaw config set plugins.entries.agent-sec.config.promptScanBlock true"
+echo "开启代码扫描审批模式（默认放行+日志记录）"
+echo "  openclaw config set plugins.entries.agent-sec.config.codeScanRequireApproval true"

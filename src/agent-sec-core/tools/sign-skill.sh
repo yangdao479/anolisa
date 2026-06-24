@@ -9,7 +9,7 @@
 #
 # Usage:
 #   Single mode: ./sign-skill.sh <skill_dir> [--skill-name NAME] [--force]
-#   Batch  mode: ./sign-skill.sh --batch [parent_dir] [--force]
+#   Batch  mode: ./sign-skill.sh --batch <parent_dir> [--force]
 #   Init   mode: ./sign-skill.sh --init [--trusted-keys-dir DIR]
 #   Export key:  ./sign-skill.sh --export-key [DIR]
 #   Check deps:  ./sign-skill.sh --check
@@ -51,17 +51,14 @@ SIGN_KEY_EMAIL="anolisa-deploy@$(hostname -s 2>/dev/null || echo localhost)"
 SIGN_KEY_NAME="ANOLISA Local Deploy Key"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+AGENT_SEC_CORE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-# Default path for deployed skills
-DEFAULT_SKILLS_DIR="$HOME/.copilot-shell/skills"
-
-# Default path for trusted public keys (verifier reads from here)
-DEFAULT_TRUSTED_KEYS_DIR="$HOME/.copilot-shell/skills/agent-sec-core/scripts/asset-verify/trusted-keys"
-
-# Path to the deployed verifier config (inside agent-sec-core skill).
-# Batch mode auto-registers the signed directory here so that the verifier
-# picks it up without manual config.conf editing.
-DEPLOY_CONFIG_CONF="$HOME/.copilot-shell/skills/agent-sec-core/scripts/asset-verify/config.conf"
+# Default path for trusted public keys in the verifier package data.
+SOURCE_ASSET_VERIFY_DIR="$AGENT_SEC_CORE_DIR/agent-sec-cli/src/agent_sec_cli/asset_verify"
+DEFAULT_TRUSTED_KEYS_DIR="$SOURCE_ASSET_VERIFY_DIR/trusted-keys"
+DEFAULT_CONFIG_FILE="$SOURCE_ASSET_VERIFY_DIR/config.conf"
+VERIFIER_PATH_SOURCE="source"
+VERIFIER_PATHS_RESOLVED=false
 
 # Resolve gpg binary: prefer 'gpg', fall back to 'gpg2' (RHEL/Alinux minimal)
 if command -v gpg &>/dev/null; then
@@ -75,6 +72,46 @@ fi
 # Resolved GPG key identifier used for signing.  Set after key generation
 # or GPG_PRIVATE_KEY import; empty means "let gpg pick its default".
 GPG_SIGN_KEY=""
+
+try_verifier_asset_dir() {
+    local asset_dir="$1"
+
+    if [[ ! -d "$asset_dir" || ! -f "$asset_dir/config.conf" ]]; then
+        return 1
+    fi
+
+    DEFAULT_TRUSTED_KEYS_DIR="$asset_dir/trusted-keys"
+    DEFAULT_CONFIG_FILE="$asset_dir/config.conf"
+    VERIFIER_PATH_SOURCE="$asset_dir"
+    return 0
+}
+
+resolve_verifier_paths() {
+    if [[ "$VERIFIER_PATHS_RESOLVED" == true ]]; then
+        return 0
+    fi
+    VERIFIER_PATHS_RESOLVED=true
+
+    local asset_dir
+
+    for asset_dir in /opt/agent-sec/venv/lib/python*/site-packages/agent_sec_cli/asset_verify; do
+        if try_verifier_asset_dir "$asset_dir"; then
+            return 0
+        fi
+    done
+
+    for asset_dir in /opt/agent-sec/lib/python*/site-packages/agent_sec_cli/asset_verify; do
+        if try_verifier_asset_dir "$asset_dir"; then
+            return 0
+        fi
+    done
+
+    if try_verifier_asset_dir "$SOURCE_ASSET_VERIFY_DIR"; then
+        VERIFIER_PATH_SOURCE="source"
+    fi
+
+    return 0
+}
 
 # Function to compute SHA256 hash of a file
 compute_file_hash() {
@@ -146,6 +183,21 @@ sign_manifest() {
     local manifest_path="$1"
     local signature_path="$2"
 
+    local secret_key_query="${GPG_SIGN_KEY:-}"
+    if [[ -n "$secret_key_query" ]]; then
+        if ! "$GPG" --list-secret-keys --with-colons "$secret_key_query" 2>/dev/null | grep -q '^sec'; then
+            echo -e "${RED}ERROR: No GPG secret key found for '$secret_key_query'.${NC}" >&2
+            echo "Run '$0 --init' first, or set GPG_PRIVATE_KEY before signing." >&2
+            return 1
+        fi
+    else
+        if ! "$GPG" --list-secret-keys --with-colons 2>/dev/null | grep -q '^sec'; then
+            echo -e "${RED}ERROR: No GPG secret key is available for signing.${NC}" >&2
+            echo "Run '$0 --init' first, or set GPG_PRIVATE_KEY before signing." >&2
+            return 1
+        fi
+    fi
+
     local cmd=("$GPG" --batch --yes --armor --detach-sign --output "$signature_path")
 
     # Pin signing key so the correct key is used when multiple exist
@@ -160,36 +212,44 @@ sign_manifest() {
 
     cmd+=("$manifest_path")
 
+    local gpg_err
+    gpg_err=$(mktemp)
     if [[ -n "${GPG_PASSPHRASE:-}" ]]; then
-        if ! "${cmd[@]}" <<<"$GPG_PASSPHRASE" 2>/dev/null; then
+        if ! "${cmd[@]}" <<<"$GPG_PASSPHRASE" 2>"$gpg_err"; then
             echo -e "${RED}ERROR: Failed to sign manifest${NC}" >&2
+            sed 's/^/  gpg: /' "$gpg_err" >&2
+            rm -f "$gpg_err"
             return 1
         fi
     else
-        if ! "${cmd[@]}" 2>/dev/null; then
+        if ! "${cmd[@]}" 2>"$gpg_err"; then
             echo -e "${RED}ERROR: Failed to sign manifest${NC}" >&2
+            sed 's/^/  gpg: /' "$gpg_err" >&2
+            rm -f "$gpg_err"
             return 1
         fi
     fi
+    rm -f "$gpg_err"
 
     return 0
 }
 
-# Ensure a skills directory is registered in the deployed config.conf.
-# This must be called BEFORE signing agent-sec-core, because config.conf
-# is part of that skill and will be included in its manifest hash.
 ensure_config_dir_entry() {
     local dir_to_add="$1"
-    local config_file="$DEPLOY_CONFIG_CONF"
+    local config_file="$2"
 
+    if [[ -z "$config_file" ]]; then
+        return 0
+    fi
     if [[ ! -f "$config_file" ]]; then
-        echo -e "${YELLOW}NOTE: config.conf not found at $config_file — skipping auto-register${NC}"
+        echo -e "${YELLOW}NOTE: verifier config not found at $config_file; skipping skills_dir registration${NC}"
+        return 0
+    fi
+    if [[ ! -w "$config_file" ]]; then
+        echo -e "${YELLOW}NOTE: verifier config is not writable at $config_file; skipping skills_dir registration${NC}"
         return 0
     fi
 
-    # Already registered?  Use awk to check only inside the skills_dir
-    # array for an exact (whitespace-trimmed) match, avoiding substring
-    # false positives from grep -F.
     if awk -v target="$dir_to_add" '
         /skills_dir[[:space:]]*=/ { in_list=1; next }
         in_list && /^[[:space:]]*\]/ { exit 1 }
@@ -199,52 +259,50 @@ ensure_config_dir_entry() {
         }
         END { exit (found ? 0 : 1) }
     ' "$config_file" 2>/dev/null; then
-        echo "Skills directory already in config.conf: $dir_to_add"
+        echo "Skills directory already registered in config.conf: $dir_to_add"
         return 0
     fi
 
-    # Preserve original file permissions across the temp-file swap.
     local orig_mode
     orig_mode=$(stat -c '%a' "$config_file" 2>/dev/null) \
         || orig_mode=$(stat -f '%Lp' "$config_file" 2>/dev/null) \
         || orig_mode=""
 
-    # Insert entry before the first ']' (end of skills_dir array).
-    # The pattern tolerates an optionally-indented closing bracket.
     local tmp_file
     tmp_file=$(mktemp)
-    awk -v entry="    $dir_to_add" '
-        /^[[:space:]]*\]/ && !done { print entry; done=1 }
+    if ! awk -v entry="    $dir_to_add" '
+        /skills_dir[[:space:]]*=/ { in_list=1 }
+        in_list && /^[[:space:]]*\]/ && !done { print entry; done=1 }
         { print }
-    ' "$config_file" > "$tmp_file" && mv "$tmp_file" "$config_file"
+        END { exit (done ? 0 : 1) }
+    ' "$config_file" > "$tmp_file"; then
+        rm -f "$tmp_file"
+        echo -e "${YELLOW}WARNING: Could not update config.conf; please add '$dir_to_add' manually${NC}"
+        return 0
+    fi
 
-    # Restore original permissions if we captured them.
+    mv "$tmp_file" "$config_file"
     if [[ -n "$orig_mode" ]]; then
-        chmod "$orig_mode" "$config_file" 2>/dev/null
+        chmod "$orig_mode" "$config_file" 2>/dev/null || true
     fi
-
-    if grep -qF "$dir_to_add" "$config_file" 2>/dev/null; then
-        echo -e "${GREEN}Added skills directory to config.conf: $dir_to_add${NC}"
-    else
-        echo -e "${YELLOW}WARNING: Could not update config.conf — please add '$dir_to_add' manually${NC}"
-    fi
+    echo -e "${GREEN}Added skills directory to config.conf: $dir_to_add${NC}"
 }
 
 # Function to show usage
 show_usage() {
+    resolve_verifier_paths
     echo -e "${BOLD}Skill Manifest and Signature Generator${NC}"
     echo ""
     echo "Usage:"
     echo "  $0 <skill_dir> [--skill-name NAME] [--force]"
-    echo "  $0 --batch [parent_dir] [--force]"
+    echo "  $0 --batch <parent_dir> [--force]"
     echo "  $0 --init [--trusted-keys-dir DIR]"
     echo "  $0 --export-key [DIR]"
     echo "  $0 --check"
     echo ""
     echo "Modes:"
     echo "  (default)           Sign a single skill directory"
-    echo "  --batch [DIR]       Sign every subdirectory under DIR"
-    echo "                      (default: $DEFAULT_SKILLS_DIR)"
+    echo "  --batch DIR         Sign every subdirectory under DIR"
     echo "  --init              One-time setup: generate GPG key + export public key"
     echo "  --export-key [DIR]  Export signing public key to DIR"
     echo "                      (default: $DEFAULT_TRUSTED_KEYS_DIR)"
@@ -255,12 +313,14 @@ show_usage() {
     echo "  --force                 Overwrite existing manifest and signature files"
     echo "  --trusted-keys-dir DIR  Where to export the public key (used with --init)"
     echo "                          (default: $DEFAULT_TRUSTED_KEYS_DIR)"
+    echo "  --config-file FILE      Verifier config.conf updated by --batch"
+    echo "                          (default: $DEFAULT_CONFIG_FILE)"
     echo "  -h, --help              Show this help message"
     echo ""
     echo "Quick Start (self-deployment):"
     echo "  $0 --init"
-    echo "  $0 --batch --force"
-    echo "  python3 /path/to/verifier.py"
+    echo "  $0 --batch /path/to/skills --force"
+    echo "  agent-sec-cli verify"
     echo ""
     echo "Environment Variables:"
     echo "  GPG_PRIVATE_KEY   ASCII-armored GPG private key (for CI/CD auto-import)"
@@ -442,9 +502,10 @@ GPGEOF
 
 do_export_key() {
     local output_dir="${1:-$DEFAULT_TRUSTED_KEYS_DIR}"
+    local key_to_export="${GPG_SIGN_KEY:-$SIGN_KEY_EMAIL}"
 
-    if ! "$GPG" --list-secret-keys "$SIGN_KEY_EMAIL" &>/dev/null 2>&1; then
-        echo -e "${RED}ERROR: No GPG secret key found for '$SIGN_KEY_EMAIL'.${NC}" >&2
+    if ! "$GPG" --list-secret-keys --with-colons "$key_to_export" 2>/dev/null | grep -q '^sec'; then
+        echo -e "${RED}ERROR: No GPG secret key found for '$key_to_export'.${NC}" >&2
         echo "Run '$0 --init' first to generate a signing key." >&2
         return 1
     fi
@@ -452,15 +513,15 @@ do_export_key() {
     mkdir -p "$output_dir"
 
     local safe_name
-    safe_name=$(echo "$SIGN_KEY_EMAIL" | tr '@.' '-')
+    safe_name=$(echo "$key_to_export" | tr '@.:' '---')
     local output_file="$output_dir/${safe_name}.asc"
 
-    "$GPG" --armor --export "$SIGN_KEY_EMAIL" > "$output_file"
+    "$GPG" --armor --export "$key_to_export" > "$output_file"
 
     if [[ -s "$output_file" ]]; then
         echo -e "${GREEN}Public key exported: $output_file${NC}"
     else
-        echo -e "${RED}ERROR: Failed to export public key for $SIGN_KEY_EMAIL${NC}" >&2
+        echo -e "${RED}ERROR: Failed to export public key for $key_to_export${NC}" >&2
         rm -f "$output_file"
         return 1
     fi
@@ -477,6 +538,8 @@ main() {
     local mode=""            # "", "init", "export-key", "check"
     local trusted_keys_dir=""
     local export_key_dir=""
+    local config_file=""
+    local config_file_explicit=false
 
     # Import GPG private key from environment variable if provided
     if [[ -n "${GPG_PRIVATE_KEY:-}" ]]; then
@@ -553,15 +616,21 @@ main() {
                 trusted_keys_dir="$2"
                 shift 2
                 ;;
+            --config-file)
+                [[ -n "${2:-}" ]] || { echo -e "${RED}ERROR: --config-file requires a file path${NC}" >&2; exit 1; }
+                config_file="$2"
+                config_file_explicit=true
+                shift 2
+                ;;
             --batch)
                 batch=true
-                # Directory is optional; default to DEFAULT_SKILLS_DIR
                 if [[ -n "${2:-}" && "${2:0:1}" != "-" ]]; then
                     batch_dir="$2"
                     shift 2
                 else
-                    batch_dir=""
-                    shift
+                    echo -e "${RED}ERROR: --batch requires a parent directory${NC}" >&2
+                    show_usage
+                    exit 1
                 fi
                 ;;
             --skill-name)
@@ -594,6 +663,14 @@ main() {
         esac
     done
 
+    resolve_verifier_paths
+    if [[ -z "$trusted_keys_dir" ]]; then
+        trusted_keys_dir="$DEFAULT_TRUSTED_KEYS_DIR"
+    fi
+    if [[ -z "$config_file" ]]; then
+        config_file="$DEFAULT_CONFIG_FILE"
+    fi
+
     # ── Mode dispatch ──
 
     if [[ "$mode" == "check" ]]; then
@@ -607,6 +684,9 @@ main() {
     fi
 
     if [[ "$mode" == "export-key" ]]; then
+        if [[ -z "$export_key_dir" ]]; then
+            export_key_dir="$DEFAULT_TRUSTED_KEYS_DIR"
+        fi
         do_export_key "$export_key_dir"
         exit $?
     fi
@@ -614,21 +694,15 @@ main() {
     # ── Batch mode ──
 
     if [[ "$batch" == true ]]; then
-        # Default to the standard deployed skills directory
-        if [[ -z "$batch_dir" ]]; then
-            batch_dir="$DEFAULT_SKILLS_DIR"
-        fi
-
         batch_dir=$(cd "$batch_dir" 2>/dev/null && pwd) || true
         if [[ ! -d "$batch_dir" ]]; then
             echo -e "${RED}ERROR: Batch directory does not exist: $batch_dir${NC}" >&2
             exit 1
         fi
 
-        # Register the skills directory in config.conf BEFORE signing.
-        # config.conf is part of the agent-sec-core skill, so it must be
-        # updated first to ensure its manifest hash is correct.
-        ensure_config_dir_entry "$batch_dir"
+        if $config_file_explicit || [[ "$config_file" != "$AGENT_SEC_CORE_DIR/"* ]]; then
+            ensure_config_dir_entry "$batch_dir" "$config_file"
+        fi
 
         echo "Batch signing skills under: $batch_dir"
         echo ""

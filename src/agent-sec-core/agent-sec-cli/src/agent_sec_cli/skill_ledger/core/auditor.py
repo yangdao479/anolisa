@@ -11,8 +11,13 @@ Implements ``agent-sec-cli skill-ledger audit <skill_dir> [--verify-snapshots]``
 from typing import Any
 
 from agent_sec_cli.skill_ledger.core.file_hasher import (
-    compute_file_hashes,
+    compute_snapshot_file_hashes,
     diff_file_hashes,
+)
+from agent_sec_cli.skill_ledger.core.manifest_integrity import (
+    MISSING_SIGNATURE_ERROR,
+    manifest_hash_error,
+    verify_manifest_signature,
 )
 from agent_sec_cli.skill_ledger.core.version_chain import (
     list_version_ids,
@@ -20,9 +25,9 @@ from agent_sec_cli.skill_ledger.core.version_chain import (
     load_version_manifest,
     snapshot_dir_path,
 )
-from agent_sec_cli.skill_ledger.errors import SignatureInvalidError
 from agent_sec_cli.skill_ledger.signing.base import SigningBackend
 from agent_sec_cli.skill_ledger.utils import validate_skill_dir
+from pydantic import ValidationError
 
 
 def audit(
@@ -51,7 +56,17 @@ def audit(
     prev_signature: str | None = None
 
     for vid in version_ids:
-        manifest = load_version_manifest(skill_dir, vid)
+        try:
+            manifest = load_version_manifest(skill_dir, vid)
+        except (ValueError, ValidationError) as exc:
+            errors.append(
+                {
+                    "versionId": vid,
+                    "error": f"Version manifest {vid}.json is corrupted: {exc}",
+                }
+            )
+            prev_signature = None
+            continue
 
         if manifest is None:
             errors.append(
@@ -61,27 +76,24 @@ def audit(
             continue
 
         # 3a: Verify manifestHash
-        expected_hash = manifest.compute_manifest_hash()
-        if manifest.manifestHash != expected_hash:
+        hash_error = manifest_hash_error(manifest)
+        if hash_error is not None:
             errors.append(
                 {
                     "versionId": vid,
-                    "error": "manifestHash does not match manifest content",
+                    "error": hash_error,
                 }
             )
 
         # 3b: Verify signature
-        if manifest.signature is not None:
-            try:
-                backend.verify(
-                    manifest.manifestHash.encode("utf-8"),
-                    manifest.signature.value,
-                    manifest.signature.keyFingerprint,
+        signature_valid, signature_error = verify_manifest_signature(manifest, backend)
+        if not signature_valid:
+            if signature_error == MISSING_SIGNATURE_ERROR:
+                errors.append({"versionId": vid, "error": "Missing signature"})
+            else:
+                errors.append(
+                    {"versionId": vid, "error": f"Signature invalid: {signature_error}"}
                 )
-            except SignatureInvalidError as exc:
-                errors.append({"versionId": vid, "error": f"Signature invalid: {exc}"})
-        else:
-            errors.append({"versionId": vid, "error": "Missing signature"})
 
         # 3c: Verify previousManifestSignature chain
         if prev_signature is not None:
@@ -121,18 +133,27 @@ def audit(
         if verify_snapshots:
             snap_path = snapshot_dir_path(skill_dir, vid)
             if snap_path.is_dir():
-                snap_hashes = compute_file_hashes(str(snap_path))
-                diff = diff_file_hashes(manifest.fileHashes, snap_hashes)
-                if not diff["match"]:
+                try:
+                    snap_hashes = compute_snapshot_file_hashes(str(snap_path))
+                except ValueError as exc:
                     errors.append(
                         {
                             "versionId": vid,
-                            "error": (
-                                f"Snapshot mismatch — added: {diff['added']}, "
-                                f"removed: {diff['removed']}, modified: {diff['modified']}"
-                            ),
+                            "error": f"Snapshot invalid — {exc}",
                         }
                     )
+                else:
+                    diff = diff_file_hashes(manifest.fileHashes, snap_hashes)
+                    if not diff["match"]:
+                        errors.append(
+                            {
+                                "versionId": vid,
+                                "error": (
+                                    f"Snapshot mismatch — added: {diff['added']}, "
+                                    f"removed: {diff['removed']}, modified: {diff['modified']}"
+                                ),
+                            }
+                        )
             else:
                 errors.append(
                     {
@@ -148,7 +169,16 @@ def audit(
             prev_signature = None
 
     # Verify latest.json consistency
-    latest = load_latest_manifest(skill_dir)
+    try:
+        latest = load_latest_manifest(skill_dir)
+    except (ValueError, ValidationError) as exc:
+        errors.append(
+            {
+                "versionId": "latest.json",
+                "error": f"latest.json is corrupted: {exc}",
+            }
+        )
+        latest = None
     if latest is not None and version_ids:
         expected_latest_vid = version_ids[-1]
         if latest.versionId != expected_latest_vid:

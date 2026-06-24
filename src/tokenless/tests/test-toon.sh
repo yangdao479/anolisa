@@ -4,6 +4,10 @@
 
 set -uo pipefail
 
+# Temp file for tests (cleaned up on exit)
+tmpfile=$(mktemp /tmp/toon_test_XXXXXX.json)
+trap 'rm -f "$tmpfile"' EXIT
+
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -85,8 +89,8 @@ assert_contains "$result" '"name":"Alice"' "解码 - name"
 assert_contains "$result" '"age":30' "解码 - age"
 
 info "3.2: 表格数组解码"
-echo -e "users[2]{id,name}:\n  1,Alice\n  2,Bob" | toon -d > /tmp/toon_decode_test.json
-result=$(cat /tmp/toon_decode_test.json)
+echo -e "users[2]{id,name}:\n  1,Alice\n  2,Bob" | toon -d > "$tmpfile"
+result=$(cat "$tmpfile")
 assert_contains "$result" '"users"' "解码表格数组 - users 键"
 # id 是数字，name 是字符串
 if echo "$result" | grep -q '"id":1'; then pass "解码表格数组 - id 为数字"
@@ -228,23 +232,23 @@ else fail "嵌套数据未压缩"; fi
 section "Test 8: OpenClaw 插件适配"
 
 info "8.1: 插件文件存在"
-if [ -f ~/.openclaw/extensions/tokenless-openclaw/index.js ]; then pass "插件 JS 文件存在"
+if [ -f ~/.openclaw/extensions/tokenless/index.js ]; then pass "插件 JS 文件存在"
 else fail "插件 JS 文件不存在"; fi
 
 info "8.2: 插件包含 toon 检测逻辑"
-if grep -q "checkToon" ~/.openclaw/extensions/tokenless-openclaw/index.js; then pass "插件包含 toon 检测"
+if grep -q "checkTokenless" ~/.openclaw/extensions/tokenless/index.js; then pass "插件包含 tokenless 检测"
 else fail "插件缺少 toon 检测"; fi
 
 info "8.3: 插件包含 toon 压缩函数"
-if grep -q 'execFileSync.*toon' ~/.openclaw/extensions/tokenless-openclaw/index.js; then pass "插件包含 toon 压缩函数"
+if grep -q 'execFileSync.*toon' ~/.openclaw/extensions/tokenless/index.js; then pass "插件包含 toon 压缩函数"
 else fail "插件缺少 toon 压缩函数"; fi
 
 info "8.4: 插件配置文件存在"
-if [ -f ~/.openclaw/extensions/tokenless-openclaw/openclaw.plugin.json ]; then pass "插件配置文件存在"
+if [ -f ~/.openclaw/extensions/tokenless/openclaw.plugin.json ]; then pass "插件配置文件存在"
 else fail "插件配置文件不存在"; fi
 
 info "8.5: 插件配置包含 toon_compression_enabled"
-if grep -q "toon_compression_enabled" ~/.openclaw/extensions/tokenless-openclaw/openclaw.plugin.json; then pass "插件配置包含 toon 选项"
+if grep -q "toon_compression_enabled" ~/.openclaw/extensions/tokenless/openclaw.plugin.json; then pass "插件配置包含 toon 选项"
 else fail "插件配置缺少 toon 选项"; fi
 
 info "8.6: 插件已启用"
@@ -253,7 +257,7 @@ import json
 with open('$HOME/.openclaw/openclaw.json') as f:
     cfg = json.load(f)
 entries = cfg.get('plugins',{}).get('entries',{})
-plugin = entries.get('tokenless-openclaw',{})
+plugin = entries.get('tokenless',{})
 assert plugin.get('enabled') == True, 'not enabled'
 config = plugin.get('config',{})
 assert config.get('toon_compression_enabled') == True, 'toon not enabled'

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
@@ -7,6 +7,118 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tracing::{error, info, warn};
 use ws_ckpt_common::{ChangeType, DiffEntry};
+
+use crate::util::unescape_proc_mount;
+
+/// init_workspace backup path (#673).
+pub fn backup_path_for(original_path: &str) -> String {
+    format!("{}.pre-init-bak", original_path.trim_end_matches('/'))
+}
+
+/// Roll back a failed init_workspace; `backup_owned=true` only when this init created the backup (#673).
+pub async fn cleanup_init_storage(
+    original_path: &str,
+    subvol_path: &Path,
+    snap_dir: &Path,
+    backup_owned: bool,
+) {
+    if backup_owned {
+        restore_original_from_backup(original_path).await;
+    } else if let Ok(meta) = tokio::fs::symlink_metadata(original_path).await {
+        if meta.file_type().is_symlink() {
+            let _ = tokio::fs::remove_file(original_path).await;
+        }
+    }
+    let _ = tokio::fs::remove_dir_all(snap_dir).await;
+    if let Err(e) = delete_subvolume(subvol_path).await {
+        error!("cleanup: failed to delete subvolume: {}", e);
+    }
+}
+
+/// Rename our own `.pre-init-bak` back over original_path; foreign data at original is preserved.
+async fn restore_original_from_backup(original_path: &str) {
+    let backup_path = backup_path_for(original_path);
+    match tokio::fs::symlink_metadata(&backup_path).await {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            warn!(
+                "cleanup: backup {:?} unexpectedly missing; dropping leftover symlink at {}",
+                backup_path, original_path
+            );
+            if let Ok(meta) = tokio::fs::symlink_metadata(original_path).await {
+                if meta.file_type().is_symlink() {
+                    let _ = tokio::fs::remove_file(original_path).await;
+                }
+            }
+            return;
+        }
+        Err(e) => {
+            error!(
+                "cleanup: cannot stat backup {:?}: {}; aborting restore (manual recovery required)",
+                backup_path, e
+            );
+            return;
+        }
+    }
+
+    match tokio::fs::symlink_metadata(original_path).await {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            let _ = tokio::fs::remove_file(original_path).await;
+        }
+        Ok(meta) if meta.is_dir() => {
+            let _ = tokio::fs::remove_dir(original_path).await;
+        }
+        _ => {}
+    }
+
+    match tokio::fs::rename(&backup_path, original_path).await {
+        Ok(()) => info!("cleanup: restored {} from backup", original_path),
+        Err(e) => error!(
+            "cleanup: failed to restore {:?} -> {:?}: {}; backup retained for manual recovery",
+            backup_path, original_path, e
+        ),
+    }
+}
+
+/// Ensure the current kernel can mount btrfs.
+///
+/// Checks `/proc/filesystems`; if absent, tries `modprobe btrfs` once and rechecks.
+/// Fails with an actionable message pointing at kernel-modules-extra / CONFIG_BTRFS_FS.
+pub async fn ensure_btrfs_support() -> Result<()> {
+    if proc_filesystems_has_btrfs().await? {
+        return Ok(());
+    }
+
+    // Best-effort modprobe; exit code is ignored, the recheck is authoritative.
+    let _ = Command::new("modprobe").arg("btrfs").status().await;
+
+    if proc_filesystems_has_btrfs().await? {
+        info!("Loaded btrfs kernel module");
+        return Ok(());
+    }
+
+    bail!(
+        "Kernel does not support btrfs (no entry in /proc/filesystems and \
+         `modprobe btrfs` did not register the module). Install the matching \
+         kernel-modules-extra package or rebuild the kernel with CONFIG_BTRFS_FS, \
+         then run `systemctl restart ws-ckpt`."
+    );
+}
+
+/// True if `btrfs` is listed in `/proc/filesystems`.
+async fn proc_filesystems_has_btrfs() -> Result<bool> {
+    let file = File::open("/proc/filesystems")
+        .await
+        .context("Failed to open /proc/filesystems")?;
+    let mut reader = BufReader::new(file).lines();
+    while let Some(line) = reader.next_line().await? {
+        // Line format: "<fstype>" or "nodev <fstype>"; fs name is always the last token.
+        if line.split_whitespace().last() == Some("btrfs") {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
 
 /// Resolve a path that may be a symlink to its real (canonical) path.
 /// If the path is a symlink, it is resolved via `canonicalize`.
@@ -119,6 +231,38 @@ pub async fn diff_between_snapshots(snap_from: &Path, snap_to: &Path) -> Result<
         .context("diff task panicked")?
 }
 
+/// Diff a snapshot against the live (writable) workspace subvolume.
+///
+/// Creates a temporary read-only snapshot of `live_subvol` inside `snap_dir`,
+/// runs the diff, then removes the temporary snapshot regardless of outcome.
+pub async fn diff_against_live(
+    snap_from: &Path,
+    live_subvol: &Path,
+    snap_dir: &Path,
+) -> Result<Vec<DiffEntry>> {
+    use std::hash::{BuildHasher, Hasher, RandomState};
+
+    let h = RandomState::new().build_hasher().finish();
+    let tmp_snap = snap_dir.join(format!(".diff-tmp-{:06x}", h & 0xFFFFFF));
+
+    // Clean up stale temp snapshot from a prior crash before creating a new one.
+    if tmp_snap.exists() {
+        let _ = delete_subvolume(&tmp_snap).await;
+    }
+
+    create_snapshot(live_subvol, &tmp_snap, true)
+        .await
+        .context("failed to create temporary snapshot of live workspace for diff")?;
+
+    let result = diff_between_snapshots(snap_from, &tmp_snap).await;
+
+    if let Err(e) = delete_subvolume(&tmp_snap).await {
+        warn!(error = %e, path = %tmp_snap.display(), "failed to remove temp diff snapshot");
+    }
+
+    result
+}
+
 /// Blocking implementation of snapshot diff using `btrfs send | btrfs receive --dump`.
 fn diff_between_snapshots_blocking(snap_from: &Path, snap_to: &Path) -> Result<Vec<DiffEntry>> {
     use std::process::{Command as StdCommand, Stdio};
@@ -174,18 +318,17 @@ fn diff_between_snapshots_blocking(snap_from: &Path, snap_to: &Path) -> Result<V
     Ok(entries)
 }
 
-/// Parse the output of `btrfs receive --dump` into clean, deduplicated DiffEntry items.
+/// Parse `btrfs receive --dump` output into deduplicated DiffEntry items.
 ///
-/// Processing phases:
-/// 1. Detect snapshot prefix (e.g. `./msg1-step1/`) and build rename map
-///    to resolve btrfs-internal temporary inode references (e.g. `o261-118-0`)
-///    to their real file paths.
-/// 2. Walk operations, resolve paths, and deduplicate so that each real path
-///    appears at most once with the most significant change type.
+/// Phase 1 collects: snapshot prefix, temp→real rename map, link pairs,
+/// unlinks. A `link new dest=old` paired with `unlink old` encodes an `mv`
+/// (btrfs send emits no `rename` line for cross-snapshot mv).
+/// Phase 2 emits entries with precedence dedup (Renamed > Added > Deleted > Modified).
 fn parse_btrfs_diff_output(output: &str) -> Vec<DiffEntry> {
-    // ── Phase 1: detect snapshot prefix + build rename map ──
     let mut snapshot_prefix = String::new();
     let mut rename_map: HashMap<String, String> = HashMap::new();
+    let mut link_pairs: Vec<(String, String)> = Vec::new();
+    let mut unlinked: HashSet<String> = HashSet::new();
 
     for line in output.lines() {
         let line = line.trim();
@@ -193,24 +336,35 @@ fn parse_btrfs_diff_output(output: &str) -> Vec<DiffEntry> {
             continue;
         }
         if let Some(rest) = line.strip_prefix("snapshot") {
-            // "snapshot  ./msg1-step1  uuid=... transid=..."
             if let Some(name) = rest.split_whitespace().next() {
                 snapshot_prefix = format!("{}/", name);
             }
         } else if let Some(rest) = line.strip_prefix("rename") {
-            // "rename  ./snap/old_path  dest=./snap/new_path"
-            let rest = rest.trim();
-            if let Some(dest_pos) = rest.find("dest=") {
-                let src = first_token(&rest[..dest_pos]);
-                let dst = first_token(&rest[dest_pos + 5..]);
-                let src = strip_snap_prefix(&src, &snapshot_prefix);
-                let dst = strip_snap_prefix(&dst, &snapshot_prefix);
+            if let Some((src, dst)) = parse_dest_pair(rest, &snapshot_prefix) {
                 rename_map.insert(src, dst);
             }
+        } else if let Some(rest) = line.strip_prefix("link") {
+            if let Some((new_real, dest_path)) = parse_dest_pair(rest, &snapshot_prefix) {
+                link_pairs.push((new_real, dest_path));
+            }
+        } else if let Some(rest) = line.strip_prefix("unlink") {
+            unlinked.insert(strip_snap_prefix(&first_token(rest), &snapshot_prefix));
         }
     }
 
-    // ── Phase 2: process operations with dedup (preserve first-seen order) ──
+    // mv detection: a `link new dest=old` paired with `unlink old` folds into
+    // a single Renamed and the matching Deleted is suppressed. Each old path
+    // can pair with at most one link — additional links to the same old path
+    // fall through to real-hardlink (Added) handling in Phase 2.
+    let mut mv_renames: HashMap<String, String> = HashMap::new();
+    let mut suppressed_unlinks: HashSet<String> = HashSet::new();
+    for (new_real, dest_path) in &link_pairs {
+        if unlinked.contains(dest_path) && !suppressed_unlinks.contains(dest_path) {
+            mv_renames.insert(new_real.clone(), dest_path.clone());
+            suppressed_unlinks.insert(dest_path.clone());
+        }
+    }
+
     let mut seen: HashMap<String, usize> = HashMap::new();
     let mut entries: Vec<DiffEntry> = Vec::new();
 
@@ -221,24 +375,53 @@ fn parse_btrfs_diff_output(output: &str) -> Vec<DiffEntry> {
         }
 
         if let Some(rest) = line.strip_prefix("mkfile") {
-            let raw = first_token(rest);
-            let path = strip_snap_prefix(&raw, &snapshot_prefix);
-            let resolved = rename_map.get(&path).cloned().unwrap_or(path);
-            insert_dedup(&mut seen, &mut entries, resolved, ChangeType::Added, None);
+            let path = resolve_path(rest, &snapshot_prefix, &rename_map);
+            insert_dedup(&mut seen, &mut entries, path, ChangeType::Added, None);
         } else if let Some(rest) = line.strip_prefix("mkdir") {
-            let raw = first_token(rest);
-            let path = strip_snap_prefix(&raw, &snapshot_prefix);
-            let resolved = rename_map.get(&path).cloned().unwrap_or(path);
+            let path = resolve_path(rest, &snapshot_prefix, &rename_map);
             insert_dedup(
                 &mut seen,
                 &mut entries,
-                resolved,
+                path,
                 ChangeType::Added,
                 Some("directory".to_string()),
             );
+        } else if let Some(rest) = line.strip_prefix("symlink") {
+            // First token is the new symlink path (often a temp inode renamed
+            // later); `dest=` is the link target string and isn't used.
+            let path = resolve_path(rest, &snapshot_prefix, &rename_map);
+            insert_dedup(
+                &mut seen,
+                &mut entries,
+                path,
+                ChangeType::Added,
+                Some("symlink".to_string()),
+            );
+        } else if let Some(rest) = line.strip_prefix("link") {
+            if let Some((new_real, _)) = parse_dest_pair(rest, &snapshot_prefix) {
+                if let Some(old) = mv_renames.get(&new_real).cloned() {
+                    insert_dedup(
+                        &mut seen,
+                        &mut entries,
+                        new_real.clone(),
+                        ChangeType::Renamed,
+                        Some(format!("{} → {}", old, new_real)),
+                    );
+                } else {
+                    insert_dedup(
+                        &mut seen,
+                        &mut entries,
+                        new_real,
+                        ChangeType::Added,
+                        Some("hardlink".to_string()),
+                    );
+                }
+            }
         } else if let Some(rest) = line.strip_prefix("unlink") {
             let path = strip_snap_prefix(&first_token(rest), &snapshot_prefix);
-            insert_dedup(&mut seen, &mut entries, path, ChangeType::Deleted, None);
+            if !suppressed_unlinks.contains(&path) {
+                insert_dedup(&mut seen, &mut entries, path, ChangeType::Deleted, None);
+            }
         } else if let Some(rest) = line.strip_prefix("rmdir") {
             let path = strip_snap_prefix(&first_token(rest), &snapshot_prefix);
             insert_dedup(
@@ -249,12 +432,8 @@ fn parse_btrfs_diff_output(output: &str) -> Vec<DiffEntry> {
                 Some("directory".to_string()),
             );
         } else if let Some(rest) = line.strip_prefix("rename") {
-            // Only emit user-facing Renamed for real renames; temp→real are
-            // silently resolved via the rename_map built in Phase 1.
-            let rest = rest.trim();
-            if let Some(dest_pos) = rest.find("dest=") {
-                let src = strip_snap_prefix(&first_token(&rest[..dest_pos]), &snapshot_prefix);
-                let dst = strip_snap_prefix(&first_token(&rest[dest_pos + 5..]), &snapshot_prefix);
+            // temp→real renames are folded via rename_map; only emit the rest.
+            if let Some((src, dst)) = parse_dest_pair(rest, &snapshot_prefix) {
                 if !is_btrfs_temp_ref(&src) {
                     insert_dedup(
                         &mut seen,
@@ -267,15 +446,8 @@ fn parse_btrfs_diff_output(output: &str) -> Vec<DiffEntry> {
             }
         } else if let Some(rest) = line.strip_prefix("update_extent") {
             // `btrfs send --no-data` emits update_extent instead of write.
-            let path = strip_snap_prefix(&first_token(rest), &snapshot_prefix);
-            let resolved = rename_map.get(&path).cloned().unwrap_or(path);
-            insert_dedup(
-                &mut seen,
-                &mut entries,
-                resolved,
-                ChangeType::Modified,
-                None,
-            );
+            let path = resolve_path(rest, &snapshot_prefix, &rename_map);
+            insert_dedup(&mut seen, &mut entries, path, ChangeType::Modified, None);
         } else if let Some(rest) = line.strip_prefix("write") {
             let path = strip_snap_prefix(&first_token(rest), &snapshot_prefix);
             insert_dedup(&mut seen, &mut entries, path, ChangeType::Modified, None);
@@ -283,14 +455,32 @@ fn parse_btrfs_diff_output(output: &str) -> Vec<DiffEntry> {
             let path = strip_snap_prefix(&first_token(rest), &snapshot_prefix);
             insert_dedup(&mut seen, &mut entries, path, ChangeType::Modified, None);
         }
-        // Silently skip metadata-only ops: snapshot, utimes, chown, chmod,
-        // set_xattr, remove_xattr, clone, link, etc.
+        // Skip metadata-only ops: utimes, chown, chmod, set_xattr, remove_xattr, clone.
     }
 
     entries
 }
 
-/// Insert a DiffEntry, deduplicating by path (first occurrence wins).
+/// Strip the snapshot prefix from the first token of `rest`, then resolve
+/// through `rename_map` (temp → real) when applicable.
+fn resolve_path(rest: &str, snapshot_prefix: &str, rename_map: &HashMap<String, String>) -> String {
+    let path = strip_snap_prefix(&first_token(rest), snapshot_prefix);
+    rename_map.get(&path).cloned().unwrap_or(path)
+}
+
+/// Parse a `<src>  dest=<dst>` line tail into `(src, dst)`, both with the
+/// snapshot prefix stripped. `dest=` for `link`/mvs may carry a bare relative
+/// path (no prefix), which `strip_snap_prefix` no-ops cleanly.
+fn parse_dest_pair(rest: &str, snapshot_prefix: &str) -> Option<(String, String)> {
+    let rest = rest.trim();
+    let dest_pos = rest.find("dest=")?;
+    let src = strip_snap_prefix(&first_token(&rest[..dest_pos]), snapshot_prefix);
+    let dst = strip_snap_prefix(&first_token(&rest[dest_pos + 5..]), snapshot_prefix);
+    Some((src, dst))
+}
+
+/// Insert a DiffEntry, dedup'd by path. Higher-precedence change_type wins
+/// on conflict (see `change_precedence`).
 fn insert_dedup(
     seen: &mut HashMap<String, usize>,
     entries: &mut Vec<DiffEntry>,
@@ -301,13 +491,31 @@ fn insert_dedup(
     if path.is_empty() {
         return;
     }
-    if !seen.contains_key(&path) {
+    if let Some(&idx) = seen.get(&path) {
+        if change_precedence(&change_type) > change_precedence(&entries[idx].change_type) {
+            // Replace both fields together: keeping the old `detail` (e.g.
+            // `"directory"` from a prior `rmdir`) when a `mkfile` reuses the
+            // path leaks misleading metadata into the new entry.
+            entries[idx].change_type = change_type;
+            entries[idx].detail = detail;
+        }
+    } else {
         seen.insert(path.clone(), entries.len());
         entries.push(DiffEntry {
             path,
             change_type,
             detail,
         });
+    }
+}
+
+/// Renamed > Added > Deleted > Modified.
+fn change_precedence(c: &ChangeType) -> u8 {
+    match c {
+        ChangeType::Renamed => 4,
+        ChangeType::Added => 3,
+        ChangeType::Deleted => 2,
+        ChangeType::Modified => 1,
     }
 }
 
@@ -488,8 +696,8 @@ pub async fn find_available_btrfs_partition() -> Result<MountInfo> {
                 continue;
             }
             return Ok(MountInfo {
-                device: parts[0].to_string(),
-                mount_point: parts[1].to_string(),
+                device: unescape_proc_mount(parts[0]),
+                mount_point: unescape_proc_mount(parts[1]),
             });
         }
     }
@@ -528,12 +736,12 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    // NOTE: All btrfs_ops tests require:
+    // NOTE: All btrfs_common tests require:
     //   1. Root privileges (CAP_SYS_ADMIN)
     //   2. A mounted btrfs filesystem
     //   3. btrfs-progs installed
     // They are marked #[ignore] and must be run manually:
-    //   cargo test -p ws-ckpt-daemon btrfs_ops -- --ignored
+    //   cargo test -p ws-ckpt-daemon btrfs_common -- --ignored
 
     #[tokio::test]
     #[ignore = "requires root + btrfs filesystem"]
@@ -621,6 +829,31 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires root + btrfs filesystem"]
+    async fn diff_against_live_workspace() {
+        let base = PathBuf::from("/mnt/btrfs-workspace");
+        let src = base.join("test-diff-live-src");
+        let snap1 = base.join("test-diff-live-snap1");
+        // Cleanup prior
+        let _ = delete_subvolume(&snap1).await;
+        let _ = delete_subvolume(&src).await;
+
+        create_subvolume(&src).await.unwrap();
+        create_snapshot(&src, &snap1, true).await.unwrap();
+        // Modify the live subvolume after snapshot
+        tokio::fs::write(src.join("live-change.txt"), "world")
+            .await
+            .unwrap();
+
+        let entries = diff_against_live(&snap1, &src, &base).await.unwrap();
+        assert!(!entries.is_empty());
+
+        // Cleanup
+        let _ = delete_subvolume(&snap1).await;
+        let _ = delete_subvolume(&src).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires root + btrfs filesystem"]
     async fn get_fs_usage() {
         let (total, used) = get_filesystem_usage(Path::new("/mnt/btrfs-workspace"))
             .await
@@ -672,6 +905,163 @@ mod tests {
     fn parse_btrfs_diff_output_empty() {
         let entries = parse_btrfs_diff_output("");
         assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn backup_path_for_appends_suffix() {
+        assert_eq!(backup_path_for("/tmp/ws"), "/tmp/ws.pre-init-bak");
+        assert_eq!(backup_path_for("/tmp/ws/"), "/tmp/ws.pre-init-bak");
+    }
+
+    /// Backup restores user data when symlink already replaced original (#673).
+    #[tokio::test]
+    async fn restore_swaps_symlink_back_to_backup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let orig = tmp.path().join("ws");
+        let bak = tmp.path().join("ws.pre-init-bak");
+        let target = tmp.path().join("subvol");
+
+        tokio::fs::create_dir(&bak).await.unwrap();
+        tokio::fs::write(bak.join("foo.txt"), b"important")
+            .await
+            .unwrap();
+        tokio::fs::create_dir(&target).await.unwrap();
+        tokio::fs::symlink(&target, &orig).await.unwrap();
+
+        restore_original_from_backup(orig.to_str().unwrap()).await;
+
+        assert!(!bak.exists(), "backup should be renamed away");
+        assert!(orig.is_dir(), "original must be a real dir again");
+        let payload = tokio::fs::read_to_string(orig.join("foo.txt"))
+            .await
+            .unwrap();
+        assert_eq!(payload, "important");
+    }
+
+    /// TOCTOU racer: an empty foreign dir appears at original between rename
+    /// and symlink. Backup must still restore (#673).
+    #[tokio::test]
+    async fn restore_clears_empty_racer_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let orig = tmp.path().join("ws");
+        let bak = tmp.path().join("ws.pre-init-bak");
+
+        tokio::fs::create_dir(&bak).await.unwrap();
+        tokio::fs::write(bak.join("foo.txt"), b"keep")
+            .await
+            .unwrap();
+        tokio::fs::create_dir(&orig).await.unwrap();
+
+        restore_original_from_backup(orig.to_str().unwrap()).await;
+
+        assert!(!bak.exists());
+        assert!(orig.join("foo.txt").exists(), "user data must be back");
+    }
+
+    /// Non-empty foreign dir at original must NOT be deleted; backup stays put.
+    #[tokio::test]
+    async fn restore_preserves_non_empty_foreign_dir_and_backup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let orig = tmp.path().join("ws");
+        let bak = tmp.path().join("ws.pre-init-bak");
+
+        tokio::fs::create_dir(&bak).await.unwrap();
+        tokio::fs::write(bak.join("foo.txt"), b"keep")
+            .await
+            .unwrap();
+        tokio::fs::create_dir(&orig).await.unwrap();
+        tokio::fs::write(orig.join("racer.txt"), b"foreign")
+            .await
+            .unwrap();
+
+        restore_original_from_backup(orig.to_str().unwrap()).await;
+
+        assert!(bak.exists(), "backup must be retained for manual recovery");
+        assert!(orig.join("racer.txt").exists());
+        assert!(bak.join("foo.txt").exists());
+    }
+
+    /// No backup -> noop, must not touch anything else.
+    #[tokio::test]
+    async fn restore_is_noop_when_backup_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let orig = tmp.path().join("ws");
+        tokio::fs::create_dir(&orig).await.unwrap();
+        tokio::fs::write(orig.join("x"), b"y").await.unwrap();
+
+        restore_original_from_backup(orig.to_str().unwrap()).await;
+
+        assert!(orig.join("x").exists());
+    }
+
+    /// Foreign .pre-init-bak must not be restored when backup_owned=false (#673).
+    #[tokio::test]
+    async fn cleanup_does_not_restore_unowned_backup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let orig = tmp.path().join("ws");
+        let bak = tmp.path().join("ws.pre-init-bak");
+        let subvol = tmp.path().join("subvol");
+        let snap = tmp.path().join("snap");
+
+        tokio::fs::create_dir(&bak).await.unwrap();
+        tokio::fs::write(bak.join("attacker.txt"), b"foreign")
+            .await
+            .unwrap();
+        tokio::fs::create_dir(&orig).await.unwrap();
+        tokio::fs::write(orig.join("user.txt"), b"real")
+            .await
+            .unwrap();
+        tokio::fs::create_dir(&snap).await.unwrap();
+
+        cleanup_init_storage(orig.to_str().unwrap(), &subvol, &snap, false).await;
+
+        assert!(orig.join("user.txt").exists(), "user data must remain");
+        assert!(
+            bak.join("attacker.txt").exists(),
+            "foreign backup not restored"
+        );
+        assert!(!snap.exists(), "snap dir cleaned");
+    }
+
+    /// cleanup with backup_owned=false drops a leftover symlink we created in step 6.
+    #[tokio::test]
+    async fn cleanup_drops_leftover_symlink_when_unowned() {
+        let tmp = tempfile::tempdir().unwrap();
+        let orig = tmp.path().join("ws");
+        let target = tmp.path().join("subvol");
+        let snap = tmp.path().join("snap");
+
+        tokio::fs::create_dir(&target).await.unwrap();
+        tokio::fs::symlink(&target, &orig).await.unwrap();
+        tokio::fs::create_dir(&snap).await.unwrap();
+
+        cleanup_init_storage(orig.to_str().unwrap(), &target, &snap, false).await;
+
+        assert!(!orig.exists(), "leftover symlink dropped");
+    }
+
+    /// backup_owned=true restores the backup over original (legit happy path).
+    #[tokio::test]
+    async fn cleanup_restores_owned_backup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let orig = tmp.path().join("ws");
+        let bak = tmp.path().join("ws.pre-init-bak");
+        let target = tmp.path().join("subvol");
+        let snap = tmp.path().join("snap");
+
+        tokio::fs::create_dir(&bak).await.unwrap();
+        tokio::fs::write(bak.join("user.txt"), b"keep")
+            .await
+            .unwrap();
+        tokio::fs::create_dir(&target).await.unwrap();
+        tokio::fs::symlink(&target, &orig).await.unwrap();
+        tokio::fs::create_dir(&snap).await.unwrap();
+
+        cleanup_init_storage(orig.to_str().unwrap(), &target, &snap, true).await;
+
+        assert!(orig.is_dir(), "original restored as real dir");
+        assert!(orig.join("user.txt").exists(), "user data back at original");
+        assert!(!bak.exists(), "backup consumed");
     }
 
     #[test]
@@ -730,6 +1120,109 @@ mod tests {
         let output = "mkfile  new.txt\nchown  foo.txt\nxattr  bar.txt\n";
         let entries = parse_btrfs_diff_output(output);
         assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].change_type, ChangeType::Added);
+    }
+
+    // mkfile temp + rename temp→foo.txt + update_extent foo.txt → Added wins.
+    #[test]
+    fn parse_btrfs_diff_output_added_file_with_temp_rename() {
+        let output = "snapshot  ./snap_a_ro  uuid=abc transid=1\n\
+                      mkfile          ./snap_a_ro/o257-34321-0\n\
+                      rename          ./snap_a_ro/o257-34321-0  dest=./snap_a_ro/foo.txt\n\
+                      update_extent   ./snap_a_ro/foo.txt  offset=0 len=6\n";
+        let entries = parse_btrfs_diff_output(output);
+        assert_eq!(entries.len(), 1, "entries: {:?}", entries);
+        assert_eq!(entries[0].path, "foo.txt");
+        assert_eq!(entries[0].change_type, ChangeType::Added);
+    }
+
+    // symlink temp + rename temp→mylink → Added(mylink, "symlink").
+    #[test]
+    fn parse_btrfs_diff_output_symlink_with_temp_rename() {
+        let output = "snapshot  ./snap_a_ro  uuid=abc transid=1\n\
+                      symlink         ./snap_a_ro/o258-34321-0  dest=/etc/passwd\n\
+                      rename          ./snap_a_ro/o258-34321-0  dest=./snap_a_ro/mylink\n";
+        let entries = parse_btrfs_diff_output(output);
+        assert_eq!(entries.len(), 1, "entries: {:?}", entries);
+        assert_eq!(entries[0].path, "mylink");
+        assert_eq!(entries[0].change_type, ChangeType::Added);
+        assert_eq!(entries[0].detail.as_deref(), Some("symlink"));
+    }
+
+    // link new dest=existing where existing is NOT unlinked → real hardlink.
+    #[test]
+    fn parse_btrfs_diff_output_real_hardlink_emits_added() {
+        let output = "snapshot  ./snap_a_ro  uuid=abc transid=1\n\
+                      mkfile          ./snap_a_ro/o259-34321-0\n\
+                      rename          ./snap_a_ro/o259-34321-0  dest=./snap_a_ro/target.txt\n\
+                      link            ./snap_a_ro/hardlink_to_target  dest=target.txt\n";
+        let entries = parse_btrfs_diff_output(output);
+        assert_eq!(entries.len(), 2, "entries: {:?}", entries);
+        assert_eq!(entries[0].path, "target.txt");
+        assert_eq!(entries[0].change_type, ChangeType::Added);
+        assert_eq!(entries[1].path, "hardlink_to_target");
+        assert_eq!(entries[1].change_type, ChangeType::Added);
+        assert_eq!(entries[1].detail.as_deref(), Some("hardlink"));
+    }
+
+    // mv foo.txt → bar.txt: link bar dest=foo + unlink foo → single Renamed,
+    // Deleted(foo) suppressed.
+    #[test]
+    fn parse_btrfs_diff_output_mv_emits_renamed_and_drops_deleted() {
+        let output = "snapshot  ./snap_b_ro  uuid=abc transid=2\n\
+                      link            ./snap_b_ro/bar.txt  dest=foo.txt\n\
+                      unlink          ./snap_b_ro/foo.txt\n";
+        let entries = parse_btrfs_diff_output(output);
+        assert_eq!(entries.len(), 1, "entries: {:?}", entries);
+        assert_eq!(entries[0].path, "bar.txt");
+        assert_eq!(entries[0].change_type, ChangeType::Renamed);
+        assert_eq!(entries[0].detail.as_deref(), Some("foo.txt → bar.txt"));
+    }
+
+    // rmdir foo + mkfile foo: Added wins over Deleted, and the old "directory"
+    // detail must NOT leak into the new file entry.
+    #[test]
+    fn parse_btrfs_diff_output_replace_clears_stale_detail() {
+        let output = "snapshot  ./snap  uuid=abc transid=1\n\
+                      rmdir   ./snap/foo\n\
+                      mkfile  ./snap/o100-1-0\n\
+                      rename  ./snap/o100-1-0  dest=./snap/foo\n";
+        let entries = parse_btrfs_diff_output(output);
+        assert_eq!(entries.len(), 1, "entries: {:?}", entries);
+        assert_eq!(entries[0].path, "foo");
+        assert_eq!(entries[0].change_type, ChangeType::Added);
+        assert_eq!(entries[0].detail, None, "stale 'directory' detail leaked");
+    }
+
+    // Two `link X dest=foo` plus one `unlink foo`: only the first link is
+    // treated as the mv rename; the second is a real hardlink Added.
+    #[test]
+    fn parse_btrfs_diff_output_multi_link_to_same_old_path() {
+        let output = "snapshot  ./snap  uuid=abc transid=1\n\
+                      link    ./snap/bar  dest=foo\n\
+                      link    ./snap/baz  dest=foo\n\
+                      unlink  ./snap/foo\n";
+        let entries = parse_btrfs_diff_output(output);
+        assert_eq!(entries.len(), 2, "entries: {:?}", entries);
+        assert_eq!(entries[0].path, "bar");
+        assert_eq!(entries[0].change_type, ChangeType::Renamed);
+        assert_eq!(entries[0].detail.as_deref(), Some("foo → bar"));
+        assert_eq!(entries[1].path, "baz");
+        assert_eq!(entries[1].change_type, ChangeType::Added);
+        assert_eq!(entries[1].detail.as_deref(), Some("hardlink"));
+    }
+
+    // PB-004: update_extent before mkfile (both resolve to same real path);
+    // Added must win over the earlier-seen Modified via precedence dedup.
+    #[test]
+    fn parse_btrfs_diff_output_added_wins_over_modified_when_extent_first() {
+        let output = "snapshot  ./snap  uuid=abc transid=1\n\
+                      update_extent   ./snap/foo.txt  offset=0 len=6\n\
+                      mkfile          ./snap/o100-1-0\n\
+                      rename          ./snap/o100-1-0  dest=./snap/foo.txt\n";
+        let entries = parse_btrfs_diff_output(output);
+        assert_eq!(entries.len(), 1, "entries: {:?}", entries);
+        assert_eq!(entries[0].path, "foo.txt");
         assert_eq!(entries[0].change_type, ChangeType::Added);
     }
 

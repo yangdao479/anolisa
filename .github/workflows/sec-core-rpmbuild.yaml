@@ -16,7 +16,7 @@ permissions:
 jobs:
   build-rpm:
     name: Build agent-sec-core RPM
-    runs-on: ubuntu-22.04
+    runs-on: [ubuntu-22.04]
     container:
       image: alibaba-cloud-linux-4-registry.cn-hangzhou.cr.aliyuncs.com/alinux4/alinux4:latest
     steps:
@@ -71,7 +71,27 @@ jobs:
         run: |
           dnf makecache
           dnf install -y scripts/rpmbuild/RPMS/**/*.rpm
+          echo "=== Verify CLI ==="
           agent-sec-cli --help
+          echo "=== Verify sandbox ==="
+          linux-sandbox --help
+          echo "=== Verify site-packages ==="
+          ls /opt/agent-sec/lib/python3.11/site-packages/agent_sec_cli/
+          echo "=== Verify cosh extension ==="
+          ls /usr/share/anolisa/extensions/agent-sec-core/
+          ls /usr/share/anolisa/extensions/agent-sec-core/hooks/
+          echo "=== Verify openclaw plugin ==="
+          ls /opt/agent-sec/openclaw-plugin/
+          ls /opt/agent-sec/openclaw-plugin/dist/
+          ls /opt/agent-sec/openclaw-plugin/scripts/deploy.sh
+          echo "=== Verify hermes plugin ==="
+          ls /opt/agent-sec/hermes-plugin/src/
+          ls /opt/agent-sec/hermes-plugin/src/plugin.yaml
+          ls /opt/agent-sec/hermes-plugin/scripts/deploy.sh
+          echo "=== Verify skills ==="
+          ls /usr/share/anolisa/skills/
+          echo "=== Verify component manifest ==="
+          test -f /usr/share/anolisa/components/sec-core/component.toml || { echo "ERROR: component.toml not found after RPM install"; exit 1; }
 
       - name: Verify Python dependencies match requirements.txt
         run: |
@@ -83,7 +103,12 @@ jobs:
           from packaging.version import Version
 
           with open('src/agent-sec-core/agent-sec-cli/requirements.txt') as f:
-              reqs = [l.strip() for l in f if l.strip() and not l.strip().startswith('#')]
+              reqs = []
+              for line in f:
+                  s = line.strip().rstrip('\\').strip()
+                  if not s or s.startswith('#') or s.startswith('--hash='):
+                      continue
+                  reqs.append(s)
           failed = []
           skipped = 0
           for raw in reqs:
@@ -106,7 +131,7 @@ jobs:
           print(f'All {len(reqs) - skipped} dependencies verified ({skipped} skipped due to platform markers).')
           PYEOF
 
-      - name: Verify all Python imports
+      - name: Verify cli Python imports
         run: |
           export PYTHONPATH=/opt/agent-sec/lib/python3.11/site-packages${PYTHONPATH:+:$PYTHONPATH}
           python3 << 'PYEOF'
@@ -145,8 +170,44 @@ jobs:
           print('All modules imported successfully')
           PYEOF
 
-      - name: Install E2E test dependencies
-        run: dnf install -y jq
+      - name: Verify cosh hook Python imports
+        run: |
+          python3 << 'PYEOF'
+          import importlib.util, pathlib, sys
+
+          hooks_dir = pathlib.Path('/usr/share/anolisa/extensions/agent-sec-core/hooks')
+          print(f'Hooks directory: {hooks_dir.resolve()}')
+          sys.path.insert(0, str(hooks_dir))
+
+          py_files = sorted(hooks_dir.glob('*.py'))
+          if not py_files:
+              print('ERROR: no hook .py files found', file=sys.stderr)
+              sys.exit(1)
+
+          failed = []
+          for pyfile in py_files:
+              mod_name = pyfile.stem.replace('-', '_')
+              spec = importlib.util.spec_from_file_location(mod_name, pyfile)
+              if spec is None:
+                  print(f'  {pyfile.name} ... FAILED: cannot create module spec')
+                  failed.append((pyfile.name, 'cannot create module spec'))
+                  continue
+              try:
+                  mod = importlib.util.module_from_spec(spec)
+                  spec.loader.exec_module(mod)
+                  print(f'  {pyfile.name} ... OK')
+              except Exception as e:
+                  print(f'  {pyfile.name} ... FAILED: {e}')
+                  failed.append((pyfile.name, str(e)))
+
+          print(f'\nTotal: {len(py_files)} hooks, {len(failed)} failed')
+          if failed:
+              print('\nFailed hooks:', file=sys.stderr)
+              for name, err in failed:
+                  print(f'  - {name}: {err}', file=sys.stderr)
+              sys.exit(1)
+          print('All hook scripts imported successfully')
+          PYEOF
 
       - name: Uninstall skills package before E2E tests
         run: rpm -e agent-sec-skills --nodeps

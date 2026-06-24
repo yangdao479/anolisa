@@ -208,7 +208,7 @@ python3 agent-sec-cli/src/agent_sec_cli/sandbox/sandbox_policy.py --cwd "$PWD" "
 
 ### 校验流程
 
-1. 加载受信公钥（`agent-sec-cli/asset-verify/trusted-keys/*.asc`）
+1. 加载受信公钥（`agent_sec_cli/asset_verify/trusted-keys/*.asc`）
 2. 验证 Skill 目录中 `.skill-meta/Manifest.json` 的 GPG 签名（`.skill-meta/.skill.sig`）
 3. 校验 Manifest 中所有文件的 SHA-256 哈希
 
@@ -247,24 +247,25 @@ agent-sec-cli verify
 
 | 命令 | 说明 |
 |------|------|
-| `init-keys` | 生成 Ed25519 签名密钥对 |
+| `init` | 初始化密钥，并为已覆盖 Skill 执行快速扫描 |
+| `scan <dir>` | 执行内置快速扫描并签名写入 manifest |
 | `check <dir>` | 检测 Skill 文件是否漂移或被篡改 |
-| `certify <dir>` | 运行扫描器、签名并封存清单 |
+| `certify <dir> --findings <file>` | 导入外部扫描结果并签名写入 manifest |
 | `status` | 系统级健康概览（密钥、配置、聚合完整性） |
 | `audit <dir>` | 查看版本历史与签名链 |
-| `check --all` / `certify --all` | 对所有已注册 Skill 目录批量执行 |
+| `check --all` / `scan --all` | 对所有已注册 Skill 目录批量执行 |
 
 ### 快速示例
 
 ```bash
-# 生成签名密钥（一次性）
-agent-sec-cli skill-ledger init-keys
+# 初始化密钥并为已覆盖 Skill 建立 baseline
+agent-sec-cli skill-ledger init
 
-# 检查完整性（首次运行自动创建无签名基线）
+# 检查完整性，不修改 ledger 元数据
 agent-sec-cli skill-ledger check /path/to/skill
 
-# 审查通过后认证
-agent-sec-cli skill-ledger certify /path/to/skill
+# 快速扫描并签名
+agent-sec-cli skill-ledger scan /path/to/skill
 
 # 系统健康概览
 agent-sec-cli skill-ledger status

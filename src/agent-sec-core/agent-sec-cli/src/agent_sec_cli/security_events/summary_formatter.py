@@ -42,6 +42,7 @@ def format_summary(events: list[SecurityEvent], time_label: str) -> str:
     code_scan_events = by_category.get("code_scan", [])
     sandbox_events = by_category.get("sandbox", [])
     prompt_scan_events = by_category.get("prompt_scan", [])
+    pii_scan_events = by_category.get("pii_scan", [])
     skill_ledger_events = by_category.get("skill_ledger", [])
 
     if harden_events:
@@ -54,6 +55,8 @@ def format_summary(events: list[SecurityEvent], time_label: str) -> str:
         sections.append(_summarize_sandbox(sandbox_events))
     if prompt_scan_events:
         sections.append(_summarize_prompt_scan(prompt_scan_events))
+    if pii_scan_events:
+        sections.append(_summarize_pii_scan(pii_scan_events))
     if skill_ledger_events:
         sections.append(_summarize_skill_ledger(skill_ledger_events))
 
@@ -67,6 +70,7 @@ def format_summary(events: list[SecurityEvent], time_label: str) -> str:
         harden_events,
         asset_events,
         prompt_scan_events,
+        pii_scan_events,
         ledger_statuses,
         time_label,
     )
@@ -144,6 +148,30 @@ def _get_mode(event: SecurityEvent) -> str:
     return ""
 
 
+def _has_hardening_stats(event: SecurityEvent) -> bool:
+    """Return whether a hardening event has parsed rule summary statistics."""
+    result = _get_result(event)
+    return isinstance(result.get("total"), int) and result.get("total", 0) > 0
+
+
+def _has_actionable_hardening_failure(event: SecurityEvent) -> bool:
+    """Return whether a hardening event has a parsed rule failure to fix."""
+    result = _get_result(event)
+    failures = result.get("failures", [])
+    if not isinstance(failures, list):
+        return False
+
+    for failure in failures:
+        if not isinstance(failure, dict):
+            continue
+        if failure.get("status") == "UNKNOWN":
+            continue
+        if not failure.get("rule_id"):
+            continue
+        return True
+    return False
+
+
 def _format_timestamp(ts: str) -> str:
     """Render an ISO-8601 timestamp in local time for inline display."""
     try:
@@ -188,8 +216,9 @@ def _summarize_hardening(events: list[SecurityEvent]) -> str:
             f"(succeeded: {reinf_ok}, failed: {reinf_fail})"
         )
 
-    # Latest scan result details (prefer succeeded, fall back to latest failed)
-    latest_scan = next((e for e in scans if e.result == "succeeded"), None)
+    # Latest scan result details. Loongshield returns non-zero for non-compliant
+    # scans, but the backend may still parse usable passed/total statistics.
+    latest_scan = next((e for e in scans if _has_hardening_stats(e)), None)
     if latest_scan:
         result = _get_result(latest_scan)
         passed = result.get("passed", 0)
@@ -199,7 +228,7 @@ def _summarize_hardening(events: list[SecurityEvent]) -> str:
         # Include fixed count from reinforce operations in compliance calculation
         fixed_count = 0
         for e in reinforcements:
-            if e.result == "succeeded":
+            if _has_hardening_stats(e):
                 reinf_result = _get_result(e)
                 fixed_count += reinf_result.get("fixed", 0)
 
@@ -349,6 +378,42 @@ def _summarize_prompt_scan(events: list[SecurityEvent]) -> str:
     return "\n".join(lines)
 
 
+def _summarize_pii_scan(events: list[SecurityEvent]) -> str:
+    """Summarize pii_scan category events."""
+    lines = ["--- PII Scan ---"]
+
+    ok_count = 0
+    verdict_counts: dict[str, int] = defaultdict(int)
+    type_counts: dict[str, int] = defaultdict(int)
+
+    for e in events:
+        if e.result == "succeeded":
+            ok_count += 1
+            result = _get_result(e)
+            verdict_counts[result.get("verdict", "unknown")] += 1
+            summary = result.get("summary", {})
+            by_type = summary.get("by_type", {}) if isinstance(summary, dict) else {}
+            if isinstance(by_type, dict):
+                for pii_type, count in by_type.items():
+                    if isinstance(count, int):
+                        type_counts[str(pii_type)] += count
+
+    fail_count = len(events) - ok_count
+    lines.append(
+        f"  Scans performed: {len(events)} (succeeded: {ok_count}, failed: {fail_count})"
+    )
+
+    if verdict_counts:
+        parts = [f"{v}: {c}" for v, c in sorted(verdict_counts.items())]
+        lines.append(f"  Verdict breakdown: {', '.join(parts)}")
+
+    if type_counts:
+        parts = [f"{t}: {c}" for t, c in sorted(type_counts.items())]
+        lines.append(f"  Finding types: {', '.join(parts)}")
+
+    return "\n".join(lines)
+
+
 def _summarize_skill_ledger(events: list[SecurityEvent]) -> str:
     """Summarize skill_ledger category events.
 
@@ -382,7 +447,8 @@ def _summarize_skill_ledger(events: list[SecurityEvent]) -> str:
         scan_status_counts: dict[str, int] = defaultdict(int)
         for e in certifications:
             if e.result == "succeeded":
-                ss = _get_result(e).get("scanStatus", "unknown")
+                result = _get_result(e)
+                ss = result.get("verdict", result.get("scanStatus", "unknown"))
                 scan_status_counts[ss] += 1
         parts = [f"{s}: {c}" for s, c in sorted(scan_status_counts.items())]
         lines.append(f"  Certifications:   {cert_ok} ({', '.join(parts)})")
@@ -473,6 +539,7 @@ def _compute_posture(
     hardening_events: list[SecurityEvent],
     verify_events: list[SecurityEvent],
     prompt_scan_events: list[SecurityEvent],
+    pii_scan_events: list[SecurityEvent],
     ledger_statuses: dict[str, int],
     time_label: str,
 ) -> str:
@@ -513,6 +580,14 @@ def _compute_posture(
 
     # --- Prompt Scan (any DENY verdict) ---
     for e in prompt_scan_events:
+        if e.result == "succeeded":
+            result = _get_result(e)
+            if result.get("verdict") == "deny":
+                needs_attention = True
+                break
+
+    # --- PII Scan (any DENY verdict) ---
+    for e in pii_scan_events:
         if e.result == "succeeded":
             result = _get_result(e)
             if result.get("verdict") == "deny":
@@ -596,12 +671,10 @@ def _compute_suggestions(
     # --- Hardening suggestions ---
     if hardening_events:
         latest = hardening_events[0]  # newest-first after _group_by_category sort
-        if latest.result == "succeeded":
-            result = _get_result(latest)
-            if result.get("failures"):
-                suggestions.append(
-                    "agent-sec-cli harden --reinforce    Fix failed rules"
-                )
+        if _has_actionable_hardening_failure(latest) and (
+            latest.result == "succeeded" or _has_hardening_stats(latest)
+        ):
+            suggestions.append("agent-sec-cli harden --reinforce    Fix failed rules")
 
     # --- Skill-ledger suggestions ---
     if ledger_statuses:
@@ -612,11 +685,11 @@ def _compute_suggestions(
             ),
             (
                 "drifted",
-                "agent-sec-cli skill-ledger certify <dir>  Re-certify drifted skills",
+                "agent-sec-cli skill-ledger scan <dir>     Re-scan drifted skills",
             ),
             (
                 "none",
-                "agent-sec-cli skill-ledger certify <dir>  Certify unchecked skills",
+                "agent-sec-cli skill-ledger scan <dir>     Scan unchecked skills",
             ),
         ]
         for status_key, hint in _LEDGER_HINTS:

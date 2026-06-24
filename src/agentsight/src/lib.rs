@@ -1,3 +1,13 @@
+// Crate-level clippy allows for lints that require architectural changes.
+#![allow(clippy::type_complexity)]
+#![allow(clippy::too_many_arguments)]
+#![allow(clippy::large_enum_variant)]
+#![allow(clippy::doc_lazy_continuation)]
+#![allow(clippy::doc_overindented_list_items)]
+#![allow(clippy::unnecessary_cast)]
+#![allow(clippy::collapsible_if)]
+#![allow(clippy::missing_safety_doc)]
+
 //! AgentSight - AI Agent observability library
 //!
 //! This crate provides eBPF-based observability for AI agents, including:
@@ -24,61 +34,68 @@
 //! sight.run()?;  // blocking event loop
 //! ```
 
-pub mod probes;
 pub mod config;
+mod logging;
+pub mod probes;
 
 // Re-export config types
 pub use config::{AgentsightConfig, default_base_path};
-pub mod event;
-pub mod parser;
+#[cfg(feature = "server")]
+pub mod agent_sec;
 pub mod aggregator;
 pub mod analyzer;
-pub mod storage;
+pub mod atif;
+pub(crate) mod background;
 pub mod chrome_trace;
 pub mod discovery;
-pub mod health;
-pub mod tokenizer;
+pub mod event;
+pub mod ffi;
 pub mod genai;
-pub mod atif;
-pub mod response_map;
+pub mod health;
 pub mod interruption;
-pub mod skill_metrics;
+pub mod parser;
+pub mod response_map;
 #[cfg(feature = "server")]
 pub mod server;
+pub mod skill_metrics;
+pub mod storage;
+pub mod tokenizer;
 mod unified;
-pub mod ffi;
+pub mod utils;
+
+#[cfg(all(test, feature = "server"))]
+mod tests {
+    #[test]
+    fn agent_sec_module_is_available_with_server_feature() {
+        let socket_path = std::path::PathBuf::from("agent-sec-daemon.sock");
+        let client = crate::agent_sec::AgentSecClient::new(Some(socket_path.clone()))
+            .expect("server feature should expose the agent-sec client");
+
+        assert_eq!(client.socket_path(), &socket_path);
+    }
+}
 
 // Re-export common types for convenience
 pub use aggregator::{
-    Aggregator, AggregatedResult,
-    HttpConnectionAggregator, ConnectionId, ConnectionState,
-    HttpPair,
-    ProcessEventAggregator, AggregatedProcess,
-    AggregatedResponse,
-};
-pub use parser::{
-    HttpParser, ParsedHttpMessage, ParsedRequest, ParsedResponse,
-    SseParser, ParsedSseEvent,
-    ProcTraceParser, ParsedProcEvent, ProcEventType,
-    Http2Parser, Http2FrameType, ParsedHttp2Frame,
-    Parser, ParsedMessage, ParseResult,
+    AggregatedProcess, AggregatedResponse, AggregatedResult, Aggregator, ConnectionId,
+    ConnectionState, HttpConnectionAggregator, HttpPair, ProcessEventAggregator,
 };
 pub use analyzer::{
-    AuditAnalyzer, AuditEventType, AuditExtra, AuditRecord, AuditSummary,
-    TokenParser, TokenUsage, TokenRecord, LLMProvider,
-    MessageParser, ParsedApiMessage,
-    OpenAIRequest, OpenAIResponse, OpenAIChatMessage, OpenAIContent, OpenAIUsage,
-    AnthropicRequest, AnthropicResponse, AnthropicMessage, AnthropicUsage,
-    MessageRole,
-    AnalysisResult, PromptTokenCount, HttpRecord, Analyzer,
+    AnalysisResult, Analyzer, AnthropicMessage, AnthropicRequest, AnthropicResponse,
+    AnthropicUsage, AuditAnalyzer, AuditEventType, AuditExtra, AuditRecord, AuditSummary,
+    HttpRecord, LLMProvider, MessageParser, MessageRole, OpenAIChatMessage, OpenAIContent,
+    OpenAIRequest, OpenAIResponse, OpenAIUsage, ParsedApiMessage, PromptTokenCount, TokenParser,
+    TokenRecord, TokenUsage,
 };
-pub use chrome_trace::{ChromeTraceEvent, TraceArgs, ToChromeTraceEvent, ns_to_us, next_flow_id};
+pub use chrome_trace::{ChromeTraceEvent, ToChromeTraceEvent, TraceArgs, next_flow_id, ns_to_us};
+pub use parser::{
+    Http2FrameType, Http2Parser, HttpParser, ParseResult, ParsedHttp2Frame, ParsedHttpMessage,
+    ParsedMessage, ParsedProcEvent, ParsedRequest, ParsedResponse, ParsedSseEvent, Parser,
+    ProcEventType, ProcTraceParser, SseParser,
+};
 pub use storage::{
-    Storage, StorageBackend, SqliteConfig,
-    SqliteStore, AuditStore,
-    TokenStore, TokenQuery,
-    HttpStore,
-    TimePeriod, TokenQueryResult, TokenBreakdown, TokenComparison, Trend,
+    AuditStore, HttpStore, SqliteConfig, SqliteStore, Storage, StorageBackend, TimePeriod,
+    TokenBreakdown, TokenComparison, TokenQuery, TokenQueryResult, TokenStore, Trend,
     format_tokens, format_tokens_with_commas,
 };
 
@@ -92,11 +109,12 @@ pub use probes::FileWatchEvent;
 pub use response_map::ResponseSessionMapper;
 
 // Re-export discovery types
-pub use discovery::{AgentInfo, AgentMatcher, AgentScanner, DiscoveredAgent, ProcessContext, known_agents};
+pub use config::default_cmdline_rules;
+pub use discovery::{AgentInfo, AgentScanner, CmdlineGlobMatcher, DiscoveredAgent, ProcessContext};
 
 // Re-export genai types
 pub use genai::{
-    GenAIBuilder, GenAISemanticEvent, LLMCall, LLMRequest, LLMResponse,
-    MessagePart, InputMessage, OutputMessage, ToolUse, AgentInteraction, StreamChunk, ToolDefinition,
-    GenAIStore, GenAIStoreStats, LogtailExporter, GenAIExporter,
+    AgentInteraction, GenAIBuilder, GenAIExporter, GenAISemanticEvent, GenAIStore, GenAIStoreStats,
+    InputMessage, LLMCall, LLMRequest, LLMResponse, LogtailExporter, MessagePart, OutputMessage,
+    StreamChunk, ToolDefinition, ToolUse,
 };

@@ -9,9 +9,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use super::port_detector::detect_listening_ports;
-use super::store::{AgentHealthState, AgentHealthStatus, HealthStore, now_ms};
+use super::store::{AgentHealthState, AgentHealthStatus, AgentRole, HealthStore, now_ms};
 use crate::discovery::AgentScanner;
-use crate::interruption::{InterruptionEvent, InterruptionType};
+use crate::interruption::{InterruptionEvent, InterruptionType, was_pid_oom_killed};
 use crate::storage::sqlite::{GenAISqliteStore, InterruptionStore};
 
 /// Background health checker that periodically probes discovered agents
@@ -77,7 +77,7 @@ impl HealthChecker {
 
     /// Perform a single health check cycle for all discovered agents.
     fn check_once(&self) {
-        let mut scanner = AgentScanner::new();
+        let mut scanner = AgentScanner::from_rules(&crate::config::default_cmdline_rules(), &[]);
         let agents = scanner.scan();
 
         let active_pids: HashSet<u32> = agents.iter().map(|a| a.pid).collect();
@@ -85,7 +85,18 @@ impl HealthChecker {
         // Mark gone processes as Offline (instead of deleting immediately)
         let newly_offline = if let Ok(mut store) = self.store.write() {
             store.last_scan_time = now_ms();
-            store.mark_stale_offline(&active_pids)
+            let offline = store.mark_stale_offline(&active_pids);
+            // 自动清理超过 5 分钟的 Offline 条目，避免历史 PID 在 Sidebar 长期残留
+            const OFFLINE_TTL_MS: u64 = 5 * 60 * 1000;
+            let removed = store.cleanup_stale_offline(OFFLINE_TTL_MS);
+            if removed > 0 {
+                log::info!(
+                    "HealthStore: cleaned {} stale offline entries (TTL={}s)",
+                    removed,
+                    OFFLINE_TTL_MS / 1000
+                );
+            }
+            offline
         } else {
             vec![]
         };
@@ -131,6 +142,14 @@ impl HealthChecker {
                     // ── Branch A: pending (in-flight) LLM calls ──────────────────────────
                     let pending_calls = self.get_pending_calls_for_pids(&pids);
                     if !pending_calls.is_empty() {
+                        // Check if any of the crashed PIDs were OOM-killed
+                        let is_oom = pids.iter().any(|&p| was_pid_oom_killed(p));
+                        if is_oom {
+                            log::info!(
+                                "Agent {agent_name} (pids={pids:?}) was OOM-killed (confirmed via dmesg)"
+                            );
+                        }
+
                         let mut by_conv: HashMap<
                             (Option<String>, Option<String>),
                             Vec<(String, Option<String>)>,
@@ -149,21 +168,31 @@ impl HealthChecker {
                             );
                             if !seen_conv.insert(dedup_key) {
                                 log::debug!(
-                                    "Skipping duplicate agent_crash for {} session={:?} conversation={:?}",
-                                    agent_name,
-                                    session_id,
-                                    conversation_id
+                                    "Skipping duplicate agent_crash for {agent_name} session={session_id:?} conversation={conversation_id:?}"
+                                );
+                                continue;
+                            }
+                            // Dedup: skip if trace-mode already recorded a
+                            // recent agent_crash for this PID (within 120s).
+                            if istore.agent_crash_exists_recent(rep.pid as i32, 120) {
+                                log::debug!(
+                                    "Skipping agent_crash for pid={} — already recorded by trace mode",
+                                    rep.pid,
                                 );
                                 continue;
                             }
                             let call_ids: Vec<&str> =
                                 calls.iter().map(|(c, _)| c.as_str()).collect();
-                            let detail = serde_json::json!({
+                            let mut detail = serde_json::json!({
                                 "pid": rep.pid,
                                 "agent_name": agent_name,
                                 "exe_path": rep.exe_path.clone(),
                                 "call_ids": call_ids,
                             });
+                            if is_oom {
+                                detail["oom"] = serde_json::json!(true);
+                                detail["source"] = serde_json::json!("healthchecker+dmesg");
+                            }
                             let event = InterruptionEvent::new(
                                 InterruptionType::AgentCrash,
                                 session_id.clone(),
@@ -183,12 +212,13 @@ impl HealthChecker {
                                 );
                             } else {
                                 log::info!(
-                                    "Recorded agent_crash for {} (pid={}, session={:?}, conversation={:?}, {} call(s))",
+                                    "Recorded agent_crash for {} (pid={}, session={:?}, conversation={:?}, {} call(s), oom={})",
                                     agent_name,
                                     rep.pid,
                                     session_id,
                                     conversation_id,
-                                    calls.len()
+                                    calls.len(),
+                                    is_oom
                                 );
                             }
                         }
@@ -198,9 +228,7 @@ impl HealthChecker {
                     } else {
                         // No pending calls — treat as normal/graceful shutdown.
                         log::debug!(
-                            "Agent {} (pids={:?}) exited with no pending calls — treating as normal shutdown",
-                            agent_name,
-                            pids
+                            "Agent {agent_name} (pids={pids:?}) exited with no pending calls — treating as normal shutdown"
                         );
                     }
                 }
@@ -209,8 +237,20 @@ impl HealthChecker {
 
         log::debug!("Health check: found {} agent(s)", agents.len());
 
+        // Collect agent names by PID for role inference (detect parent-child within same agent)
+        let agent_name_by_pid: HashMap<u32, String> = agents
+            .iter()
+            .map(|a| (a.pid, a.agent_info.name.clone()))
+            .collect();
+
+        // Pre-scan listening ports per pid (also avoids scanning /proc twice).
+        let ports_by_pid: HashMap<u32, Vec<u16>> = agents
+            .iter()
+            .map(|a| (a.pid, detect_listening_ports(a.pid)))
+            .collect();
+
         for agent in &agents {
-            let ports = detect_listening_ports(agent.pid);
+            let ports = ports_by_pid.get(&agent.pid).cloned().unwrap_or_default();
             // Cosh has no daemon process and does not support keepalive/restart.
             // Build restart_cmd only for agents that support it.
             let restart_cmd = if agent.agent_info.name == "Cosh" {
@@ -218,6 +258,35 @@ impl HealthChecker {
             } else {
                 Some(build_restart_cmd(&agent.exe_path, &agent.cmdline_args))
             };
+
+            // Read parent PID from /proc/<pid>/stat for role inference
+            let ppid = read_ppid(agent.pid);
+
+            // Infer role:
+            //   1. ports != empty            → Gateway (real service with TCP port)
+            //   2. parent is same agent_name → Worker (genuine fork, fold under parent)
+            //   3. otherwise                 → Gateway (independent process, own card)
+            //
+            // Two separately-launched hermes/openclaw client instances are
+            // independent (no parent-child link, different terminals), so they
+            // each deserve their own primary card; only true forks go into the
+            // associated-processes drawer of their parent.
+            let role = if !ports.is_empty() {
+                AgentRole::Gateway
+            } else if let Some(pp) = ppid {
+                if agent_name_by_pid
+                    .get(&pp)
+                    .map(|n| n == &agent.agent_info.name)
+                    .unwrap_or(false)
+                {
+                    AgentRole::Worker
+                } else {
+                    AgentRole::Gateway
+                }
+            } else {
+                AgentRole::Gateway
+            };
+
             let status = if ports.is_empty() {
                 AgentHealthStatus {
                     pid: agent.pid,
@@ -230,9 +299,12 @@ impl HealthChecker {
                     latency_ms: None,
                     error_message: None,
                     restart_cmd,
+                    offline_since: None,
+                    role,
+                    parent_pid: ppid,
                 }
             } else {
-                self.probe_agent(agent, &ports, restart_cmd)
+                self.probe_agent(agent, &ports, restart_cmd, role, ppid)
             };
 
             if let Ok(mut store) = self.store.write() {
@@ -252,13 +324,15 @@ impl HealthChecker {
         agent: &crate::discovery::DiscoveredAgent,
         ports: &[u16],
         restart_cmd: Option<Vec<String>>,
+        role: AgentRole,
+        parent_pid: Option<u32>,
     ) -> AgentHealthStatus {
         let mut last_error = String::new();
         // 标记是否遇到了超时错误（区分 hung vs unreachable）
         let mut timed_out = false;
 
         for &port in ports {
-            let url = format!("http://127.0.0.1:{}/", port);
+            let url = format!("http://127.0.0.1:{port}/");
             let start = Instant::now();
 
             let result = ureq::AgentBuilder::new()
@@ -283,6 +357,9 @@ impl HealthChecker {
                         latency_ms: Some(latency),
                         error_message: None,
                         restart_cmd,
+                        offline_since: None,
+                        role: role.clone(),
+                        parent_pid,
                     };
                 }
                 Err(ureq::Error::Status(_code, _resp)) => {
@@ -298,6 +375,9 @@ impl HealthChecker {
                         latency_ms: Some(latency),
                         error_message: None,
                         restart_cmd,
+                        offline_since: None,
+                        role: role.clone(),
+                        parent_pid,
                     };
                 }
                 Err(ureq::Error::Transport(e)) => {
@@ -305,7 +385,7 @@ impl HealthChecker {
                     // ureq 的读超时 / 写超时消息均包含 "timed out"
                     if msg.to_lowercase().contains("timed out") {
                         timed_out = true;
-                        last_error = format!("响应超时 ({}ms): {}", latency, msg);
+                        last_error = format!("响应超时 ({latency}ms): {msg}");
                     } else {
                         last_error = msg.clone();
                     }
@@ -338,26 +418,9 @@ impl HealthChecker {
             latency_ms: None,
             error_message: Some(last_error),
             restart_cmd,
-        }
-    }
-
-    /// Query pending LLM calls for a specific PID from genai_events.
-    ///
-    /// Returns a list of (call_id, session_id, trace_id, conversation_id) tuples.
-    fn get_pending_calls_for_pid(
-        &self,
-        pid: u32,
-    ) -> Vec<(String, Option<String>, Option<String>, Option<String>)> {
-        if let Some(ref genai_store) = self.genai_store {
-            match genai_store.list_pending_for_pid(pid as i32) {
-                Ok(calls) => calls,
-                Err(e) => {
-                    log::warn!("Failed to query pending calls for pid={}: {}", pid, e);
-                    vec![]
-                }
-            }
-        } else {
-            vec![]
+            offline_since: None,
+            role,
+            parent_pid,
         }
     }
 
@@ -372,7 +435,7 @@ impl HealthChecker {
             match genai_store.list_pending_for_pids(pids) {
                 Ok(calls) => calls,
                 Err(e) => {
-                    log::warn!("Failed to query pending calls for pids={:?}: {}", pids, e);
+                    log::warn!("Failed to query pending calls for pids={pids:?}: {e}");
                     vec![]
                 }
             }
@@ -385,11 +448,7 @@ impl HealthChecker {
     fn mark_pending_interrupted(&self, pid: u32, itype: &str) {
         if let Some(ref genai_store) = self.genai_store {
             if let Err(e) = genai_store.mark_pending_interrupted_for_pid(pid as i32, itype) {
-                log::warn!(
-                    "Failed to mark pending calls as interrupted for pid={}: {}",
-                    pid,
-                    e
-                );
+                log::warn!("Failed to mark pending calls as interrupted for pid={pid}: {e}");
             }
         }
     }
@@ -409,4 +468,18 @@ fn build_restart_cmd(exe_path: &str, cmdline_args: &[String]) -> Vec<String> {
         .collect();
     cmd.extend(args);
     cmd
+}
+
+/// Read the parent PID (ppid) from /proc/<pid>/stat.
+/// Returns None if the file cannot be read or parsed.
+fn read_ppid(pid: u32) -> Option<u32> {
+    let stat = std::fs::read_to_string(format!("/proc/{}/stat", pid)).ok()?;
+    // Format: "pid (comm) state ppid ..."
+    // Find the closing ')' first (comm may contain spaces/parens)
+    let after_comm = stat.rsplit_once(')')?.1;
+    // after_comm = " state ppid ..."
+    let mut fields = after_comm.split_whitespace();
+    let _state = fields.next()?;
+    let ppid_str = fields.next()?;
+    ppid_str.parse::<u32>().ok()
 }

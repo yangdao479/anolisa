@@ -9,6 +9,7 @@ on:
       - 'skill/v*'
       - 'tokenless/v*'
       - 'ckpt/v*'
+      - 'memory/v*'
 
 permissions:
   contents: write
@@ -21,7 +22,7 @@ jobs:
   # =========================================================================
   package:
     name: Package ${{ github.ref_name }}
-    runs-on: ubuntu-22.04
+    runs-on: [self-hosted, ubuntu]
     outputs:
       component: ${{ steps.parse.outputs.component }}
       version: ${{ steps.parse.outputs.version }}
@@ -47,6 +48,7 @@ jobs:
             skill)    COMPONENT="os-skills" ;;
             tokenless) COMPONENT="tokenless" ;;
             ckpt)     COMPONENT="ws-ckpt" ;;
+            memory)   COMPONENT="agent-memory" ;;
             *)
               echo "Unknown scope: $SCOPE"
               exit 1
@@ -92,7 +94,7 @@ jobs:
     name: Publish ${{ needs.package.outputs.tag }}
     needs: package
     environment: release
-    runs-on: ubuntu-22.04
+    runs-on: [self-hosted, ubuntu]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -143,6 +145,7 @@ jobs:
             os-skills)      PREFIX="skill/v" ;;
             tokenless)      PREFIX="tokenless/v" ;;
             ws-ckpt)        PREFIX="ckpt/v" ;;
+            agent-memory)   PREFIX="memory/v" ;;
           esac
 
           PREV_TAG=$(git tag --list "${PREFIX}*" --sort=-version:refname | grep -v "^${TAG}$" | head -1)

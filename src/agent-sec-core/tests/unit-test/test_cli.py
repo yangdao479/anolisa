@@ -1,11 +1,362 @@
 """Unit tests for the top-level CLI entry points."""
 
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
-from agent_sec_cli.cli import app
+import pytest
+from agent_sec_cli.cli import _extract_trace_context_arg, app, main
+from agent_sec_cli.correlation_context import (
+    TraceContext,
+    clear_process_trace_context,
+    get_current_trace_context,
+)
 from agent_sec_cli.security_middleware.result import ActionResult
 from typer.testing import CliRunner
+
+
+@patch("agent_sec_cli.cli.invoke")
+def test_trace_context_is_hidden_global_option_and_commands_do_not_forward_it(
+    mock_invoke,
+):
+    mock_invoke.return_value = ActionResult(success=True, exit_code=0, stdout="{}")
+
+    try:
+        result = CliRunner().invoke(
+            app,
+            [
+                "--trace-context",
+                '{"sessionId":"session-1","runId":"run-1"}',
+                "scan-code",
+                "--code",
+                "echo ok",
+                "--language",
+                "bash",
+            ],
+        )
+    finally:
+        clear_process_trace_context()
+
+    assert result.exit_code == 0
+    mock_invoke.assert_called_once_with("code_scan", code="echo ok", language="bash")
+
+
+@patch("agent_sec_cli.cli.invoke")
+def test_trace_context_option_is_declared_but_not_used_by_typer_callback(mock_invoke):
+    mock_invoke.return_value = ActionResult(success=True, exit_code=0, stdout="{}")
+
+    try:
+        result = CliRunner().invoke(
+            app,
+            ["--trace-context", "not-json", "scan-code", "--code", "echo ok"],
+        )
+    finally:
+        clear_process_trace_context()
+
+    assert result.exit_code == 0
+    assert get_current_trace_context() is None
+    mock_invoke.assert_called_once_with("code_scan", code="echo ok", language="bash")
+
+
+def test_trace_context_option_is_hidden_from_help():
+    result = CliRunner().invoke(app, ["--help"])
+
+    assert result.exit_code == 0
+    assert "--trace-context" not in result.output
+
+
+def test_extract_trace_context_arg_supports_future_pre_app_initialization():
+    assert (
+        _extract_trace_context_arg(
+            [
+                "agent-sec-cli",
+                "--trace-context",
+                '{"session_id":"session-1"}',
+                "scan-code",
+            ]
+        )
+        == '{"session_id":"session-1"}'
+    )
+
+
+def test_extract_trace_context_arg_supports_equals_style():
+    assert (
+        _extract_trace_context_arg(
+            ["agent-sec-cli", '--trace-context={"session_id":"session-1"}', "scan-code"]
+        )
+        == '{"session_id":"session-1"}'
+    )
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["agent-sec-cli", "--trace-context", "", "scan-code"],
+        ["agent-sec-cli", "--trace-context=", "scan-code"],
+    ],
+)
+def test_extract_trace_context_arg_treats_empty_value_as_unset(argv):
+    assert _extract_trace_context_arg(argv) is None
+
+
+def test_extract_trace_context_arg_requires_value_before_another_option():
+    with pytest.raises(ValueError, match="missing trace context value"):
+        _extract_trace_context_arg(["agent-sec-cli", "--trace-context", "--version"])
+
+
+def test_extract_trace_context_arg_uses_last_top_level_value():
+    assert (
+        _extract_trace_context_arg(
+            [
+                "agent-sec-cli",
+                "--trace-context",
+                '{"session_id":"session-1"}',
+                '--trace-context={"session_id":"session-2"}',
+                "scan-code",
+            ]
+        )
+        == '{"session_id":"session-2"}'
+    )
+
+
+def test_extract_trace_context_arg_stops_at_posix_double_dash():
+    assert (
+        _extract_trace_context_arg(
+            [
+                "agent-sec-cli",
+                "scan-code",
+                "--",
+                "--trace-context",
+                '{"session_id":"not-top-level"}',
+            ]
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        [
+            "agent-sec-cli",
+            "scan-code",
+            "--trace-context",
+            '{"session_id":"command-session"}',
+        ],
+        [
+            "agent-sec-cli",
+            "harden",
+            "--trace-context",
+            '{"session_id":"downstream-session"}',
+        ],
+    ],
+)
+def test_extract_trace_context_arg_ignores_command_arguments(argv):
+    assert _extract_trace_context_arg(argv) is None
+
+
+@patch("agent_sec_cli.cli.app")
+def test_main_initializes_trace_context_before_app(mock_app, monkeypatch):
+    monkeypatch.setattr(
+        "sys.argv",
+        ["agent-sec-cli", "--trace-context", '{"session_id":"session-1"}', "scan-code"],
+    )
+
+    try:
+        main()
+    finally:
+        clear_process_trace_context()
+
+    mock_app.assert_called_once()
+
+
+@patch("agent_sec_cli.cli.invoke")
+@patch("agent_sec_cli.cli.init_process_trace_context")
+def test_main_initializes_process_trace_context_once(
+    mock_init_process_trace_context,
+    mock_invoke,
+    monkeypatch,
+):
+    mock_invoke.return_value = ActionResult(success=True, exit_code=0, stdout="{}")
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "agent-sec-cli",
+            "--trace-context",
+            '{"session_id":"session-1","run_id":"run-1"}',
+            "scan-code",
+            "--code",
+            "echo ok",
+        ],
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        main()
+
+    assert exc.value.code == 0
+    mock_init_process_trace_context.assert_called_once_with(
+        TraceContext(session_id="session-1", run_id="run-1")
+    )
+    mock_invoke.assert_called_once_with("code_scan", code="echo ok", language="bash")
+
+
+@patch("agent_sec_cli.cli.app")
+def test_main_does_not_initialize_session_from_env(mock_app, monkeypatch):
+    monkeypatch.setenv("AGENT_SEC_SESSION_ID", "env-session")
+    monkeypatch.setattr("sys.argv", ["agent-sec-cli", "scan-code"])
+
+    try:
+        main()
+        assert get_current_trace_context() is None
+    finally:
+        clear_process_trace_context()
+
+    mock_app.assert_called_once()
+
+
+@patch("agent_sec_cli.cli.app")
+def test_main_invalid_trace_context_exits_before_app(mock_app, monkeypatch, capsys):
+    monkeypatch.setattr(
+        "sys.argv",
+        ["agent-sec-cli", "--trace-context", "not-json", "scan-code"],
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        main()
+
+    assert exc.value.code == 1
+    assert "invalid trace context JSON" in capsys.readouterr().err
+    mock_app.assert_not_called()
+
+
+def test_main_initializes_invocation_context_and_logging_after_trace_context(
+    monkeypatch,
+):
+    calls = []
+
+    def fake_init_trace_context(trace_context):
+        calls.append(("trace", trace_context))
+
+    def fake_init_invocation_context():
+        calls.append(("invocation", None))
+
+    def fake_setup_cli_logging():
+        calls.append(("logging", None))
+
+    def fake_app():
+        calls.append(("app", None))
+
+    monkeypatch.setattr("sys.argv", ["agent-sec-cli", "scan-code"])
+    monkeypatch.setattr(
+        "agent_sec_cli.cli._init_trace_context", fake_init_trace_context
+    )
+    monkeypatch.setattr(
+        "agent_sec_cli.cli.init_invocation_context",
+        fake_init_invocation_context,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "agent_sec_cli.cli.setup_cli_logging",
+        fake_setup_cli_logging,
+        raising=False,
+    )
+    monkeypatch.setattr("agent_sec_cli.cli.app", fake_app)
+
+    main()
+
+    assert calls == [
+        ("trace", None),
+        ("invocation", None),
+        ("logging", None),
+        ("app", None),
+    ]
+
+
+def test_events_count_forwards_trace_id_filter():
+    captured = {}
+
+    class Reader:
+        def count(
+            self,
+            *,
+            event_type=None,
+            category=None,
+            trace_id=None,
+            since=None,
+            until=None,
+            offset=0,
+        ):
+            captured.update(
+                {
+                    "event_type": event_type,
+                    "category": category,
+                    "trace_id": trace_id,
+                    "since": since,
+                    "until": until,
+                    "offset": offset,
+                }
+            )
+            return 2
+
+    with patch("agent_sec_cli.cli.get_reader", return_value=Reader()):
+        result = CliRunner().invoke(
+            app, ["events", "--trace-id", "trace-abc", "--count"]
+        )
+
+    assert result.exit_code == 0
+    assert result.output == "2\n"
+    assert captured["trace_id"] == "trace-abc"
+
+
+def test_events_count_by_forwards_filters():
+    captured = {}
+
+    class Reader:
+        def count_by(
+            self,
+            group_field,
+            *,
+            event_type=None,
+            category=None,
+            trace_id=None,
+            since=None,
+            until=None,
+            offset=0,
+        ):
+            captured.update(
+                {
+                    "group_field": group_field,
+                    "event_type": event_type,
+                    "category": category,
+                    "trace_id": trace_id,
+                    "since": since,
+                    "until": until,
+                    "offset": offset,
+                }
+            )
+            return {"sandbox": 1}
+
+    with patch("agent_sec_cli.cli.get_reader", return_value=Reader()):
+        result = CliRunner().invoke(
+            app,
+            [
+                "events",
+                "--count-by",
+                "category",
+                "--event-type",
+                "alpha",
+                "--category",
+                "sandbox",
+                "--trace-id",
+                "trace-abc",
+            ],
+        )
+
+    assert result.exit_code == 0
+    assert captured["group_field"] == "category"
+    assert captured["event_type"] == "alpha"
+    assert captured["category"] == "sandbox"
+    assert captured["trace_id"] == "trace-abc"
 
 
 class TestHardenCli(unittest.TestCase):
@@ -129,6 +480,265 @@ class TestHardenCli(unittest.TestCase):
         self.assertEqual(result.exit_code, 0)
         self.assertEqual(result.output, "seharden help\n")
         mock_invoke.assert_called_once_with("harden", args=["--help"])
+
+
+class TestScanPiiCli(unittest.TestCase):
+    def setUp(self):
+        self.runner = CliRunner()
+
+    @patch("agent_sec_cli.pii_checker.cli.invoke")
+    def test_scan_pii_text_json(self, mock_invoke):
+        mock_invoke.return_value = ActionResult(
+            success=True,
+            exit_code=0,
+            stdout='{"ok": true, "verdict": "warn"}',
+            data={
+                "ok": True,
+                "verdict": "warn",
+                "summary": {"total": 1},
+                "findings": [],
+            },
+        )
+
+        result = self.runner.invoke(
+            app,
+            ["scan-pii", "--text", "alice@example.com", "--source", "manual"],
+        )
+
+        self.assertEqual(result.exit_code, 0)
+        self.assertIn('"verdict": "warn"', result.output)
+        mock_invoke.assert_called_once()
+        _, kwargs = mock_invoke.call_args
+        self.assertEqual(mock_invoke.call_args.args[0], "pii_scan")
+        self.assertEqual(kwargs["text"], "alice@example.com")
+        self.assertEqual(kwargs["source"], "manual")
+        self.assertFalse(kwargs["raw_evidence"])
+        self.assertIsNone(kwargs["max_bytes"])
+
+    @patch("agent_sec_cli.pii_checker.cli.invoke")
+    def test_scan_pii_stdin_json(self, mock_invoke):
+        mock_invoke.return_value = ActionResult(
+            success=True,
+            exit_code=0,
+            stdout='{"ok": true, "verdict": "warn"}',
+            data={
+                "ok": True,
+                "verdict": "warn",
+                "summary": {"total": 1},
+                "findings": [],
+            },
+        )
+
+        result = self.runner.invoke(
+            app,
+            ["scan-pii", "--stdin", "--source", "manual"],
+            input="alice@example.com",
+        )
+
+        self.assertEqual(result.exit_code, 0)
+        mock_invoke.assert_called_once()
+        _, kwargs = mock_invoke.call_args
+        self.assertEqual(kwargs["text"], "alice@example.com")
+        self.assertEqual(kwargs["source"], "manual")
+
+    @patch("agent_sec_cli.pii_checker.cli.invoke")
+    def test_scan_pii_stdin_reports_byte_limit(self, mock_invoke):
+        mock_invoke.return_value = ActionResult(
+            success=True,
+            exit_code=0,
+            stdout='{"ok": true, "verdict": "pass"}',
+            data={
+                "ok": True,
+                "verdict": "pass",
+                "summary": {"total": 0},
+                "findings": [],
+            },
+        )
+
+        text = "备注🙂 alice@example.com"
+        max_bytes = len("备注".encode("utf-8")) + 1
+        result = self.runner.invoke(
+            app,
+            ["scan-pii", "--stdin", "--max-bytes", str(max_bytes)],
+            input=text,
+        )
+
+        self.assertEqual(result.exit_code, 0)
+        _, kwargs = mock_invoke.call_args
+        self.assertEqual(kwargs["text"], "备注")
+        self.assertTrue(kwargs["input_truncated"])
+        self.assertEqual(kwargs["input_bytes_scanned"], max_bytes)
+        self.assertNotIn("\ufffd", kwargs["text"])
+
+    @patch("agent_sec_cli.pii_checker.cli.invoke")
+    def test_scan_pii_stdin_rejects_invalid_utf8(self, mock_invoke):
+        result = self.runner.invoke(app, ["scan-pii", "--stdin"], input=b"\xff")
+
+        self.assertEqual(result.exit_code, 1)
+        self.assertIn("--stdin must be valid UTF-8", result.output)
+        mock_invoke.assert_not_called()
+
+    @patch("agent_sec_cli.pii_checker.cli.invoke")
+    def test_scan_pii_text_output(self, mock_invoke):
+        mock_invoke.return_value = ActionResult(
+            success=True,
+            exit_code=0,
+            data={
+                "ok": True,
+                "verdict": "deny",
+                "summary": {"total": 1, "source": "manual"},
+                "findings": [
+                    {
+                        "type": "api_key",
+                        "severity": "deny",
+                        "confidence": 0.99,
+                        "evidence_redacted": "sk-a...[REDACTED]...7890",
+                    }
+                ],
+            },
+        )
+
+        result = self.runner.invoke(
+            app,
+            ["scan-pii", "--text", "api_key=secret", "--format", "text"],
+        )
+
+        self.assertEqual(result.exit_code, 0)
+        self.assertIn("Verdict: deny", result.output)
+        self.assertIn("api_key", result.output)
+
+    def test_scan_pii_requires_one_input(self):
+        result = self.runner.invoke(app, ["scan-pii"])
+
+        self.assertEqual(result.exit_code, 1)
+        self.assertIn("provide exactly one", result.output)
+
+    def test_scan_pii_rejects_multiple_inputs(self):
+        result = self.runner.invoke(
+            app,
+            ["scan-pii", "--text", "hello", "--stdin"],
+            input="alice@example.com",
+        )
+
+        self.assertEqual(result.exit_code, 1)
+        self.assertIn("provide exactly one", result.output)
+
+    def test_scan_pii_rejects_invalid_source(self):
+        result = self.runner.invoke(
+            app,
+            ["scan-pii", "--text", "hello", "--source", "browser"],
+        )
+
+        self.assertEqual(result.exit_code, 1)
+        self.assertIn("--source must be one of", result.output)
+
+    @patch("agent_sec_cli.pii_checker.cli.invoke")
+    def test_scan_pii_accepts_runtime_sources(self, mock_invoke):
+        mock_invoke.return_value = ActionResult(
+            success=True,
+            exit_code=0,
+            stdout='{"ok": true, "verdict": "pass"}',
+            data={"ok": True, "verdict": "pass", "summary": {"total": 0}},
+        )
+
+        for source in ["tool_input", "tool_output", "model_output", "observability"]:
+            with self.subTest(source=source):
+                result = self.runner.invoke(
+                    app,
+                    ["scan-pii", "--text", "hello", "--source", source],
+                )
+
+                self.assertEqual(result.exit_code, 0)
+                _, kwargs = mock_invoke.call_args
+                self.assertEqual(kwargs["source"], source)
+
+    @patch("agent_sec_cli.pii_checker.cli.invoke")
+    def test_scan_pii_input_default_reads_full_file(self, mock_invoke):
+        mock_invoke.return_value = ActionResult(
+            success=True,
+            exit_code=0,
+            stdout='{"ok": true, "verdict": "warn"}',
+            data={
+                "ok": True,
+                "verdict": "warn",
+                "summary": {"total": 1},
+                "findings": [],
+            },
+        )
+
+        with self.runner.isolated_filesystem():
+            text = "备注🙂 alice@example.com"
+            Path("input.txt").write_text(text, encoding="utf-8")
+
+            result = self.runner.invoke(
+                app,
+                ["scan-pii", "--input", "input.txt"],
+            )
+
+        self.assertEqual(result.exit_code, 0)
+        _, kwargs = mock_invoke.call_args
+        self.assertEqual(kwargs["text"], text)
+        self.assertFalse(kwargs["input_truncated"])
+        self.assertEqual(kwargs["input_bytes_scanned"], len(text.encode("utf-8")))
+        self.assertIsNone(kwargs["max_bytes"])
+
+    @patch("agent_sec_cli.pii_checker.cli.invoke")
+    def test_scan_pii_input_reports_file_byte_limit(self, mock_invoke):
+        mock_invoke.return_value = ActionResult(
+            success=True,
+            exit_code=0,
+            stdout='{"ok": true, "verdict": "pass"}',
+            data={
+                "ok": True,
+                "verdict": "pass",
+                "summary": {"total": 0},
+                "findings": [],
+            },
+        )
+
+        with self.runner.isolated_filesystem():
+            Path("input.txt").write_bytes("备注🙂 alice".encode("utf-8"))
+            max_bytes = len("备注".encode("utf-8")) + 1
+
+            result = self.runner.invoke(
+                app,
+                [
+                    "scan-pii",
+                    "--input",
+                    "input.txt",
+                    "--max-bytes",
+                    str(max_bytes),
+                ],
+            )
+
+        self.assertEqual(result.exit_code, 0)
+        _, kwargs = mock_invoke.call_args
+        self.assertTrue(kwargs["input_truncated"])
+        self.assertEqual(kwargs["input_bytes_scanned"], max_bytes)
+        self.assertNotIn("\ufffd", kwargs["text"])
+
+    @patch("agent_sec_cli.pii_checker.cli.invoke")
+    def test_scan_pii_input_rejects_invalid_utf8(self, mock_invoke):
+        with self.runner.isolated_filesystem():
+            Path("input.txt").write_bytes(b"\xff")
+
+            result = self.runner.invoke(
+                app,
+                ["scan-pii", "--input", "input.txt"],
+            )
+
+        self.assertEqual(result.exit_code, 1)
+        self.assertIn("--input must be valid UTF-8", result.output)
+        mock_invoke.assert_not_called()
+
+    def test_scan_pii_rejects_zero_max_bytes(self):
+        result = self.runner.invoke(
+            app,
+            ["scan-pii", "--text", "hello", "--max-bytes", "0"],
+        )
+
+        self.assertEqual(result.exit_code, 1)
+        self.assertIn("--max-bytes must be greater than zero", result.output)
 
 
 if __name__ == "__main__":

@@ -27,6 +27,8 @@ import json
 import subprocess
 import sys
 
+from trace_context import with_trace_context
+
 # -- config ----------------------------------------------------------------
 
 _DEFAULT_MODE = "standard"
@@ -41,8 +43,25 @@ def _allow() -> str:
     return json.dumps({"decision": "allow"})
 
 
-# Keyword used by model_manager.py in the ModelLoadError message.
-_WARMUP_HINT = "agent-sec-cli scan-prompt warmup"
+def _build_detail_reason(scan_result: dict) -> str:
+    """Build a detailed reason string from scan result for security operations."""
+    threat_type = scan_result.get("threat_type", "")
+    risk_level = scan_result.get("risk_level", "unknown")
+    confidence = scan_result.get("confidence")
+
+    lines = [
+        f"[prompt-scanner] 检测到安全风险",
+        f"  攻击类型 : {threat_type or 'unknown'}",
+        f"  风险等级 : {risk_level}",
+        f"  拦截环节 : 用户输入扫描 (UserPromptSubmit)",
+    ]
+    if confidence is not None:
+        try:
+            lines.append(f"  模型置信度: {float(confidence) * 100:.1f}%")
+        except (TypeError, ValueError):
+            pass
+
+    return "\n".join(lines)
 
 
 def _format_cosh(scan_result: dict) -> str:
@@ -52,46 +71,25 @@ def _format_cosh(scan_result: dict) -> str:
         verdict == "pass"  -> decision "allow"
         verdict == "warn"  -> decision "ask"  (let user decide)
         verdict == "deny"  -> decision "ask"  (let user decide)
-        verdict == "error"
-          + model not downloaded -> decision "ask" with warmup instructions
-          otherwise              -> fail-open "allow"
+        otherwise           -> fail-open "allow"
     """
     verdict = scan_result.get("verdict", "pass")
 
     if verdict == "pass":
         return json.dumps({"decision": "allow"})
 
-    # Build reason from summary; it already contains threat type, confidence & evidence.
-    summary = scan_result.get("summary", "")
-    threat_type = scan_result.get("threat_type", "")
-    msg = f"[prompt-scanner] {summary or threat_type or 'Prompt rejected by security policy'}"
+    reason = _build_detail_reason(scan_result)
 
     if verdict == "warn":
         return json.dumps(
-            {"decision": "ask", "reason": msg},
+            {"decision": "ask", "reason": reason},
             ensure_ascii=False,
         )
     # Use "ask" to avoid blocking users outright.
     # TODO: switch to "block" once the policy is mature enough.
     if verdict == "deny":
         return json.dumps(
-            {"decision": "ask", "reason": msg},
-            ensure_ascii=False,
-        )
-    # error verdict — check whether it is a "model not downloaded" error.
-    # Use "ask" so the user can still send the prompt; the reason text makes
-    # it clear this is a setup reminder, not a security block.
-    if verdict == "error" and _WARMUP_HINT in summary:
-        warmup_msg = (
-            "[prompt-scanner] ⚠️  安全扫描组件尚未完成初始化，本次 prompt 未经安全检测。\n"
-            "需要一次性下载本地检测小模型才能启用扫描功能。\n"
-            "请在终端执行以下命令完成下载，之后无需再次操作：\n"
-            "  agent-sec-cli scan-prompt warmup\n"
-            "\n"
-            "你仍可以选择继续发送（Yes），或取消（No）后先完成下载。"
-        )
-        return json.dumps(
-            {"decision": "ask", "reason": warmup_msg},
+            {"decision": "ask", "reason": reason},
             ensure_ascii=False,
         )
     # other error or unknown verdict -> fail-open
@@ -115,9 +113,9 @@ def main() -> None:
         print(_allow())
         return
 
-    # 3. Call agent-sec-cli scan-prompt via subprocess
+    # 3. Call CLI. Model download/loading is owned by the daemon.
     try:
-        proc = subprocess.run(
+        cmd = with_trace_context(
             [
                 "agent-sec-cli",
                 "scan-prompt",
@@ -130,23 +128,45 @@ def main() -> None:
                 "--source",
                 _DEFAULT_SOURCE,
             ],
+            input_data,
+        )
+        proc = subprocess.run(
+            cmd,
             capture_output=True,
+            check=False,
             text=True,
             timeout=10,
         )
-    except Exception:
-        # Timeout or other error -> fail-open
+    except subprocess.TimeoutExpired as exc:
+        print(
+            f"[prompt-scanner] CLI timed out after {exc.timeout}s",
+            file=sys.stderr,
+        )
+        print(_allow())
+        return
+    except Exception as exc:
+        print(f"[prompt-scanner] CLI invocation failed: {exc}", file=sys.stderr)
         print(_allow())
         return
 
     if proc.returncode != 0:
+        stderr_tail = (proc.stderr or "").strip().splitlines()[-5:]
+        print(
+            f"[prompt-scanner] CLI exited with code {proc.returncode}:"
+            f" {'; '.join(stderr_tail)}",
+            file=sys.stderr,
+        )
         print(_allow())
         return
 
     # 4. Parse ScanResult JSON from stdout
     try:
         scan_result = json.loads(proc.stdout)
-    except (json.JSONDecodeError, ValueError):
+    except (json.JSONDecodeError, ValueError) as exc:
+        print(
+            f"[prompt-scanner] failed to parse CLI output: {exc}",
+            file=sys.stderr,
+        )
         print(_allow())
         return
 

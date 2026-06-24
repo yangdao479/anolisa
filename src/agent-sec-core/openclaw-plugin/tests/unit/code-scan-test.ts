@@ -1,4 +1,4 @@
-// tests/unit/code-scan.test.ts
+// tests/unit/code-scan-test.ts
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { codeScan } from "../../src/capabilities/code-scan.js";
@@ -16,11 +16,11 @@ type RegisteredHook = {
 };
 
 /** Create a minimal mock OpenClaw API and capture hook registrations. */
-function createMockApi() {
+function createMockApi(pluginConfig: Record<string, any> = {}) {
   const hooks: RegisteredHook[] = [];
   const logs: string[] = [];
   const api = {
-    pluginConfig: {},
+    pluginConfig,
     logger: {
       info: (msg: string) => logs.push(msg),
       error: (msg: string) => logs.push(msg),
@@ -35,8 +35,8 @@ function createMockApi() {
 }
 
 /** Register scan-code and return the single captured handler. */
-function registerAndGetHandler() {
-  const { api, hooks, logs } = createMockApi();
+function registerAndGetHandler(pluginConfig: Record<string, any> = {}) {
+  const { api, hooks, logs } = createMockApi(pluginConfig);
   codeScan.register(api);
   assert.equal(hooks.length, 1, "scan-code should register exactly 1 hook");
   return { handler: hooks[0].handler, hooks, logs };
@@ -109,8 +109,39 @@ describe("scan-code", () => {
 
       await handler(execEvent("rm -rf /"), {});
 
-      assert.deepEqual(lastCliArgs, ["scan-code", "--code", "rm -rf /", "--language", "bash"]);
+      assert.deepEqual(lastCliArgs?.slice(0, 2), [
+        "--trace-context",
+        JSON.stringify({ agent_name: "openclaw" }),
+      ]);
+      assert.deepEqual(lastCliArgs?.slice(2), ["scan-code", "--code", "rm -rf /", "--language", "bash"]);
       assert.equal(lastCliOpts?.timeout, 10000);
+    });
+
+    it("exec tool with trace context → injects trace context before scan-code", async () => {
+      const { handler } = registerAndGetHandler();
+      mockCli({ exitCode: 0, stdout: '{"verdict":"pass","findings":[]}', stderr: "" });
+
+      await handler(
+        {
+          ...execEvent("pwd"),
+          sessionId: "session-1",
+          runId: "run-1",
+          toolCallId: "tool-1",
+          trace: { traceId: "nested-trace-is-not-hook-input" },
+        },
+        {},
+      );
+
+      assert.deepEqual(lastCliArgs?.slice(0, 2), [
+        "--trace-context",
+        JSON.stringify({
+          agent_name: "openclaw",
+          session_id: "session-1",
+          run_id: "run-1",
+          tool_call_id: "tool-1",
+        }),
+      ]);
+      assert.deepEqual(lastCliArgs?.slice(2), ["scan-code", "--code", "pwd", "--language", "bash"]);
     });
 
     it("non-exec tool (read_file) → no CLI call", async () => {
@@ -159,7 +190,11 @@ describe("scan-code", () => {
 
       await handler(execEvent('echo "hello world"'), {});
 
-      assert.deepEqual(lastCliArgs, ["scan-code", "--code", 'echo "hello world"', "--language", "bash"]);
+      assert.deepEqual(lastCliArgs?.slice(0, 2), [
+        "--trace-context",
+        JSON.stringify({ agent_name: "openclaw" }),
+      ]);
+      assert.deepEqual(lastCliArgs?.slice(2), ["scan-code", "--code", 'echo "hello world"', "--language", "bash"]);
     });
   });
 
@@ -175,8 +210,20 @@ describe("scan-code", () => {
       assert.equal(result, undefined);
     });
 
-    it("deny with 1 finding → { requireApproval } (unified ask strategy)", async () => {
+    it("deny with 1 finding, default config → undefined (log only)", async () => {
       const { handler } = registerAndGetHandler();
+      mockCli({
+        exitCode: 0,
+        stdout: '{"verdict":"deny","findings":[{"desc_zh":"危险命令"}]}',
+        stderr: "",
+      });
+
+      const result = await handler(execEvent("rm -rf /"), {});
+      assert.equal(result, undefined);
+    });
+
+    it("deny with 1 finding, codeScanRequireApproval=true → { requireApproval }", async () => {
+      const { handler } = registerAndGetHandler({ codeScanRequireApproval: true });
       mockCli({
         exitCode: 0,
         stdout: '{"verdict":"deny","findings":[{"desc_zh":"危险命令"}]}',
@@ -193,8 +240,8 @@ describe("scan-code", () => {
       assert.ok(result.requireApproval.description.includes("Command: rm -rf /"));
     });
 
-    it("deny with 2 findings → requireApproval.description contains both", async () => {
-      const { handler } = registerAndGetHandler();
+    it("deny with 2 findings, codeScanRequireApproval=true → requireApproval.description contains both", async () => {
+      const { handler } = registerAndGetHandler({ codeScanRequireApproval: true });
       mockCli({
         exitCode: 0,
         stdout: '{"verdict":"deny","findings":[{"desc_zh":"A"},{"desc_zh":"B"}]}',
@@ -209,8 +256,20 @@ describe("scan-code", () => {
       assert.ok(result.requireApproval.description.includes("- B"));
     });
 
-    it("warn with findings → { requireApproval }", async () => {
+    it("warn with findings, default config → undefined (log only)", async () => {
       const { handler } = registerAndGetHandler();
+      mockCli({
+        exitCode: 0,
+        stdout: '{"verdict":"warn","findings":[{"desc_zh":"注意"}]}',
+        stderr: "",
+      });
+
+      const result = await handler(execEvent("risky-cmd"), {});
+      assert.equal(result, undefined);
+    });
+
+    it("warn with findings, codeScanRequireApproval=true → { requireApproval }", async () => {
+      const { handler } = registerAndGetHandler({ codeScanRequireApproval: true });
       mockCli({
         exitCode: 0,
         stdout: '{"verdict":"warn","findings":[{"desc_zh":"注意"}]}',
@@ -307,6 +366,86 @@ describe("scan-code", () => {
       _setCliMock(async () => { throw new Error("process crashed"); });
 
       const result = await handler(execEvent("ls"), {});
+      assert.equal(result, undefined);
+    });
+  });
+
+  // =========================================================================
+  // Dimension 5: Self-Protect Forced Block
+  // =========================================================================
+  describe("self-protect forced block", () => {
+    it("self-protect-openclaw finding forces block regardless of config", async () => {
+      const { handler } = registerAndGetHandler(); // default: codeScanRequireApproval=false
+      mockCli({
+        exitCode: 0,
+        stdout: JSON.stringify({
+          verdict: "warn",
+          findings: [{ rule_id: "shell-self-protect-openclaw", desc_zh: "禁用 agent-sec 插件" }],
+        }),
+        stderr: "",
+      });
+
+      const result = await handler(
+        execEvent("openclaw config set plugins.entries.agent-sec.enabled false"),
+        {},
+      );
+
+      assert.ok(result);
+      assert.equal(result.block, true);
+      assert.ok(result.blockReason.includes("自我保护"));
+      assert.ok(result.blockReason.includes("手动执行"));
+    });
+
+    it("self-protect block includes the original command in message", async () => {
+      const { handler } = registerAndGetHandler();
+      const cmd = "openclaw config set plugins.entries.agent-sec.enabled false && openclaw gateway restart";
+      mockCli({
+        exitCode: 0,
+        stdout: JSON.stringify({
+          verdict: "warn",
+          findings: [{ rule_id: "shell-self-protect-openclaw", desc_zh: "禁用 agent-sec 插件" }],
+        }),
+        stderr: "",
+      });
+
+      const result = await handler(execEvent(cmd), {});
+
+      assert.ok(result);
+      assert.equal(result.block, true);
+      assert.ok(result.blockReason.includes(cmd));
+    });
+
+    it("non-self-protect deny finding does not force block without codeScanRequireApproval", async () => {
+      const { handler } = registerAndGetHandler(); // codeScanRequireApproval=false
+      mockCli({
+        exitCode: 0,
+        stdout: JSON.stringify({
+          verdict: "deny",
+          findings: [{ rule_id: "shell-recursive-delete", desc_zh: "危险删除" }],
+        }),
+        stderr: "",
+      });
+
+      const result = await handler(execEvent("rm -rf /"), {});
+      assert.equal(result, undefined);
+    });
+
+    it("self-protect hermes finding does NOT trigger block in openclaw hook", async () => {
+      const { handler } = registerAndGetHandler();
+      mockCli({
+        exitCode: 0,
+        stdout: JSON.stringify({
+          verdict: "warn",
+          findings: [{ rule_id: "shell-self-protect-hermes", desc_zh: "禁用 hermes 插件" }],
+        }),
+        stderr: "",
+      });
+
+      const result = await handler(
+        execEvent("hermes plugins disable agent-sec-core-hermes-plugin"),
+        {},
+      );
+      // hermes rule should not trigger openclaw self-protect
       assert.equal(result, undefined);
     });
   });

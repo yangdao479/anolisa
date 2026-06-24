@@ -3,40 +3,35 @@
 Implements ``agent-sec-cli skill-ledger check <skill_dir>``:
 
 1. Read ``latest.json``
-2. Missing → auto-create (unsigned baseline) → ``{"status": "none"}``
-3. Compute current fileHashes, compare
+2. Missing → ``{"status": "none"}``
+3. Manifest present → compute current fileHashes, compare
 4. Mismatch → ``{"status": "drifted", "added": ..., "removed": ..., "modified": ...}``
 5. Match → verify signature → invalid → ``{"status": "tampered", "reason": ...}``
 6. Check scanStatus → ``deny`` / ``warn`` / ``none`` / ``pass``
 """
 
 import json
-import logging
 from pathlib import Path
 from typing import Any
 
-from agent_sec_cli.skill_ledger.config import remember_skill_dir
 from agent_sec_cli.skill_ledger.core.file_hasher import (
     compute_file_hashes,
     diff_file_hashes,
 )
-from agent_sec_cli.skill_ledger.core.version_chain import (
-    create_snapshot,
-    latest_json_path,
-    list_version_ids,
-    load_latest_manifest,
-    load_version_manifest,
-    next_version_id,
-    save_manifest,
+from agent_sec_cli.skill_ledger.core.manifest_integrity import (
+    MISSING_SIGNATURE_ERROR,
+    manifest_hash_error,
+    verify_manifest_signature,
 )
-from agent_sec_cli.skill_ledger.errors import SignatureInvalidError
+from agent_sec_cli.skill_ledger.core.version_chain import (
+    latest_json_path,
+    load_latest_manifest,
+)
 from agent_sec_cli.skill_ledger.models.manifest import (
     SignedManifest,
 )
 from agent_sec_cli.skill_ledger.signing.base import SigningBackend
-from agent_sec_cli.skill_ledger.utils import utc_now_iso, validate_skill_dir
-
-logger = logging.getLogger(__name__)
+from agent_sec_cli.skill_ledger.utils import validate_skill_dir
 
 
 def _manifest_metadata(manifest: SignedManifest, skill_dir: str) -> dict[str, Any]:
@@ -56,62 +51,6 @@ def _manifest_metadata(manifest: SignedManifest, skill_dir: str) -> dict[str, An
     }
 
 
-def _auto_create_manifest(
-    skill_dir: str,
-    file_hashes: dict[str, str],
-) -> SignedManifest:
-    """Create an unsigned baseline manifest when none exists.
-
-    The manifest records file hashes for drift detection but is **not signed**.
-    Signing is deferred to ``certify``, which is always run interactively.
-    This avoids requiring the private key (and thus a passphrase) during
-    ``check``, which may run in a non-interactive hook context.
-
-    If prior versions exist (e.g. latest.json was deleted but versions/ has
-    entries), the chain linkage fields are preserved so the audit trail stays
-    intact.
-
-    Returns the persisted :class:`SignedManifest` instance.  The caller is
-    responsible for constructing the result dict.
-    """
-    skill_name = Path(skill_dir).name
-
-    # Single traversal of .skill-meta/versions/ to derive all chain fields
-    existing_ids = list_version_ids(skill_dir)
-    if not existing_ids:
-        vid = "v000001"
-        prev_vid = None
-        prev_sig = None
-    else:
-        vid = next_version_id(skill_dir)
-        prev_vid = existing_ids[-1]
-        last_manifest = load_version_manifest(skill_dir, prev_vid)
-        prev_sig = (
-            last_manifest.signature.value
-            if last_manifest is not None and last_manifest.signature is not None
-            else None
-        )
-
-    manifest = SignedManifest(
-        versionId=vid,
-        previousVersionId=prev_vid,
-        skillName=skill_name,
-        fileHashes=file_hashes,
-        scanStatus="none",
-        previousManifestSignature=prev_sig,
-    )
-
-    # Stamp the last-modified time and compute content hash (for integrity).
-    # Signature is left as None — signing is deferred to ``certify``.
-    manifest.updatedAt = utc_now_iso()
-    manifest.manifestHash = manifest.compute_manifest_hash()
-
-    save_manifest(skill_dir, manifest)
-    create_snapshot(skill_dir, vid)
-
-    return manifest
-
-
 def check(skill_dir: str, backend: SigningBackend) -> dict[str, Any]:
     """Execute the full check state machine.
 
@@ -123,14 +62,6 @@ def check(skill_dir: str, backend: SigningBackend) -> dict[str, Any]:
     # Step 0: Validate skill directory
     validate_skill_dir(skill_dir)
     skill_name = Path(skill_dir).name
-
-    # Auto-remember: append to skillDirs if not already covered (best-effort)
-    try:
-        remember_skill_dir(Path(skill_dir))
-    except Exception:
-        logger.debug(
-            "auto-remember failed for %s, continuing", skill_dir, exc_info=True
-        )
 
     # Step 1: Load latest.json
     # If the file exists but is malformed/corrupted, treat as tampered.
@@ -152,21 +83,29 @@ def check(skill_dir: str, backend: SigningBackend) -> dict[str, Any]:
         # File doesn't exist and some other error — treat as missing
         manifest = None
 
-    # Step 2: Compute current file hashes
-    current_hashes = compute_file_hashes(skill_dir)
-
-    # Step 2b: No manifest → auto-create unsigned baseline
+    # Step 2: No manifest → read-only none.  scan/certify are the only
+    # commands that create signed versions and snapshots.
     if manifest is None:
-        manifest = _auto_create_manifest(skill_dir, current_hashes)
-        return {"status": "none", **_manifest_metadata(manifest, skill_dir)}
+        return {
+            "status": "none",
+            "skillName": skill_name,
+            "versionId": None,
+            "createdAt": None,
+            "updatedAt": None,
+            "fileCount": None,
+            "manifestHash": None,
+        }
+
+    # Step 3: Compute current file hashes
+    current_hashes = compute_file_hashes(skill_dir)
 
     # Manifest loaded — compute standard metadata for all subsequent returns
     meta = _manifest_metadata(manifest, skill_dir)
 
-    # Step 3: Compare fileHashes (takes priority over signature verification)
+    # Step 4: Compare fileHashes (takes priority over signature verification)
     diff = diff_file_hashes(manifest.fileHashes, current_hashes)
 
-    # Step 4: Mismatch → drifted
+    # Step 5: Mismatch → drifted
     if not diff["match"]:
         return {
             **meta,
@@ -176,35 +115,29 @@ def check(skill_dir: str, backend: SigningBackend) -> dict[str, Any]:
             "modified": diff["modified"],
         }
 
-    # Step 5: fileHashes match → verify signature
-    # 5a: Recompute manifestHash
-    expected_hash = manifest.compute_manifest_hash()
-    if manifest.manifestHash != expected_hash:
+    # Step 6: fileHashes match → verify signature
+    # 6a: Recompute manifestHash
+    hash_error = manifest_hash_error(manifest)
+    if hash_error is not None:
         return {
             **meta,
             "status": "tampered",
-            "reason": "manifestHash does not match manifest content",
+            "reason": hash_error,
         }
 
-    # 5b: Verify digital signature
-    if manifest.signature is None:
+    # 6b: Verify digital signature
+    signature_valid, signature_error = verify_manifest_signature(manifest, backend)
+    if not signature_valid and signature_error == MISSING_SIGNATURE_ERROR:
         # Legacy manifest without signature — treat as "none" (backward compat)
         return {
             **meta,
             "status": "none",
             "reason": "manifest has no signature (legacy)",
         }
+    if not signature_valid:
+        return {**meta, "status": "tampered", "reason": signature_error}
 
-    try:
-        backend.verify(
-            manifest.manifestHash.encode("utf-8"),
-            manifest.signature.value,
-            manifest.signature.keyFingerprint,
-        )
-    except SignatureInvalidError as exc:
-        return {**meta, "status": "tampered", "reason": str(exc)}
-
-    # Step 6: Signature valid → dispatch on scanStatus
+    # Step 7: Signature valid → dispatch on scanStatus
     scan_status = manifest.scanStatus
 
     if scan_status == "deny":

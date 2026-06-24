@@ -5,20 +5,51 @@ import logging
 from pathlib import Path
 from typing import Any
 
+from agent_sec_cli.skill_ledger.activation_policy import (
+    ACTIVATION_POLICIES as ACTIVATION_POLICIES,
+)
+from agent_sec_cli.skill_ledger.activation_policy import (
+    ACTIVATION_POLICY_LATEST_SCANNED as ACTIVATION_POLICY_LATEST_SCANNED,
+)
+from agent_sec_cli.skill_ledger.activation_policy import (
+    ACTIVATION_POLICY_PASS_ONLY as ACTIVATION_POLICY_PASS_ONLY,
+)
+from agent_sec_cli.skill_ledger.activation_policy import (
+    ACTIVATION_POLICY_PASS_WARN_ONLY as ACTIVATION_POLICY_PASS_WARN_ONLY,
+)
+from agent_sec_cli.skill_ledger.activation_policy import (
+    DEFAULT_ACTIVATION_POLICY as DEFAULT_ACTIVATION_POLICY,
+)
+from agent_sec_cli.skill_ledger.activation_policy import (
+    validate_activation_policy,
+)
 from agent_sec_cli.skill_ledger.errors import ConfigError
 from agent_sec_cli.skill_ledger.paths import get_config_dir
+from agent_sec_cli.skill_ledger.scanner.names import (
+    CODE_SCANNER_NAME,
+    STATIC_SCANNER_NAME,
+    canonicalize_scanner_name,
+)
 
 logger = logging.getLogger(__name__)
 
 _SKILL_MANIFEST = "SKILL.md"
+_DEPRECATED_SKILL_DIRS_KEY = "skillDirs"
+DEFAULT_SKILL_DIRS = [
+    "~/.openclaw/skills/*",
+    "~/.copilot-shell/skills/*",
+    "~/.hermes/skills/**",
+    "/usr/share/anolisa/skills/*",
+]
+_IGNORED_RECURSIVE_DIRS = frozenset(
+    {".git", ".github", ".hub", ".archive", ".skill-meta"}
+)
 
 _DEFAULT_CONFIG: dict[str, Any] = {
     "signingBackend": "ed25519",
-    "skillDirs": [
-        "~/.openclaw/skills/*",
-        "~/.copilot-shell/skills/*",
-        "/usr/share/anolisa/skills/*",
-    ],
+    "activationPolicy": DEFAULT_ACTIVATION_POLICY,
+    "enableDefaultSkillDirs": True,
+    "managedSkillDirs": [],
     # ── Scanner / parser registry (see design doc §2) ──
     "scanners": [
         {
@@ -26,6 +57,20 @@ _DEFAULT_CONFIG: dict[str, Any] = {
             "type": "skill",
             "parser": "findings-array",
             "description": "LLM-driven 4-phase skill audit",
+        },
+        {
+            "name": CODE_SCANNER_NAME,
+            "type": "builtin",
+            "parser": "findings-array",
+            "enabled": True,
+            "description": "Scan Skill code files via code-scanner",
+        },
+        {
+            "name": STATIC_SCANNER_NAME,
+            "type": "builtin",
+            "parser": "findings-array",
+            "enabled": True,
+            "description": "Static Skill security scanner based on Cisco skill-scanner rules",
         },
     ],
     "parsers": {
@@ -47,8 +92,10 @@ def _deep_merge_config(
     """Merge *user* config onto *defaults* with list-of-dict awareness.
 
     Rules:
-    - ``skillDirs`` (list[str]): **additive** — user entries are appended
-      to defaults; duplicates are removed while preserving order.
+    - ``managedSkillDirs`` (list[str]): user-managed discovery entries are
+      stored separately from built-in defaults and are replaced by user config.
+    - ``enableDefaultSkillDirs`` (bool): controls whether built-in default
+      discovery entries participate in runtime resolution.
     - ``scanners`` (list[dict]): merge by ``name`` — user entries override
       defaults with the same ``name``; defaults not in user are preserved.
     - ``parsers`` (dict[str, dict]): shallow dict merge per parser name.
@@ -56,26 +103,20 @@ def _deep_merge_config(
     """
     merged = dict(defaults)
     for key, user_val in user.items():
-        if key == "skillDirs" and isinstance(user_val, list):
-            # Additive: defaults + user, dedup preserving order
-            seen: set[str] = set()
-            combined: list[str] = []
-            for entry in [*defaults.get("skillDirs", []), *user_val]:
-                entry_str = str(entry)
-                if entry_str not in seen:
-                    seen.add(entry_str)
-                    combined.append(entry_str)
-            merged["skillDirs"] = combined
+        if key == "managedSkillDirs" and isinstance(user_val, list):
+            merged["managedSkillDirs"] = _compact_skill_dirs([str(v) for v in user_val])
         elif key == "scanners" and isinstance(user_val, list):
             # Index defaults by name for O(1) lookup
             by_name: dict[str, dict[str, Any]] = {}
             for s in defaults.get("scanners", []):
                 if isinstance(s, dict) and "name" in s:
-                    by_name[s["name"]] = s
+                    canonical = canonicalize_scanner_name(str(s["name"]))
+                    by_name[canonical] = {**s, "name": canonical}
             # User entries override by name
             for s in user_val:
                 if isinstance(s, dict) and "name" in s:
-                    by_name[s["name"]] = s
+                    canonical = canonicalize_scanner_name(str(s["name"]))
+                    by_name[canonical] = {**s, "name": canonical}
             merged["scanners"] = list(by_name.values())
         elif key == "parsers" and isinstance(user_val, dict):
             merged_parsers = dict(defaults.get("parsers", {}))
@@ -84,6 +125,23 @@ def _deep_merge_config(
         else:
             merged[key] = user_val
     return merged
+
+
+def effective_skill_dir_entries(config: dict[str, Any]) -> list[str]:
+    """Return built-in plus managed skill directory entries for discovery."""
+    entries: list[str] = []
+    if config.get("enableDefaultSkillDirs", True):
+        entries.extend(DEFAULT_SKILL_DIRS)
+    entries.extend(str(v) for v in config.get("managedSkillDirs", []))
+    return _compact_skill_dirs(entries)
+
+
+def deprecated_skill_dir_entries(config: dict[str, Any]) -> list[str]:
+    """Return deprecated skillDirs entries retained only for diagnostics."""
+    entries = config.get(_DEPRECATED_SKILL_DIRS_KEY)
+    if isinstance(entries, list):
+        return [str(v) for v in entries]
+    return []
 
 
 def load_config() -> dict[str, Any]:
@@ -98,17 +156,38 @@ def load_config() -> dict[str, Any]:
             raise ConfigError(
                 f"config.json must be a JSON object, got {type(cfg).__name__}"
             )
+        if _DEPRECATED_SKILL_DIRS_KEY in cfg:
+            logger.warning(
+                "Ignoring deprecated skill-ledger config key %r in %s; use "
+                "managedSkillDirs instead. Set enableDefaultSkillDirs=false "
+                "for isolated discovery.",
+                _DEPRECATED_SKILL_DIRS_KEY,
+                path,
+            )
         return _deep_merge_config(_DEFAULT_CONFIG, cfg)
     except json.JSONDecodeError as exc:
         raise ConfigError(f"Invalid JSON in {path}: {exc}") from exc
 
 
-def resolve_skill_dirs(config: dict[str, Any] | None = None) -> list[Path]:
-    """Expand ``skillDirs`` entries (glob + single-dir) into concrete directories.
+def resolve_activation_policy(config: dict[str, Any] | None = None) -> str:
+    """Return the configured activation policy."""
+    if config is None:
+        config = load_config()
+    policy = config.get("activationPolicy", DEFAULT_ACTIVATION_POLICY)
+    try:
+        return validate_activation_policy(policy)
+    except ValueError as exc:
+        raise ConfigError(f"Invalid activationPolicy: {exc}") from exc
 
-    Supports two formats per entry:
+
+def resolve_skill_dirs(config: dict[str, Any] | None = None) -> list[Path]:
+    """Expand effective skill dir entries into concrete directories.
+
+    Supports three formats per entry:
     - ``"path/*"`` — glob pattern: each matching subdirectory **that contains
       SKILL.md** is included.
+    - ``"path/**"`` — recursive pattern: every descendant directory containing
+      SKILL.md is included, with hidden/internal metadata dirs skipped.
     - ``"path/to/skill"`` — single skill directory; must also contain
       ``SKILL.md`` to be included.
 
@@ -121,11 +200,22 @@ def resolve_skill_dirs(config: dict[str, Any] | None = None) -> list[Path]:
     skill_dirs: list[Path] = []
     seen: set[Path] = set()
 
-    for entry in config.get("skillDirs", []):
+    for entry in effective_skill_dir_entries(config):
         entry = str(entry)
         expanded = Path(entry).expanduser()
 
-        if entry.endswith("/*"):
+        if entry.endswith("/**"):
+            parent = expanded.parent
+            if parent.is_dir():
+                for skill_file in sorted(parent.rglob(_SKILL_MANIFEST)):
+                    skill_dir = skill_file.parent
+                    if _is_ignored_recursive_skill_dir(skill_dir, parent):
+                        continue
+                    resolved = skill_dir.resolve()
+                    if resolved not in seen:
+                        seen.add(resolved)
+                        skill_dirs.append(skill_dir)
+        elif entry.endswith("/*"):
             # Glob mode: parent directory, each child with SKILL.md is a skill
             parent = expanded.parent
             if parent.is_dir():
@@ -162,8 +252,11 @@ def _compact_skill_dirs(entries: list[str]) -> list[str]:
     Preserves order; keeps the glob, drops the specifics.
     """
     glob_parents: set[str] = set()
+    recursive_parents: set[Path] = set()
     for entry in entries:
-        if entry.endswith("/*"):
+        if entry.endswith("/**"):
+            recursive_parents.add(Path(entry[:-3]).expanduser().resolve())
+        elif entry.endswith("/*"):
             # Normalise: resolve ~ so "/home/user/.copilot-shell/skills/*"
             # and "~/.copilot-shell/skills/*" are treated as the same parent.
             glob_parents.add(str(Path(entry[:-2]).expanduser().resolve()))
@@ -176,14 +269,27 @@ def _compact_skill_dirs(entries: list[str]) -> list[str]:
         seen.add(entry)
 
         # Skip specific paths whose parent is covered by a glob
-        if not entry.endswith("/*"):
+        if not entry.endswith(("/*", "/**")):
             expanded = Path(entry).expanduser().resolve()
             parent_str = str(expanded.parent)
             if parent_str in glob_parents:
                 continue
+            if any(expanded.is_relative_to(parent) for parent in recursive_parents):
+                continue
 
         compacted.append(entry)
     return compacted
+
+
+def _is_ignored_recursive_skill_dir(skill_dir: Path, root: Path) -> bool:
+    """Return True when *skill_dir* is under a hidden/internal subtree."""
+    try:
+        parts = skill_dir.relative_to(root).parts
+    except ValueError:
+        return True
+    return any(
+        part.startswith(".") or part in _IGNORED_RECURSIVE_DIRS for part in parts
+    )
 
 
 def is_covered(skill_dir: Path, config: dict[str, Any] | None = None) -> bool:
@@ -198,7 +304,7 @@ def is_covered(skill_dir: Path, config: dict[str, Any] | None = None) -> bool:
 def remember_skill_dir(
     skill_dir: Path, config: dict[str, Any] | None = None
 ) -> str | None:
-    """Append *skill_dir* (or its parent glob) to ``skillDirs`` if not covered.
+    """Append *skill_dir* (or its parent glob) to ``managedSkillDirs`` if not covered.
 
     Heuristic for entry format:
     - If the parent directory contains **at least two** sibling sub-directories
@@ -234,12 +340,12 @@ def remember_skill_dir(
     else:
         entry = str(skill_dir)
 
-    existing = list(config.get("skillDirs", []))
+    existing = list(config.get("managedSkillDirs", []))
     if entry not in existing:
         existing.append(entry)
-    config["skillDirs"] = _compact_skill_dirs(existing)
+    config["managedSkillDirs"] = _compact_skill_dirs(existing)
     save_config(config)
-    logger.info("Added %r to skillDirs in %s", entry, config_path())
+    logger.info("Added %r to managedSkillDirs in %s", entry, config_path())
 
     return entry
 

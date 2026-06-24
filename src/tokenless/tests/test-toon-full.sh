@@ -55,11 +55,11 @@ fi
 
 # 检查 OpenClaw 配置
 if python3 -c "
-import json
-cfg=json.load(open('$HOME/.openclaw/openclaw.json'))
+import json, os
+cfg=json.load(open(os.path.expanduser('~/.openclaw/openclaw.json')))
 entries=cfg.get('plugins',{}).get('entries',{})
-assert 'tokenless-openclaw' in entries and entries['tokenless-openclaw'].get('enabled'), 'not enabled'
-assert entries['tokenless-openclaw'].get('config',{}).get('toon_compression_enabled'), 'toon disabled'
+assert 'tokenless' in entries and entries['tokenless'].get('enabled'), 'not enabled'
+assert entries['tokenless'].get('config',{}).get('toon_compression_enabled'), 'toon disabled'
 " 2>/dev/null; then
     pass "OpenClaw 插件已启用且 TOON 配置正确"
 else
@@ -67,10 +67,10 @@ else
 fi
 
 # 检查 copilot-shell hook
-if [ -x /usr/share/tokenless/adapters/cosh/tokenless-compress-toon.sh ]; then
-    pass "COSH TOON hook 已安装且可执行"
+if [ -f /usr/share/anolisa/adapters/tokenless/common/hooks/compress_toon_hook.py ]; then
+    pass "COSH TOON hook 已安装"
 else
-    fail "COSH TOON hook 缺失或不可执行"
+    fail "COSH TOON hook 缺失"
 fi
 
 # ========== 场景 1: Tokenless CLI ==========
@@ -235,7 +235,7 @@ fi
 # ========== 场景 2: COSH (copilot-shell) ==========
 section "场景 2: COSH (copilot-shell) Hooks"
 
-HOOK_DIR=/usr/share/tokenless/adapters/cosh
+HOOK_DIR=/usr/share/anolisa/adapters/tokenless/common/hooks
 
 scenario "2.1 独立 TOON Hook — 直接 JSON 对象"
 
@@ -256,7 +256,7 @@ payload=$(cat <<'EOF'
 EOF
 )
 
-result=$(echo "$payload" | bash "$HOOK_DIR/tokenless-compress-toon.sh" 2>/dev/null)
+result=$(echo "$payload" | python3 "$HOOK_DIR/compress_toon_hook.py" 2>/dev/null)
 assert_not_empty "$result" "TOON Hook 直接 JSON 输出"
 assert_contains "$result" "users[5]" "TOON Hook 表格格式输出"
 if echo "$result" | jq -e '.hookSpecificOutput.additionalContext' &>/dev/null; then
@@ -265,7 +265,12 @@ else
     fail "TOON Hook 响应结构异常"
 fi
 context=$(echo "$result" | jq -r '.hookSpecificOutput.additionalContext')
-assert_contains "$context" "token savings" "TOON Hook 包含压缩率信息"
+assert_contains "$context" "users[5]" "TOON Hook additionalContext 为裸 TOON 内容"
+if echo "$context" | grep -qF "TOON format"; then
+    fail "TOON Hook 仍包含已废弃的 [TOON format ...] 前缀"
+else
+    pass "TOON Hook 已去除 [TOON format ...] 前缀"
+fi
 
 scenario "2.2 独立 TOON Hook — 转义 JSON 字符串"
 
@@ -277,7 +282,7 @@ payload=$(cat <<'EOF'
 EOF
 )
 
-result=$(echo "$payload" | bash "$HOOK_DIR/tokenless-compress-toon.sh" 2>/dev/null)
+result=$(echo "$payload" | python3 "$HOOK_DIR/compress_toon_hook.py" 2>/dev/null)
 assert_not_empty "$result" "TOON Hook 转义字符串输出"
 if echo "$result" | jq -r '.hookSpecificOutput.additionalContext' | grep -qF "users[5]"; then
     pass "TOON Hook 正确 unwrap 转义字符串"
@@ -309,10 +314,15 @@ payload=$(cat <<'EOF'
 EOF
 )
 
-result=$(echo "$payload" | bash "$HOOK_DIR/tokenless-compress-response.sh" 2>/dev/null)
+result=$(echo "$payload" | python3 "$HOOK_DIR/compress_response_hook.py" 2>/dev/null)
 assert_not_empty "$result" "Response→TOON 流水线输出"
 context=$(echo "$result" | jq -r '.hookSpecificOutput.additionalContext')
-assert_contains "$context" "response compressed + TOON encoded" "流水线标签正确"
+assert_contains "$context" "data[5]" "流水线产出 TOON 表格内容"
+if echo "$context" | grep -qE "\[tokenless\]|TOON format"; then
+    fail "流水线 additionalContext 仍包含已废弃的标签前缀"
+else
+    pass "流水线 additionalContext 已去除标签前缀"
+fi
 # 验证 debug 字段被移除
 if echo "$context" | grep -qvF "debug_trace_id"; then
     pass "Response 压缩移除了 debug 字段"
@@ -323,7 +333,7 @@ fi
 scenario "2.4 COSH Hook — 小响应跳过"
 
 payload='{"tool_name":"exec","tool_response":"{\"result\":\"ok\"}"}'
-result=$(echo "$payload" | bash "$HOOK_DIR/tokenless-compress-toon.sh" 2>/dev/null)
+result=$(echo "$payload" | python3 "$HOOK_DIR/compress_toon_hook.py" 2>/dev/null)
 # 小响应应该被跳过（无输出）
 if [ -z "$result" ]; then
     pass "小响应正确跳过"
@@ -334,7 +344,7 @@ fi
 scenario "2.5 COSH Hook — 非 JSON 响应跳过"
 
 payload='{"tool_name":"exec","tool_response":"plain text output, not json at all but long enough to pass length check... padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding padding"}'
-result=$(echo "$payload" | bash "$HOOK_DIR/tokenless-compress-toon.sh" 2>/dev/null)
+result=$(echo "$payload" | python3 "$HOOK_DIR/compress_toon_hook.py" 2>/dev/null)
 # 非 JSON 应该被跳过
 if [ -z "$result" ]; then
     pass "非 JSON 响应正确跳过"

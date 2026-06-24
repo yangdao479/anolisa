@@ -11,7 +11,7 @@ use libbpf_rs::{
 };
 use std::{
     mem::MaybeUninit,
-    os::fd::{AsFd, AsRawFd},
+    os::fd::AsFd,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -21,6 +21,12 @@ use std::{
 };
 
 // ─── Generated skeleton ───────────────────────────────────────────────────────
+#[allow(
+    non_camel_case_types,
+    non_upper_case_globals,
+    dead_code,
+    non_snake_case
+)]
 mod bpf {
     include!(concat!(env!("OUT_DIR"), "/proctrace.skel.rs"));
     include!(concat!(env!("OUT_DIR"), "/proctrace.rs"));
@@ -71,7 +77,7 @@ impl VariableEvent {
 
         // SAFETY: BPF guarantees proper alignment and layout
         let raw_header = unsafe { &*(data.as_ptr() as *const ProcEventHeader) };
-        
+
         // Convert ktime to Unix timestamp
         let mut header = *raw_header;
         header.timestamp_ns = config::ktime_to_unix_ns(raw_header.timestamp_ns);
@@ -359,6 +365,21 @@ impl ProcTrace {
         traced_processes: Option<&MapHandle>,
         rb: Option<&MapHandle>,
     ) -> Result<Self> {
+        Self::new_with_target_and_maps(target_pids, target_uid, traced_processes, rb, false)
+    }
+
+    /// Create a new ProcTrace with extra control over the cgroup-level filter.
+    ///
+    /// `cgroup_filter_enabled` flips the rodata flag baked into the BPF object.
+    /// When false (default), the cgroup filter logic short-circuits to true and
+    /// the cgroup_filter map is ignored — behavior identical to pre-feature.
+    pub fn new_with_target_and_maps(
+        target_pids: &[u32],
+        target_uid: Option<u32>,
+        traced_processes: Option<&MapHandle>,
+        rb: Option<&MapHandle>,
+        cgroup_filter_enabled: bool,
+    ) -> Result<Self> {
         // Open + load skeleton
         let mut builder = ProctraceSkelBuilder::default();
         builder.obj_builder.debug(config::verbose());
@@ -370,6 +391,16 @@ impl ProcTrace {
         if let Some(uid) = target_uid {
             open_skel.rodata_mut().targ_uid = uid;
         }
+
+        // Set cgroup-filter rodata flag before load. Defaults to false so
+        // existing behavior is preserved when feature is unused.
+        open_skel.rodata_mut().filter_cgroup_enabled = cgroup_filter_enabled;
+
+        // Detect cgroup v2 unified hierarchy and pass to BPF via rodata.
+        // When true, get_cgroup_id_compat() uses bpf_get_current_cgroup_id() directly.
+        // When false, it CO-RE reads the v1 memory subsys cgroup.
+        open_skel.rodata_mut().cgroup_v2_mode =
+            std::path::Path::new("/sys/fs/cgroup/cgroup.controllers").exists();
 
         // If external traced_processes map is provided, reuse its fd
         if let Some(map) = traced_processes {
@@ -400,7 +431,7 @@ impl ProcTrace {
                 skel.maps_mut()
                     .traced_processes()
                     .update(&key, &val, libbpf_rs::MapFlags::ANY)
-                    .with_context(|| format!("failed to add pid {} to traced_processes", pid))?;
+                    .with_context(|| format!("failed to add pid {pid} to traced_processes"))?;
             }
         }
 
@@ -433,7 +464,7 @@ impl ProcTrace {
             .maps_mut()
             .traced_processes()
             .update(&key, &val, libbpf_rs::MapFlags::ANY)
-            .with_context(|| format!("failed to add pid {} to traced_processes", pid))
+            .with_context(|| format!("failed to add pid {pid} to traced_processes"))
     }
 
     /// Remove a PID from the traced_processes map at runtime
@@ -443,7 +474,41 @@ impl ProcTrace {
             .maps_mut()
             .traced_processes()
             .delete(&key)
-            .with_context(|| format!("failed to remove pid {} from traced_processes", pid))
+            .with_context(|| format!("failed to remove pid {pid} from traced_processes"))
+    }
+
+    /// Add a cgroup inode id to the cgroup_filter map at runtime.
+    ///
+    /// When the rodata flag `filter_cgroup_enabled` was set to true at load
+    /// time, only events from cgroups registered here will pass the cgroup
+    /// gate. The id must match what `get_cgroup_id_compat()` returns in BPF,
+    /// which equals `stat(cgroup_path).st_ino` for the corresponding
+    /// hierarchy (v2 unified path or v1 memory subsystem path).
+    pub fn add_traced_cgroup(&mut self, cgroup_id: u64) -> Result<()> {
+        let key = cgroup_id.to_ne_bytes();
+        let val = 1u8.to_ne_bytes();
+        self.skel
+            .maps_mut()
+            .cgroup_filter()
+            .update(&key, &val, libbpf_rs::MapFlags::ANY)
+            .with_context(|| format!("failed to add cgroup_id {cgroup_id} to cgroup_filter"))
+    }
+
+    /// Remove a cgroup inode id from the cgroup_filter map at runtime.
+    pub fn remove_traced_cgroup(&mut self, cgroup_id: u64) -> Result<()> {
+        let key = cgroup_id.to_ne_bytes();
+        self.skel
+            .maps_mut()
+            .cgroup_filter()
+            .delete(&key)
+            .with_context(|| format!("failed to remove cgroup_id {cgroup_id} from cgroup_filter"))
+    }
+
+    /// Create a MapHandle from the cgroup_filter map for cross-probe reuse.
+    pub fn cgroup_filter_handle(&self) -> Result<MapHandle> {
+        let binding = self.skel.maps();
+        let map = binding.cgroup_filter();
+        MapHandle::try_clone(map).context("failed to create MapHandle from cgroup_filter")
     }
 
     /// Create a MapHandle from the traced_processes map for external reuse
@@ -521,7 +586,7 @@ impl ProcTrace {
         let mut rb_builder = RingBufferBuilder::new();
         let binding = self.skel.maps();
         rb_builder
-            .add(&binding.rb(), move |data: &[u8]| {
+            .add(binding.rb(), move |data: &[u8]| {
                 if data.len() < min_sz {
                     return 0;
                 }

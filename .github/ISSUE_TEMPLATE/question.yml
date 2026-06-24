@@ -20,6 +20,9 @@ body:
         - sight
         - tokenless
         - ckpt
+        - memory
+        - anolisa
+        - skillfs
         - other
   - type: textarea
     id: question

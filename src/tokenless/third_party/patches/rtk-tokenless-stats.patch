@@ -1,8 +1,8 @@
 diff --git a/src/core/tracking.rs b/src/core/tracking.rs
-index 982c937..5e60a58 100644
+index 359e4f6..c543753 100644
 --- a/src/core/tracking.rs
 +++ b/src/core/tracking.rs
-@@ -1294,6 +1294,9 @@ impl TimedExecution {
+@@ -1358,6 +1358,9 @@ impl TimedExecution {
          let input_tokens = estimate_tokens(input);
          let output_tokens = estimate_tokens(output);
  
@@ -12,13 +12,15 @@ index 982c937..5e60a58 100644
          if let Ok(tracker) = Tracker::new() {
              let _ = tracker.record(
                  original_cmd,
-@@ -1355,6 +1358,150 @@ pub fn args_display(args: &[OsString]) -> String {
+@@ -1419,6 +1422,159 @@ pub fn args_display(args: &[OsString]) -> String {
          .join(" ")
  }
  
 +/// Estimate token count from character count using ~4 chars/token heuristic.
 +fn estimate_tokens_from_chars(chars: usize) -> usize {
-+    if chars == 0 { return 0; }
++    if chars == 0 {
++        return 0;
++    }
 +    chars.div_ceil(4)
 +}
 +
@@ -52,8 +54,16 @@ index 982c937..5e60a58 100644
 +        } else {
 +            "cli".to_string()
 +        };
-+        let sid = if session.is_empty() { None } else { Some(session) };
-+        let tuid = if toolcall.is_empty() { None } else { Some(toolcall) };
++        let sid = if session.is_empty() {
++            None
++        } else {
++            Some(session)
++        };
++        let tuid = if toolcall.is_empty() {
++            None
++        } else {
++            Some(toolcall)
++        };
 +        return (agent, sid, tuid);
 +    }
 +
@@ -90,13 +100,12 @@ index 982c937..5e60a58 100644
 +
 +    let (agent_id, session_id, tool_use_id) = resolve_tokenless_context();
 +
-+    let db_path = std::env::var("TOKENLESS_STATS_DB")
-+        .unwrap_or_else(|_| {
-+            format!(
-+                "{}/.tokenless/stats.db",
-+                std::env::var("HOME").unwrap_or_else(|_| ".".to_string())
-+            )
-+        });
++    let db_path = std::env::var("TOKENLESS_STATS_DB").unwrap_or_else(|_| {
++        format!(
++            "{}/.tokenless/stats.db",
++            std::env::var("HOME").unwrap_or_else(|_| ".".to_string())
++        )
++    });
 +
 +    let before_chars = raw_output.len();
 +    let after_chars = filtered_output.len();
@@ -163,3 +172,14 @@ index 982c937..5e60a58 100644
  #[cfg(test)]
  mod tests {
      use super::*;
+diff --git a/src/hooks/hook_check.rs b/src/hooks/hook_check.rs
+index 4dd26d8..3638321 100644
+--- a/src/hooks/hook_check.rs
++++ b/src/hooks/hook_check.rs
+@@ -1,5 +1,6 @@
+ //! Detects whether RTK hooks are installed and warns if they are outdated.
+ 
++#[allow(unused_imports)]
+ use super::constants::{
+     CLAUDE_DIR, CLAUDE_HOOK_COMMAND, HOOKS_SUBDIR, PRE_TOOL_USE_KEY, REWRITE_HOOK_FILE,
+     SETTINGS_JSON,

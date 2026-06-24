@@ -1,11 +1,20 @@
 """CLI entry point for agent-sec-cli package."""
 
 import json
+import sys
 import time
 from datetime import datetime, timezone
 from typing import Any
 
 import typer
+from agent_sec_cli.cli_logging import setup_cli_logging
+from agent_sec_cli.correlation_context import (
+    init_invocation_context,
+    init_process_trace_context,
+    parse_trace_context,
+)
+from agent_sec_cli.observability.cli import app as observability_app
+from agent_sec_cli.pii_checker.cli import scanner_app as pii_scanner_app
 from agent_sec_cli.prompt_scanner.cli import scanner_app
 from agent_sec_cli.security_events import get_reader
 from agent_sec_cli.security_events.summary_formatter import format_summary
@@ -22,7 +31,7 @@ try:
 
     __version__ = get_version("agent-sec-cli")
 except Exception:
-    __version__ = "0.4.0"  # pragma: no cover
+    __version__ = "0.6.1"  # pragma: no cover
 
 app = typer.Typer(
     name="agent-sec-cli",
@@ -30,6 +39,45 @@ app = typer.Typer(
     add_completion=True,
     rich_markup_mode="rich",
 )
+
+
+def _extract_trace_context_arg(argv: list[str]) -> str | None:
+    """Return hidden top-level trace context before Typer/logging setup.
+
+    This bootstrap parser is the canonical trace-context parser. It only
+    recognizes process-level options before the first command token so command
+    arguments and downstream pass-through flags keep their own semantics.
+    """
+    trace_context: str | None = None
+    index = 1 if argv else 0
+    while index < len(argv):
+        arg = argv[index]
+        if arg == "--":
+            return trace_context
+        if arg == "--trace-context":
+            if index + 1 < len(argv):
+                value = argv[index + 1]
+                if value.startswith("-"):
+                    raise ValueError("missing trace context value")
+                trace_context = value if value.strip() else None
+                index += 2
+                continue
+            raise ValueError("missing trace context value")
+        prefix = "--trace-context="
+        if arg.startswith(prefix):
+            value = arg[len(prefix) :]
+            trace_context = value if value.strip() else None
+            index += 1
+            continue
+        if not arg.startswith("-"):
+            return trace_context
+        index += 1
+    return trace_context
+
+
+def _init_trace_context(trace_context: str | None) -> None:
+    """Initialize process trace context from raw CLI JSON."""
+    init_process_trace_context(parse_trace_context(trace_context))
 
 
 @app.callback(invoke_without_command=True)
@@ -42,8 +90,17 @@ def main_callback(
         is_eager=True,
         help="Show version and exit.",
     ),
+    trace_context: str | None = typer.Option(
+        None,
+        "--trace-context",
+        help="JSON tracing context for plugin integrations.",
+        hidden=True,
+    ),
 ) -> None:
     """Main callback for version option."""
+    # Declared but intentionally unused here so Typer recognizes the hidden
+    # top-level option; process trace context is initialized once in main().
+
     if version:
         typer.echo(f"agent-sec-cli {__version__}")
         raise typer.Exit()
@@ -51,6 +108,7 @@ def main_callback(
 
 # Mount skill-ledger as a subcommand group: agent-sec-cli skill-ledger <cmd>
 app.add_typer(skill_ledger_app, name="skill-ledger")
+app.add_typer(observability_app, name="observability")
 
 # ---------------------------------------------------------------------------
 # Command: harden
@@ -99,6 +157,8 @@ def _with_default_harden_args(args: list[str]) -> list[str]:
 
 # Register prompt scanner sub-command
 app.add_typer(scanner_app, name="scan-prompt")
+# Register PII scanner sub-command
+app.add_typer(pii_scanner_app, name="scan-pii")
 
 
 # ---------------------------------------------------------------------------
@@ -131,7 +191,7 @@ def log_sandbox(
         "--cwd",
         help="Current working directory",
     ),
-):
+) -> None:
     """Internal: Record sandbox prehook decision (called by sandbox-guard.py)."""
     result = invoke(
         "sandbox_prehook",
@@ -167,7 +227,7 @@ def harden(
         "--downstream-help",
         help="Show full `loongshield seharden` help and exit.",
     ),
-):
+) -> None:
     """Scan or reinforce the system against a security baseline."""
     if help_flag:
         typer.echo(_HARDEN_HELP_TEXT.rstrip())
@@ -195,7 +255,7 @@ def verify(
         "--skill",
         help="Path to specific skill for verification",
     ),
-):
+) -> None:
     """Skill integrity verification."""
     result = invoke("verify", skill=skill)
     if result.stdout:
@@ -411,7 +471,7 @@ def events(
             "Incompatible with --count, --count-by, --output."
         ),
     ),
-):
+) -> None:
     """Query security events from the local SQLite store."""
     # TODO: Support paging with limit and continue
 
@@ -524,6 +584,7 @@ def events(
         result = reader.count(
             event_type=event_type,
             category=category,
+            trace_id=trace_id,
             since=resolved_since,
             until=resolved_until,
             offset=offset,
@@ -542,7 +603,13 @@ def events(
             raise typer.Exit(code=1)
 
         result = reader.count_by(
-            count_by, since=resolved_since, until=resolved_until, offset=offset
+            count_by,
+            event_type=event_type,
+            category=category,
+            trace_id=trace_id,
+            since=resolved_since,
+            until=resolved_until,
+            offset=offset,
         )
         typer.echo(json.dumps(result, ensure_ascii=False, indent=2))
         raise typer.Exit(code=0)
@@ -582,6 +649,16 @@ def events(
 
 def main() -> None:
     """Main entry point."""
+    try:
+        # Preload tracing before Typer executes callbacks so future CLI logging
+        # setup can correlate startup records. This is the single process-level
+        # trace-context initialization path.
+        _init_trace_context(_extract_trace_context_arg(sys.argv))
+        init_invocation_context()
+        setup_cli_logging()
+    except ValueError as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise SystemExit(1) from exc
     app()
 
 

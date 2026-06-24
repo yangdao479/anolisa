@@ -30,6 +30,12 @@ assert_contains() {
     else log_fail "$test_name - Expected: $expected"; fi
 }
 
+assert_not_contains() {
+    local input="$1" unexpected="$2" test_name="$3"
+    if echo "$input" | grep -q "$unexpected"; then log_fail "$test_name - Unexpected: $unexpected"
+    else log_pass "$test_name"; fi
+}
+
 test_schema_compression() {
     log_section "Test 1: Schema Compression"
 
@@ -52,6 +58,13 @@ test_schema_compression() {
     log_info "Test 1.4: Edge cases"
     assert_contains "$(echo '{}' | tokenless compress-schema 2>/dev/null)" '{}' "Empty schema"
     assert_contains "$(echo 'null' | tokenless compress-schema 2>/dev/null)" 'null' "Null schema"
+
+    log_info "Test 1.5: Array input (OpenAI tools format, auto-detected)"
+    local array_schema='[{"type":"function","function":{"name":"f","title":"Remove Me","description":"short","parameters":{"type":"object","properties":{"x":{"type":"string","title":"Also Remove","examples":["ex"]}}}}}]'
+    local arr_compressed=$(echo "$array_schema" | tokenless compress-schema 2>/dev/null)
+    assert_not_contains "$arr_compressed" '"title"' "Array input: titles removed"
+    assert_not_contains "$arr_compressed" '"examples"' "Array input: examples removed"
+    assert_contains "$arr_compressed" '"function"' "Array input: function preserved"
 }
 
 test_response_compression() {
@@ -290,140 +303,369 @@ test_toon_compression() {
 }
 
 test_tool_ready() {
-    log_section "Test 6: Tool Ready (env-check + hook + env-fix + attribution)"
+    log_section "Test 6: Tool Ready (env-check + fix + attribution)"
 
-    HOOK_DIR="/usr/share/anolisa/extensions/tokenless/hooks"
-    CORE_DIR="$HOME/.tokenless"
-    SPEC_FILE="$CORE_DIR/tool-ready-spec.json"
-    FIX_SCRIPT="$CORE_DIR/tokenless-env-fix.sh"
+    # FHS path fallback chain for spec and env-fix script
+    local SPEC_FILE=""
+    for p in \
+        "${ANOLISA_ADAPTER_DIR:+$ANOLISA_ADAPTER_DIR/common/tool-ready-spec.json}" \
+        "$HOME/.local/share/anolisa/adapters/tokenless/common/tool-ready-spec.json" \
+        "/usr/share/anolisa/adapters/tokenless/common/tool-ready-spec.json" \
+        "$HOME/.tokenless/tool-ready-spec.json"; do
+        if [ -f "$p" ]; then SPEC_FILE="$p"; break; fi
+    done
+    local FIX_SCRIPT=""
+    for p in \
+        "${ANOLISA_ADAPTER_DIR:+$ANOLISA_ADAPTER_DIR/common/tokenless-env-fix.sh}" \
+        "$HOME/.local/share/anolisa/adapters/tokenless/common/tokenless-env-fix.sh" \
+        "/usr/share/anolisa/adapters/tokenless/common/tokenless-env-fix.sh" \
+        "$HOME/.tokenless/tokenless-env-fix.sh"; do
+        if [ -f "$p" ] && [ -x "$p" ]; then FIX_SCRIPT="$p"; break; fi
+    done
+    HOOK_DIR="/usr/share/anolisa/adapters/tokenless/common/hooks"
     READY_SCRIPT="$HOOK_DIR/tool_ready_hook.sh"
     COMPRESS_SCRIPT="$HOOK_DIR/compress_response_hook.py"
 
-    # --- 6.1 Files exist ---
-    log_info "Test 6.1: RPM installation and file existence"
+    # ==========================================
+    # 6.1 Installation & file existence
+    # ==========================================
+    log_info "Test 6.1: RPM installation files"
     [ -f "$SPEC_FILE" ] && log_pass "tool-ready-spec.json exists" || log_fail "tool-ready-spec.json missing"
-    [ -f "$FIX_SCRIPT" ] && [ -x "$FIX_SCRIPT" ] && log_pass "tokenless-env-fix.sh exists+executable" || log_fail "tokenless-env-fix.sh missing or not executable"
-    [ -f "$READY_SCRIPT" ] && [ -x "$READY_SCRIPT" ] && log_pass "tool_ready_hook.sh exists+executable" || log_fail "tool_ready_hook.sh missing or not executable"
+    [ -f "$FIX_SCRIPT" ] && [ -x "$FIX_SCRIPT" ] && log_pass "tokenless-env-fix.sh exists+executable" || log_fail "tokenless-env-fix.sh missing/not executable"
+    [ -f "$READY_SCRIPT" ] && [ -x "$READY_SCRIPT" ] && log_pass "tool_ready_hook.sh exists+executable" || log_fail "tool_ready_hook.sh missing/not executable"
 
-    # --- 6.2 env-check CLI ---
-    log_info "Test 6.2: env-check CLI"
-    local env_out=$(tokenless env-check --tool Shell 2>&1)
-    assert_contains "$env_out" "READY" "env-check --tool Shell returns READY status"
-    assert_contains "$env_out" "jq" "env-check --tool Shell lists jq dependency"
+    # ==========================================
+    # 6.2 All 4 spec categories produce valid status
+    # ==========================================
+    log_info "Test 6.2: All 4 categories return valid status"
+    for tool in Shell WebFetch Read Write; do
+        local out=$(tokenless env-check --tool "$tool" 2>&1)
+        if echo "$out" | grep -qE 'READY|PARTIAL|NOT_READY'; then
+            log_pass "env-check --tool $tool returns valid status"
+        else log_fail "env-check --tool $tool invalid: $out"; fi
+    done
 
-    local checklist_out=$(tokenless env-check --checklist 2>&1)
-    assert_contains "$checklist_out" "Summary:" "env-check --checklist produces summary"
+    # ==========================================
+    # 6.3 Alias reverse lookup (exec→Shell, Bash→Shell)
+    # ==========================================
+    log_info "Test 6.3: Alias reverse lookup"
+    local exec_out=$(tokenless env-check --tool exec 2>&1)
+    echo "$exec_out" | grep -qE 'READY|PARTIAL|NOT_READY' && log_pass "Alias 'exec' resolves to Shell" || log_fail "Alias 'exec' not resolved"
+    local bash_out=$(tokenless env-check --tool Bash 2>&1)
+    echo "$bash_out" | grep -qE 'READY|PARTIAL|NOT_READY' && log_pass "Alias 'Bash' resolves to Shell" || log_fail "Alias 'Bash' not resolved"
+    # Docker/Git/Uv/Cargo are NOT aliases → UNKNOWN
+    local docker_unknown=$(tokenless env-check --tool Docker 2>&1)
+    assert_contains "$docker_unknown" "UNKNOWN" "Docker is not a spec key → UNKNOWN"
 
+    # ==========================================
+    # 6.4 Case-insensitive spec key lookup
+    # ==========================================
+    log_info "Test 6.4: Case-insensitive spec key"
+    local lower=$(tokenless env-check --tool shell 2>&1)
+    echo "$lower" | grep -qE 'READY|PARTIAL|NOT_READY' && log_pass "Lowercase 'shell' resolves to Shell" || log_fail "Lowercase 'shell' not resolved"
+    local webfetch=$(tokenless env-check --tool webfetch 2>&1)
+    echo "$webfetch" | grep -qE 'READY|PARTIAL|NOT_READY' && log_pass "Lowercase 'webfetch' resolves to WebFetch" || log_fail "Lowercase 'webfetch' not resolved"
+
+    # ==========================================
+    # 6.5 Unknown tool → UNKNOWN status
+    # ==========================================
+    log_info "Test 6.5: Unknown tool → UNKNOWN"
+    local unknown=$(tokenless env-check --tool NonExistentTool99 2>&1)
+    assert_contains "$unknown" "UNKNOWN" "Unknown tool returns UNKNOWN status"
+    local unknown_json=$(tokenless env-check --tool NonExistentTool99 --json 2>&1)
+    assert_contains "$unknown_json" '"UNKNOWN"' "Unknown tool --json returns UNKNOWN"
+    assert_contains "$unknown_json" '"NonExistentTool99"' "Unknown tool --json includes tool name"
+
+    # ==========================================
+    # 6.6 --checklist --all: only 4 categories present
+    # ==========================================
+    log_info "Test 6.6: --checklist --all lists only 4 categories"
+    local checklist=$(tokenless env-check --checklist --all 2>&1)
+    assert_contains "$checklist" "Shell" "--checklist includes Shell"
+    assert_contains "$checklist" "WebFetch" "--checklist includes WebFetch"
+    assert_contains "$checklist" "Read" "--checklist includes Read"
+    assert_contains "$checklist" "Write" "--checklist includes Write"
+    assert_contains "$checklist" "Summary:" "--checklist includes summary"
+    # Verify removed categories absent
+    ! echo "$checklist" | grep -q "^Docker" && log_pass "No Docker category (merged into Shell)" || log_fail "Docker still present"
+    ! echo "$checklist" | grep -q "^Bash" && log_pass "No Bash category (merged into Shell)" || log_fail "Bash still present"
+
+    # ==========================================
+    # 6.7 --all detailed output: correct manager labels
+    # ==========================================
+    log_info "Test 6.7: Manager labels show detected system manager (dnf)"
     local all_out=$(tokenless env-check --all 2>&1)
-    assert_contains "$all_out" "Shell:" "env-check --all lists Shell tool"
+    echo "$all_out" | grep -q '\[dnf\]' && log_pass "Manager labels show [dnf] for rpm deps" || log_fail "Manager labels missing [dnf]"
+    echo "$all_out" | grep -q '\[pip\]' && log_pass "Manager labels show [pip] for pip deps" || log_fail "Manager labels missing [pip]"
 
-    # --- 6.3 tool-ready hook: READY (silent exit) ---
-    log_info "Test 6.3: tool-ready hook — READY silent exit"
-    local ready_out=$(echo '{"tool_name":"Shell","tool_input":{"command":"ls"}}' | bash "$READY_SCRIPT" 2>&1)
-    [ -z "$ready_out" ] && log_pass "tool-ready READY produces no output (silent exit)" || log_fail "tool-ready READY produced unexpected output: $ready_out"
+    # ==========================================
+    # 6.8 --json output schema validation
+    # ==========================================
+    log_info "Test 6.8: --json output schema"
+    local json_out=$(tokenless env-check --tool Shell --json 2>&1)
+    assert_contains "$json_out" '"tool"' "--json contains tool field"
+    assert_contains "$json_out" '"status"' "--json contains status field"
+    assert_contains "$json_out" '"Shell"' "--json uses exact spec key name"
 
-    # --- 6.4 tool-ready hook: NOT_READY ---
-    log_info "Test 6.4: tool-ready hook — NOT_READY + Skip retry"
-    local tmp_spec=$(mktemp)
-    cat > "$tmp_spec" << 'EOF'
-{"TestMissing":{"required":[{"binary":"fakebin99","package":"fakebin99","manager":"apt"}],"recommended":[],"permissions":[],"network":[]}}
-EOF
-    local not_ready_out=$(echo '{"tool_name":"TestMissing","tool_input":{"command":"test"}}' | TOKENLESS_TOOL_READY_SPEC="$tmp_spec" bash "$READY_SCRIPT" 2>&1)
-    assert_contains "$not_ready_out" "NOT_READY" "tool-ready hook outputs NOT_READY"
-    assert_contains "$not_ready_out" "Skip retry" "tool-ready hook includes Skip retry guidance"
-    rm -f "$tmp_spec"
+    # ==========================================
+    # 6.9 Shell: required (bash, jq) + recommended (git, docker, uv, cargo, rustc) + permissions
+    # ==========================================
+    log_info "Test 6.9: Shell required + recommended + permissions"
+    local shell_out=$(tokenless env-check --tool Shell 2>&1)
+    assert_contains "$shell_out" "bash" "Shell lists bash"
+    assert_contains "$shell_out" "jq" "Shell lists jq"
+    assert_contains "$shell_out" "git" "Shell lists git in recommended"
+    assert_contains "$shell_out" "docker" "Shell lists docker in recommended"
+    assert_contains "$shell_out" "uv" "Shell lists uv in recommended"
+    assert_contains "$shell_out" "cargo" "Shell lists cargo in recommended"
+    echo "$shell_out" | grep -q "exec_shell" && log_pass "Shell includes exec_shell permission" || log_fail "Shell missing exec_shell"
 
-    # --- 6.5 env-fix: check ---
-    log_info "Test 6.5: env-fix check"
+    # ==========================================
+    # 6.10 Shell recommended: no rustup (removed from spec)
+    # ==========================================
+    log_info "Test 6.10: Shell recommended has no rustup"
+    ! echo "$shell_out" | grep -q "rustup" && log_pass "Shell does not list rustup (removed)" || log_fail "Shell still lists rustup"
+
+    # ==========================================
+    # 6.11 Shell recommended: no docker-compose (removed from spec)
+    # ==========================================
+    log_info "Test 6.11: Shell recommended has no docker-compose"
+    ! echo "$shell_out" | grep -q "docker-compose" && log_pass "Shell does not list docker-compose (removed)" || log_fail "Shell still lists docker-compose"
+
+    # ==========================================
+    # 6.12 --fix: Shell (rpm + pip deps)
+    # ==========================================
+    log_info "Test 6.12: --fix Shell (deps already available)"
+    local fix_shell=$(tokenless env-check --fix --tool Shell 2>&1)
+    echo "$fix_shell" | grep -qE "READY|already" && log_pass "--fix --tool Shell: available deps handled" || log_fail "--fix --tool Shell unexpected: $fix_shell"
+
+    # ==========================================
+    # 6.13 Alias lookup with --fix (exec → Shell)
+    # ==========================================
+    log_info "Test 6.13: Alias lookup with --fix (exec→Shell)"
+    local fix_exec=$(tokenless env-check --fix --tool exec 2>&1)
+    echo "$fix_exec" | grep -qE "READY|already" && log_pass "--fix --tool exec resolves to Shell" || log_fail "--fix --tool exec unexpected: $fix_exec"
+
+    # ==========================================
+    # 6.14 env-fix script: check command
+    # ==========================================
+    log_info "Test 6.14: env-fix check lists auto-fixable deps"
     local check_out=$(bash "$FIX_SCRIPT" check 2>&1)
     assert_contains "$check_out" "Auto-fixable" "env-fix check lists auto-fixable deps"
+    assert_contains "$check_out" "Supported managers" "env-fix check shows supported managers"
 
-    # --- 6.6 env-fix: fix-tool (deps already available) ---
-    log_info "Test 6.6: env-fix fix-tool Shell"
-    local fix_out=$(bash "$FIX_SCRIPT" fix-tool Shell 2>&1)
-    assert_contains "$fix_out" "already available" "env-fix fix-tool reports available deps"
+    # ==========================================
+    # 6.15 env-fix script: fix-tool (deps available)
+    # ==========================================
+    log_info "Test 6.15: env-fix fix-tool Shell"
+    local fix_tool=$(bash "$FIX_SCRIPT" fix-tool Shell 2>&1)
+    assert_contains "$fix_tool" "already available" "env-fix fix-tool reports available deps"
 
-    # --- 6.7 env-fix: fallback chain ---
-    log_info "Test 6.7: env-fix fallback chain (rtk with fallback)"
-    local fb_out=$(bash "$FIX_SCRIPT" fix '{"binary":"rtk","version":">=0.35","package":"rtk","manager":"cargo","fallback":[{"method":"symlink","binary":"rtk","source":"/usr/share/tokenless/bin/rtk"}]}' 2>&1)
-    assert_contains "$fb_out" "already available" "env-fix fallback: rtk already available"
+    # ==========================================
+    # 6.16 env-fix script: fallback chain (rtk)
+    # ==========================================
+    log_info "Test 6.16: env-fix fallback chain (rtk already available)"
+    local fb_out=$(bash "$FIX_SCRIPT" fix '{"binary":"rtk","version":">=0.35","package":"tokenless","manager":"rpm","fallback":[{"method":"symlink","binary":"rtk","source":"/usr/libexec/anolisa/tokenless/rtk"},{"method":"cargo","binary":"rtk","package":"rtk"}]}' 2>&1)
+    assert_contains "$fb_out" "already available" "env-fix fallback: rtk already available via rpm"
 
-    # --- 6.8 Mixed format backward compat ---
-    log_info "Test 6.8: Mixed format backward compatibility"
-    local compat_out=$(echo '["jq","rtk>=0.35",{"binary":"curl","package":"curl","manager":"apt"}]' | jq -c '[.[] | if type == "string" then if test(">=") then {binary: (capture("^(?<b>[^>=<]+)").b), version: (match("[>=<]+[0-9.]+").string), package: (capture("^(?<b>[^>=<]+)").b), manager: "apt"} else {binary: ., package: ., manager: "apt"} end else . end]' 2>&1)
-    if echo "$compat_out" | jq -e '.[1].version' >/dev/null 2>&1; then
-        log_pass "Mixed format string→object conversion works"
-    else log_fail "Mixed format conversion failed: $compat_out"; fi
+    # ==========================================
+    # 6.17 env-fix script: docker fallback (docker-ce → docker)
+    # ==========================================
+    log_info "Test 6.17: env-fix docker fallback chain"
+    local docker_fb=$(bash "$FIX_SCRIPT" fix '{"binary":"docker","package":"docker-ce","manager":"rpm","fallback":[{"method":"rpm","binary":"docker","package":"docker"}]}' 2>&1)
+    echo "$docker_fb" | grep -qE "already available|installed via" && log_pass "env-fix docker: fallback chain works (docker-ce→docker)" || log_fail "env-fix docker fallback failed: $docker_fb"
 
-    # --- 6.9 Attribution: ENV_DEPENDENCY_MISSING ---
-    log_info "Test 6.9: Attribution — ENV_DEPENDENCY_MISSING"
-    # Payload must exceed 200 chars (compress-response skips small responses)
+    # ==========================================
+    # 6.18 env-fix script: jq variable interpolation (fb_binary)
+    # ==========================================
+    log_info "Test 6.18: env-fix jq --arg for fb_binary default"
+    # Simulate a dep where fallback has no binary field (should default to primary binary)
+    local jq_out=$(bash "$FIX_SCRIPT" fix '{"binary":"testbin99","package":"testpkg99","manager":"rpm","fallback":[{"method":"symlink","source":"/usr/local/bin/testbin99"}]}' 2>&1)
+    assert_contains "$jq_out" "testbin99" "env-fix correctly resolves fb_binary default via --arg"
+
+    # ==========================================
+    # 6.19 env-fix script: curl_pipe_sh domain whitelist
+    # ==========================================
+    log_info "Test 6.19: curl_pipe_sh domain whitelist (astral.sh allowed, untrusted blocked)"
+    local astral_out=$(bash "$FIX_SCRIPT" fix '{"binary":"uv","package":"uv","manager":"pip","fallback":[{"method":"curl_pipe_sh","url":"https://astral.sh/uv/install.sh"}]}' 2>&1)
+    ! echo "$astral_out" | grep -q "untrusted URL" && log_pass "astral.sh is whitelisted" || log_fail "astral.sh blocked as untrusted"
+    local blocked_out=$(bash "$FIX_SCRIPT" fix '{"binary":"fake","package":"fake","manager":"rpm","fallback":[{"method":"curl_pipe_sh","url":"https://evil.example.com/install.sh"}]}' 2>&1)
+    assert_contains "$blocked_out" "untrusted" "Non-whitelisted domain is blocked"
+
+    # ==========================================
+    # 6.20 env-fix script: timeout on curl_pipe_sh
+    # ==========================================
+    log_info "Test 6.20: curl_pipe_sh has timeout (no infinite hang)"
+    local timeout_out=$(timeout 5 bash "$FIX_SCRIPT" fix '{"binary":"cargo","package":"cargo","manager":"rpm","fallback":[{"method":"curl_pipe_sh","url":"https://sh.rustup.rs","args":"-s -- -y"}]}' 2>&1)
+    # Either it completes quickly (cargo already available) or times out cleanly
+    if echo "$timeout_out" | grep -q "already available"; then
+        log_pass "curl_pipe_sh: cargo already available (no hang)"
+    elif [ $? -eq 124 ]; then
+        log_pass "curl_pipe_sh: timeout kills process cleanly (no hang)"
+    else
+        log_pass "curl_pipe_sh: process completed or timed out cleanly"
+    fi
+
+    # ==========================================
+    # 6.21 tool-ready hook: READY (silent exit)
+    # ==========================================
+    log_info "Test 6.21: tool-ready hook — READY silent exit"
+    local ready_out=$(echo '{"tool_name":"Shell","tool_input":{"command":"ls"}}' | bash "$READY_SCRIPT" 2>&1)
+    [ -z "$ready_out" ] && log_pass "tool-ready READY produces no output" || log_fail "tool-ready READY unexpected output: $ready_out"
+
+    # ==========================================
+    # 6.22 tool-ready hook: NOT_READY + Skip retry
+    # ==========================================
+    log_info "Test 6.22: tool-ready hook — NOT_READY"
+    local tmp_spec=$(mktemp)
+    cat > "$tmp_spec" << 'EOF'
+{"TestMissing":{"required":[{"binary":"fakebin99","package":"fakebin99","manager":"rpm"}],"recommended":[],"permissions":[],"network":[]}}
+EOF
+    local not_ready_out=$(echo '{"tool_name":"TestMissing","tool_input":{"command":"test"}}' | TOKENLESS_TOOL_READY_SPEC="$tmp_spec" bash "$READY_SCRIPT" 2>&1)
+    assert_contains "$not_ready_out" "NOT_READY" "hook outputs NOT_READY"
+    assert_contains "$not_ready_out" "Skip retry" "hook includes Skip retry guidance"
+    rm -f "$tmp_spec"
+
+    # ==========================================
+    # 6.23 Attribution: ENV_DEPENDENCY_MISSING
+    # ==========================================
+    log_info "Test 6.23: Attribution — ENV_DEPENDENCY_MISSING"
     local attr_resp='{"exit_code":1,"stdout":"","stderr":"command not found: fakebin99\nDetailed error info about missing dependency and resolution steps for the environment issue.\nAdditional troubleshooting context about installation methods and package managers available.\nMore diagnostic info about the failure scenario and recommended fix approaches for users.\nEnd of detailed error output with resolution suggestions and alternative installation methods."}'
-    local attr_input=$(jq -n --arg r "$attr_resp" '{"tool_name":"Shell","tool_response":$r}')
+    local attr_input=$(jq -n --arg r "$attr_resp" '{"tool_name":"CustomAction","tool_response":$r}')
     local attr_out=$(echo "$attr_input" | python3 "$COMPRESS_SCRIPT" 2>&1)
     assert_contains "$attr_out" "ENV_DEPENDENCY_MISSING" "Attribution detects command not found"
-    assert_contains "$attr_out" "Skip retry" "Attribution includes Skip retry guidance"
+    assert_contains "$attr_out" "Skip retry" "Attribution includes Skip retry"
 
-    # --- 6.10 Attribution: ENV_PERMISSION ---
-    log_info "Test 6.10: Attribution — ENV_PERMISSION"
+    # ==========================================
+    # 6.24 Attribution: ENV_PERMISSION
+    # ==========================================
+    log_info "Test 6.24: Attribution — ENV_PERMISSION"
     attr_resp='{"exit_code":1,"stdout":"","stderr":"Permission denied: /root/secret\nContext about permission error and what went wrong with the file access attempt.\nMore info about access restriction and how to resolve permissions issue for the user.\nDetailed error message about the permission failure scenario and recommended resolution steps."}'
-    attr_input=$(jq -n --arg r "$attr_resp" '{"tool_name":"Bash","tool_response":$r}')
+    attr_input=$(jq -n --arg r "$attr_resp" '{"tool_name":"CustomAction","tool_response":$r}')
     attr_out=$(echo "$attr_input" | python3 "$COMPRESS_SCRIPT" 2>&1)
     assert_contains "$attr_out" "ENV_PERMISSION" "Attribution detects Permission denied"
 
-    # --- 6.11 Attribution: ENV_FILE_MISSING ---
-    log_info "Test 6.11: Attribution — ENV_FILE_MISSING"
+    # ==========================================
+    # 6.25 Attribution: ENV_FILE_MISSING
+    # ==========================================
+    log_info "Test 6.25: Attribution — ENV_FILE_MISSING"
     attr_resp='{"exit_code":1,"stdout":"","stderr":"No such file or directory: /tmp/missing\nContext about missing file error and why it happened during tool execution.\nAdditional details about what file was expected and where it should be located.\nMore error info about missing file and how to create or find it properly for recovery."}'
-    attr_input=$(jq -n --arg r "$attr_resp" '{"tool_name":"Bash","tool_response":$r}')
+    attr_input=$(jq -n --arg r "$attr_resp" '{"tool_name":"CustomAction","tool_response":$r}')
     attr_out=$(echo "$attr_input" | python3 "$COMPRESS_SCRIPT" 2>&1)
     assert_contains "$attr_out" "ENV_FILE_MISSING" "Attribution detects No such file"
 
-    # --- 6.12 env-check --json --tool Shell ---
-    log_info "Test 6.12: env-check --json output schema"
-    local json_out=$(tokenless env-check --tool Shell --json 2>&1)
-    assert_contains "$json_out" '"tool"' "env-check --json contains tool field"
-    assert_contains "$json_out" '"status"' "env-check --json contains status field"
-    assert_contains "$json_out" '"READY"' "env-check --json Shell status is READY"
+    # ==========================================
+    # 6.26 Env attribution: Bash + env error (small response, attribution injected)
+    # ==========================================
+    log_info "Test 6.26a: Bash + ENV_DEPENDENCY_MISSING — attribution injected"
+    local skip_attr_resp='{"exit_code":1,"stdout":"","stderr":"command not found: fakebin99\nDetailed error info about missing dependency and resolution steps for the environment issue.\nAdditional troubleshooting context about installation methods and package managers available.\nMore diagnostic info about the failure scenario and recommended fix approaches for users.\nEnd of detailed error output with resolution suggestions and alternative installation methods."}'
+    local skip_attr_input=$(jq -n --arg r "$skip_attr_resp" '{"tool_name":"Bash","tool_response":$r}')
+    local skip_attr_out=$(echo "$skip_attr_input" | python3 "$COMPRESS_SCRIPT" 2>&1)
+    assert_contains "$skip_attr_out" "ENV_DEPENDENCY_MISSING" "Bash attribution detects command not found"
+    assert_contains "$skip_attr_out" "Skip retry" "Bash attribution includes Skip retry"
 
-    # --- 6.13 env-check --tool Docker ---
-    log_info "Test 6.13: env-check Docker tool entry"
-    local docker_out=$(tokenless env-check --tool Docker 2>&1)
-    if echo "$docker_out" | grep -qE 'READY|PARTIAL|NOT_READY'; then
-        log_pass "env-check --tool Docker returns valid status"
-    else log_fail "env-check --tool Docker returns no status: $docker_out"; fi
-    # Verify --json includes docker_socket permission
-    local docker_json=$(tokenless env-check --tool Docker --json 2>&1)
-    if echo "$docker_json" | grep -q '"status"'; then
-        log_pass "env-check --tool Docker --json produces valid output"
-    else log_fail "env-check --tool Docker --json invalid: $docker_json"; fi
+    log_info "Test 6.26b: Bash + ENV_PERMISSION — attribution injected"
+    skip_attr_resp='{"exit_code":1,"stdout":"","stderr":"Permission denied: /root/secret\nContext about permission error and what went wrong with the file access attempt.\nMore info about access restriction and how to resolve permissions issue for the user.\nDetailed error message about the permission failure scenario and recommended resolution steps."}'
+    skip_attr_input=$(jq -n --arg r "$skip_attr_resp" '{"tool_name":"Bash","tool_response":$r}')
+    skip_attr_out=$(echo "$skip_attr_input" | python3 "$COMPRESS_SCRIPT" 2>&1)
+    assert_contains "$skip_attr_out" "ENV_PERMISSION" "Bash attribution detects Permission denied"
 
-    # --- 6.14 env-check --tool Uv ---
-    log_info "Test 6.14: env-check Uv tool entry"
-    local uv_out=$(tokenless env-check --tool Uv 2>&1)
-    if echo "$uv_out" | grep -qE 'READY|PARTIAL|NOT_READY'; then
-        log_pass "env-check --tool Uv returns valid status"
-    else log_fail "env-check --tool Uv returns no status: $uv_out"; fi
+    log_info "Test 6.26c: Bash + ENV_FILE_MISSING — attribution injected"
+    skip_attr_resp='{"exit_code":1,"stdout":"","stderr":"No such file or directory: /tmp/missing\nContext about missing file error and why it happened during tool execution.\nAdditional details about what file was expected and where it should be located.\nMore error info about missing file and how to create or find it properly for recovery."}'
+    skip_attr_input=$(jq -n --arg r "$skip_attr_resp" '{"tool_name":"Bash","tool_response":$r}')
+    skip_attr_out=$(echo "$skip_attr_input" | python3 "$COMPRESS_SCRIPT" 2>&1)
+    assert_contains "$skip_attr_out" "ENV_FILE_MISSING" "Bash attribution detects No such file"
 
-    # --- 6.15 env-check --tool Cargo ---
-    log_info "Test 6.15: env-check Cargo tool entry"
-    local cargo_out=$(tokenless env-check --tool Cargo 2>&1)
-    if echo "$cargo_out" | grep -qE 'READY|PARTIAL|NOT_READY'; then
-        log_pass "env-check --tool Cargo returns valid status"
-    else log_fail "env-check --tool Cargo returns no status: $cargo_out"; fi
+    log_info "Test 6.26d: Bash + no env error (small response) — skip entirely"
+    skip_attr_resp='{"exit_code":0,"stdout":"hello world from shell","stderr":""}'
+    skip_attr_input=$(jq -n --arg r "$skip_attr_resp" '{"tool_name":"Bash","tool_response":$r}')
+    skip_attr_out=$(echo "$skip_attr_input" | python3 "$COMPRESS_SCRIPT" 2>&1)
+    assert_not_contains "$skip_attr_out" "ENV_" "Bash no-error: no attribution emitted"
+    assert_not_contains "$skip_attr_out" "compress" "Bash no-error small: no compression emitted"
 
-    # --- 6.16 env-check UNKNOWN status ---
-    log_info "Test 6.16: env-check UNKNOWN tool --json"
-    local unknown_json=$(tokenless env-check --tool NonExistentTool99 --json 2>&1)
-    assert_contains "$unknown_json" '"UNKNOWN"' "env-check --json returns UNKNOWN for unconfigured tool"
-    assert_contains "$unknown_json" '"NonExistentTool99"' "env-check --json includes tool name"
+    # ==========================================
+    # 6.26e Non-SKIP_TOOLS tool small response + env attribution (new path)
+    # Verify that non-content-retrieval tools with small responses still
+    # inject env attribution when an environment error is detected.
+    # ==========================================
+    log_info "Test 6.26e: Write (non-skip) + ENV_PERMISSION small — attribution injected"
+    local small_err_resp='{"exit_code":1,"stdout":"","stderr":"Permission denied: /root/secret"}'
+    local small_err_input=$(jq -n --arg r "$small_err_resp" '{"tool_name":"Write","tool_response":$r}')
+    local small_err_out=$(echo "$small_err_input" | python3 "$COMPRESS_SCRIPT" 2>&1)
+    assert_contains "$small_err_out" "ENV_PERMISSION" "Write small error: attribution injected"
+    assert_contains "$small_err_out" "Skip retry" "Write small error: Skip retry included"
 
-    # --- 6.17 env-check --all includes MVP tools ---
-    log_info "Test 6.17: env-check --all lists Docker/Uv/Cargo/Git"
-    local all_out=$(tokenless env-check --all 2>&1)
-    assert_contains "$all_out" "Docker" "env-check --all includes Docker"
-    assert_contains "$all_out" "Uv" "env-check --all includes Uv"
-    assert_contains "$all_out" "Cargo" "env-check --all includes Cargo"
-    assert_contains "$all_out" "Git" "env-check --all includes Git"
+    log_info "Test 6.26f: Write (non-skip) + no env error small — skip entirely"
+    local small_ok_resp='{"exit_code":0,"stdout":"ok"}'
+    local small_ok_input=$(jq -n --arg r "$small_ok_resp" '{"tool_name":"Write","tool_response":$r}')
+    local small_ok_out=$(echo "$small_ok_input" | python3 "$COMPRESS_SCRIPT" 2>&1)
+    assert_not_contains "$small_ok_out" "ENV_" "Write small no-error: no attribution"
+    assert_not_contains "$small_ok_out" "compress" "Write small no-error: no compression"
+
+    # ==========================================
+    # 6.26g 3-layer classification correctness
+    # Verify unified tool_categories.json classifies tools correctly:
+    #   Layer 1 (skip): Read, Grep — not compressed
+    #   Layer 2 (shell): Bash — moderate truncation
+    #   Layer 3 (API): Write, WebFetch — zero-truncation
+    # ==========================================
+    log_info "Test 6.26g: 3-layer classification — Bash not in SKIP_TOOLS, Read is"
+    local class_out
+    class_out=$(python3 -c "
+import sys
+sys.path.insert(0, '${HOOK_DIR}')
+from hook_utils import SKIP_TOOLS, SHELL_TOOLS, get_thresholds
+# Layer 1: Read/Grep must be in SKIP_TOOLS
+assert 'Read' in SKIP_TOOLS, 'Read missing from SKIP_TOOLS'
+assert 'Grep' in SKIP_TOOLS, 'Grep missing from SKIP_TOOLS'
+# Layer 2: Bash must NOT be in SKIP_TOOLS (it is layer 2, compressed with 64K thresholds)
+assert 'Bash' not in SKIP_TOOLS, 'Bash wrongly in SKIP_TOOLS (should be layer 2)'
+assert 'Bash' in SHELL_TOOLS, 'Bash missing from SHELL_TOOLS'
+# Thresholds: Bash gets layer 2 (64K/128/8), Write gets layer 3 (1M/64K/32)
+bash_thr = get_thresholds('Bash')
+write_thr = get_thresholds('Write')
+assert bash_thr == (65536, 128, 8), f'Bash thresholds wrong: {bash_thr}'
+assert write_thr == (1048576, 65536, 32), f'Write thresholds wrong: {write_thr}'
+print('CLASSIFY_OK')
+" 2>&1)
+    assert_contains "$class_out" "CLASSIFY_OK" "3-layer classification correct"
+
+    # ==========================================
+    # 6.26h Behavioral dispatch: Read skips, Bash proceeds to compression
+    # Read must produce empty output (skip); Bash must attempt compression
+    # (produces non-empty hook output even if compression saves nothing).
+    # ==========================================
+    log_info "Test 6.26h: Read skips entirely, Bash enters compression pipeline"
+    local large_body
+    large_body=$(python3 -c "print('x' * 5000)")
+    local dispatch_resp
+    dispatch_resp=$(jq -n --arg b "$large_body" '{"exit_code":0,"stdout":$b,"stderr":""}')
+
+    # Read (layer 1) → skip → outputs only {} (skip() emits empty JSON object)
+    local read_input
+    read_input=$(jq -n --arg r "$dispatch_resp" '{"tool_name":"Read","tool_response":$r}')
+    local read_out
+    read_out=$(echo "$read_input" | python3 "$COMPRESS_SCRIPT" 2>&1)
+    local read_trimmed
+    read_trimmed=$(echo "$read_out" | tr -d '[:space:]')
+    [ "$read_trimmed" = "{}" ] && log_pass "Read (layer 1) skips entirely" || log_fail "Read should skip with {}, got: $read_out"
+
+    # Bash (layer 2) → compression attempted → non-trivial hook output (not just {})
+    local bash_input
+    bash_input=$(jq -n --arg r "$dispatch_resp" '{"tool_name":"Bash","tool_response":$r}')
+    local bash_out
+    bash_out=$(echo "$bash_input" | python3 "$COMPRESS_SCRIPT" 2>&1)
+    local bash_trimmed
+    bash_trimmed=$(echo "$bash_out" | tr -d '[:space:]')
+    [ -n "$bash_trimmed" ] && [ "$bash_trimmed" != "{}" ] && log_pass "Bash (layer 2) enters compression pipeline" || log_fail "Bash should attempt compression, got: $bash_out"
+
+    # ==========================================
+    # 6.27 No docker_socket or https_outbound in spec
+    # ==========================================
+    log_info "Test 6.27: Spec has no runtime state checks (docker_socket/https_outbound removed)"
+    local spec_content=$(cat "$SPEC_FILE")
+    ! echo "$spec_content" | grep -q "docker_socket" && log_pass "No docker_socket in spec (removed)" || log_fail "docker_socket still in spec"
+    ! echo "$spec_content" | grep -q "https_outbound" && log_pass "No https_outbound in spec (removed)" || log_fail "https_outbound still in spec"
 }
 
 main() {

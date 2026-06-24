@@ -16,14 +16,23 @@ shared state, no ordering dependency, no cascade failures.
 import json
 import time
 
-import pytest
-
 # Import shared helpers from conftest.py
 from .conftest import iso_now, require_loongshield, run_cli
+
+
+def _run_harden_and_expected_event_result() -> str:
+    """Run harden and return the expected SecurityEvent.result value."""
+    result = run_cli("harden")
+    return "succeeded" if result.returncode == 0 else "failed"
+
 
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
+
+
+def _expected_event_result(cli_result):
+    return "succeeded" if cli_result.returncode == 0 else "failed"
 
 
 class TestHardenEventLogging:
@@ -159,7 +168,8 @@ class TestEventQueryFilters:
         """Default output is human-readable table format."""
         since = iso_now()
         time.sleep(0.05)
-        run_cli("harden")
+        harden_result = run_cli("harden")
+        expected_result = _expected_event_result(harden_result)
         time.sleep(0.1)
 
         result = run_cli("events", "--event-type", "harden", "--since", since)
@@ -170,7 +180,7 @@ class TestEventQueryFilters:
         assert len(lines) == 4
         assert lines[0].startswith("EVENT_TYPE")
         assert "harden" in lines[1]
-        assert "succeeded" in lines[1]
+        assert expected_result in lines[1]
         assert "1 event" in lines[3]
 
 
@@ -247,7 +257,8 @@ class TestCLIValidation:
         """Verify that --output json returns a valid JSON array with complete event data."""
         since = iso_now()
         time.sleep(0.05)
-        run_cli("harden")
+        harden_result = run_cli("harden")
+        expected_result = _expected_event_result(harden_result)
         time.sleep(0.1)
 
         result = run_cli(
@@ -269,7 +280,7 @@ class TestCLIValidation:
         assert "timestamp" in event
         assert "details" in event
         assert event["event_type"] == "harden"
-        assert event["result"] == "succeeded"
+        assert event["result"] == expected_result
 
     def test_jsonl_output_format(self):
         """Verify that --output jsonl returns one JSON object per line."""
@@ -295,18 +306,19 @@ class TestCLIValidation:
         assert "details" in event
 
     def test_result_field_in_table_output(self):
-        """Verify that result column shows 'succeeded' in table format."""
+        """Verify that result column shows the harden command outcome."""
         since = iso_now()
         time.sleep(0.05)
-        run_cli("harden")
+        harden_result = run_cli("harden")
+        expected_result = _expected_event_result(harden_result)
         time.sleep(0.1)
 
         result = run_cli("events", "--event-type", "harden", "--since", since)
         assert result.returncode == 0
 
-        # Table output should contain RESULT column with 'succeeded'
+        # Table output should contain RESULT column with the command outcome.
         assert "RESULT" in result.stdout
-        assert "succeeded" in result.stdout
+        assert expected_result in result.stdout
 
 
 # ---------------------------------------------------------------------------
@@ -405,7 +417,8 @@ class TestEventsDefaultOutput:
         """TC-005: Default output is human-readable table format."""
         since = iso_now()
         time.sleep(0.05)
-        run_cli("harden")
+        harden_result = run_cli("harden")
+        expected_result = _expected_event_result(harden_result)
         time.sleep(0.1)
 
         result = run_cli("events", "--event-type", "harden", "--since", since)
@@ -417,7 +430,7 @@ class TestEventsDefaultOutput:
         assert len(lines) == 4
         assert lines[0].startswith("EVENT_TYPE")
         assert "harden" in lines[1]
-        assert "succeeded" in lines[1]
+        assert expected_result in lines[1]
         assert "1 event" in lines[3]
 
     def test_json_output_completeness(self):
@@ -428,8 +441,8 @@ class TestEventsDefaultOutput:
         - Whether harden ran in scan or reinforce mode
         - The actual output from the harden command
 
-        We verify core fields that ALWAYS exist, and make statistical
-        fields (passed/failed/total) conditional.
+        We verify core fields that ALWAYS exist, and make seharden summary
+        statistics conditional.
         """
         since = iso_now()
         time.sleep(0.05)
@@ -467,9 +480,8 @@ class TestEventsDefaultOutput:
         result_data = event["details"]["result"]
         assert "argv" in result_data or "mode" in result_data
 
-        # Statistical fields (passed/failed/total) only present if loongshield
-        # is installed and harden completed successfully
-        # When loongshield is missing, harden may exit 127 without stats
+        # Statistical fields are present when loongshield emits a parseable
+        # seharden summary. A non-compliant scan may still exit 1 with stats.
         if "passed" in result_data:
             # If one statistical field exists, all should exist
             assert (
@@ -485,7 +497,7 @@ class TestEventsDefaultOutput:
         """TC-006 (extended): When loongshield is installed, verify full stats.
 
         This test validates that when loongshield is available, the harden
-        event contains complete statistical data (passed/failed/total fields).
+        event contains complete parsed seharden summary statistics.
         """
         require_loongshield()
 
@@ -502,18 +514,34 @@ class TestEventsDefaultOutput:
         events = json.loads(result.stdout)
         assert len(events) == 1
 
-        # With loongshield, statistical fields should be present
+        # With loongshield, statistical fields should be present when seharden
+        # emits a parseable summary.
         result_data = events[0]["details"]["result"]
         assert "passed" in result_data, "Expected 'passed' field with loongshield"
         assert "failed" in result_data, "Expected 'failed' field with loongshield"
+        assert "fixed" in result_data, "Expected 'fixed' field with loongshield"
+        assert "manual" in result_data, "Expected 'manual' field with loongshield"
+        assert (
+            "dry_run_pending" in result_data
+        ), "Expected 'dry_run_pending' field with loongshield"
         assert "total" in result_data, "Expected 'total' field with loongshield"
 
         # Validate data types and consistency
         assert isinstance(result_data["passed"], int)
         assert isinstance(result_data["failed"], int)
+        assert isinstance(result_data["fixed"], int)
+        assert isinstance(result_data["manual"], int)
+        assert isinstance(result_data["dry_run_pending"], int)
         assert isinstance(result_data["total"], int)
         assert result_data["total"] > 0, "Total rules should be > 0"
-        assert result_data["passed"] + result_data["failed"] == result_data["total"]
+        assert (
+            result_data["passed"]
+            + result_data["fixed"]
+            + result_data["failed"]
+            + result_data["manual"]
+            + result_data["dry_run_pending"]
+            == result_data["total"]
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -564,7 +592,6 @@ class TestEventsTimeRange:
 
     def test_last_hours_decimal_precision(self):
         """TC-008: --last-hours works with decimal values."""
-        since = iso_now()
         time.sleep(0.05)
         run_cli("harden")
         time.sleep(0.1)

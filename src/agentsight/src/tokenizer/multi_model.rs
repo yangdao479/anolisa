@@ -10,7 +10,6 @@ use anyhow::{Result, anyhow};
 use hf_hub::api::sync::{Api, ApiBuilder};
 use once_cell::sync::OnceCell;
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 static GLOBAL_TOKENIZER: OnceCell<Mutex<MultiModelTokenizer>> = OnceCell::new();
@@ -124,7 +123,7 @@ impl MultiModelTokenizer {
 
         // Map model name to HuggingFace model ID
         let hf_model_id = map_to_hf_model_id(model_name);
-        
+
         // Try lookup with HF model ID (in case same HF ID was registered under different name)
         if hf_model_id != model_name {
             if let Some(tokenizer) = self.get(hf_model_id) {
@@ -149,10 +148,7 @@ impl MultiModelTokenizer {
 
         // Return the tokenizer
         self.get(model_name).ok_or_else(|| {
-            anyhow!(
-                "Failed to get tokenizer after registration for model '{}'",
-                model_name
-            )
+            anyhow!("Failed to get tokenizer after registration for model '{model_name}'")
         })
     }
 

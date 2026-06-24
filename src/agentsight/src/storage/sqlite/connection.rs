@@ -21,14 +21,19 @@ pub fn create_connection(path: &Path) -> Result<Connection> {
     // Ensure parent directory exists
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
-            .with_context(|| format!("Failed to create directory: {:?}", parent))?;
+            .with_context(|| format!("Failed to create directory: {parent:?}"))?;
     }
 
     let conn =
-        Connection::open(path).with_context(|| format!("Failed to open SQLite: {:?}", path))?;
+        Connection::open(path).with_context(|| format!("Failed to open SQLite: {path:?}"))?;
 
     // Enable WAL mode for better concurrent read performance
     conn.execute_batch("PRAGMA journal_mode=WAL;")?;
+
+    // Allow readers to retry briefly on transient write locks (VACUUM, checkpoint)
+    // rather than failing with SQLITE_BUSY immediately. 500ms matches the tokenless
+    // stats store and is long enough to ride out a typical prune-time VACUUM.
+    conn.busy_timeout(std::time::Duration::from_millis(500))?;
 
     Ok(conn)
 }
@@ -56,15 +61,15 @@ mod tests {
     #[test]
     fn test_create_connection() {
         let test_path = PathBuf::from("/tmp/test_agentsight_connection.db");
-        
+
         // Clean up if exists
         let _ = fs::remove_file(&test_path);
-        
+
         let conn = create_connection(&test_path).unwrap();
         drop(conn);
-        
+
         assert!(test_path.exists());
-        
+
         // Cleanup
         fs::remove_file(&test_path).ok();
     }

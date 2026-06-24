@@ -1,22 +1,25 @@
 """Unit tests for security_events.sqlite_writer — SqliteEventWriter."""
 
-import io
 import json
+import logging
 import sqlite3
 import stat
-import sys
 import threading
 import time
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
+import agent_sec_cli.security_events.sqlite_writer as sqlite_writer_module
 import pytest
 from agent_sec_cli.security_events.schema import SecurityEvent
 from agent_sec_cli.security_events.sqlite_writer import SqliteEventWriter
 from sqlalchemy.exc import DatabaseError, SQLAlchemyError
+
+SQLITE_WRITER_LOGGER = "agent_sec_cli.security_events.sqlite_writer"
 
 
 def _make_event(
@@ -30,14 +33,33 @@ def _make_event(
     )
 
 
+def _busy_database_error(message: str = "database is locked") -> DatabaseError:
+    class BusyError(Exception):
+        sqlite_errorcode = sqlite3.SQLITE_BUSY
+
+    return DatabaseError("INSERT", {}, BusyError(message))
+
+
+def _locked_database_error(message: str = "database table is locked") -> DatabaseError:
+    class LockedError(Exception):
+        sqlite_errorcode = sqlite3.SQLITE_LOCKED
+
+    return DatabaseError("INSERT", {}, LockedError(message))
+
+
 @pytest.fixture()
 def db_path(tmp_path: Path) -> str:
     return str(tmp_path / "test.db")
 
 
 class TestSqliteEventWriter:
-    def test_write_with_invalid_timestamp(self, db_path: str) -> None:
-        """Verify that invalid timestamps are caught and logged to stderr."""
+    def test_write_with_invalid_timestamp(
+        self,
+        db_path: str,
+        caplog: pytest.LogCaptureFixture,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Invalid timestamps are dropped without writing to stderr."""
         writer = SqliteEventWriter(path=db_path)
 
         # Create event with malformed timestamp
@@ -48,26 +70,32 @@ class TestSqliteEventWriter:
             timestamp="not-a-valid-timestamp",
         )
 
-        # Capture stderr
-        old_stderr = sys.stderr
-        sys.stderr = io.StringIO()
-
-        try:
+        with caplog.at_level(logging.WARNING, logger=SQLITE_WRITER_LOGGER):
             writer.write(evt)
-            stderr_output = sys.stderr.getvalue()
-        finally:
-            sys.stderr = old_stderr
 
-        # Should print warning to stderr
-        assert "invalid event params" in stderr_output
+        assert capsys.readouterr().err == ""
+        matching = [
+            record
+            for record in caplog.records
+            if record.name == SQLITE_WRITER_LOGGER
+            and record.message == "sqlite write dropped security event"
+        ]
+        assert len(matching) == 1
+        assert matching[0].data["phase"] == "insert"
+        assert matching[0].data["event_id"] == evt.event_id
 
         # DB file should not be created since write fails before connection
         assert not Path(db_path).exists()
 
         writer.close()
 
-    def test_write_with_non_serializable_details(self, db_path: str) -> None:
-        """Verify that non-serializable details are caught and logged."""
+    def test_write_with_non_serializable_details(
+        self,
+        db_path: str,
+        caplog: pytest.LogCaptureFixture,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Non-serializable details are dropped without writing to stderr."""
         writer = SqliteEventWriter(path=db_path)
 
         # Create event with non-serializable details (custom object)
@@ -80,18 +108,19 @@ class TestSqliteEventWriter:
             details={"obj": CustomObject()},  # json.dumps will fail
         )
 
-        # Capture stderr
-        old_stderr = sys.stderr
-        sys.stderr = io.StringIO()
-
-        try:
+        with caplog.at_level(logging.WARNING, logger=SQLITE_WRITER_LOGGER):
             writer.write(evt)
-            stderr_output = sys.stderr.getvalue()
-        finally:
-            sys.stderr = old_stderr
 
-        # Should print warning to stderr
-        assert "invalid event params" in stderr_output
+        assert capsys.readouterr().err == ""
+        matching = [
+            record
+            for record in caplog.records
+            if record.name == SQLITE_WRITER_LOGGER
+            and record.message == "sqlite write dropped security event"
+        ]
+        assert len(matching) == 1
+        assert matching[0].data["phase"] == "insert"
+        assert matching[0].data["event_id"] == evt.event_id
 
         # DB file should not be created since write fails before connection
         assert not Path(db_path).exists()
@@ -104,7 +133,7 @@ class TestSqliteEventWriter:
         This is a critical data integrity test — validates the entire
         SecurityEvent conversion and INSERT correctness.
         """
-        writer = SqliteEventWriter(path=db_path)
+        writer = SqliteEventWriter(path=db_path, max_age_days=None)
 
         # Create a comprehensive event with all fields
         evt = SecurityEvent(
@@ -114,6 +143,9 @@ class TestSqliteEventWriter:
             timestamp="2026-04-20T13:47:00.123456+00:00",
             trace_id="test-trace-123",
             session_id="session-abc",
+            run_id="run-abc",
+            call_id="call-abc",
+            tool_call_id="tool-abc",
             details={
                 "nested": {"key": "value"},
                 "list": [1, 2, 3],
@@ -143,6 +175,9 @@ class TestSqliteEventWriter:
         assert row["pid"] == evt.pid
         assert row["uid"] == evt.uid
         assert row["session_id"] == "session-abc"
+        assert row["run_id"] == "run-abc"
+        assert row["call_id"] == "call-abc"
+        assert row["tool_call_id"] == "tool-abc"
 
         # Verify timestamp_epoch is correct
         expected_epoch = datetime.fromisoformat(evt.timestamp).timestamp()
@@ -201,6 +236,34 @@ class TestSqliteEventWriter:
         # Should not raise
         writer.write(_make_event())
 
+    def test_write_swallows_unexpected_insert_exception(
+        self,
+        db_path: str,
+        caplog: pytest.LogCaptureFixture,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        event = _make_event(event_type="unexpected_insert_error")
+        writer = SqliteEventWriter(path=db_path)
+
+        def raise_runtime_error(_event: SecurityEvent) -> bool:
+            raise RuntimeError("unexpected insert failure")
+
+        monkeypatch.setattr(writer._repository, "insert", raise_runtime_error)
+
+        with caplog.at_level(logging.WARNING, logger=SQLITE_WRITER_LOGGER):
+            writer.write(event)
+
+        matching = [
+            record
+            for record in caplog.records
+            if record.name == SQLITE_WRITER_LOGGER
+            and record.message == "sqlite write dropped security event"
+        ]
+        assert len(matching) == 1
+        assert matching[0].data["phase"] == "insert"
+        assert matching[0].data["event_id"] == event.event_id
+        assert matching[0].data["error_type"] == "RuntimeError"
+
     def test_insert_or_ignore_dedup(self, db_path: str) -> None:
         writer = SqliteEventWriter(path=db_path)
         evt = _make_event()
@@ -242,9 +305,11 @@ class TestSqliteEventWriter:
         assert count == 100
         writer.close()
 
-    def test_concurrent_writes_from_independent_writers(self, db_path: str) -> None:
-        writer_count = 8
-        events_per_writer = 25
+    def test_concurrent_writes_from_independent_writers(
+        self, db_path: str, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        writer_count = 16
+        events_per_writer = 50
         warmup_writer = SqliteEventWriter(path=db_path)
         warmup_writer.write(
             SecurityEvent(
@@ -270,17 +335,18 @@ class TestSqliteEventWriter:
                     )
                 )
 
-        try:
-            with ThreadPoolExecutor(max_workers=writer_count) as executor:
-                futures = [
-                    executor.submit(write_events, writer_id)
-                    for writer_id in range(writer_count)
-                ]
-                for future in as_completed(futures):
-                    future.result()
-        finally:
-            for writer in writers:
-                writer.close()
+        with caplog.at_level(logging.WARNING, logger=SQLITE_WRITER_LOGGER):
+            try:
+                with ThreadPoolExecutor(max_workers=writer_count) as executor:
+                    futures = [
+                        executor.submit(write_events, writer_id)
+                        for writer_id in range(writer_count)
+                    ]
+                    for future in as_completed(futures):
+                        future.result()
+            finally:
+                for writer in writers:
+                    writer.close()
 
         conn = sqlite3.connect(db_path)
         total, distinct_ids = conn.execute(
@@ -290,8 +356,14 @@ class TestSqliteEventWriter:
         conn.close()
 
         expected = writer_count * events_per_writer
-        assert total == expected
-        assert distinct_ids == expected
+        busy_wait_records = [
+            record
+            for record in caplog.records
+            if record.name == SQLITE_WRITER_LOGGER
+            and record.message == "sqlite busy dropped security event"
+        ]
+        assert total + len(busy_wait_records) == expected
+        assert distinct_ids == total
 
     def test_concurrent_cold_bootstrap_is_best_effort(
         self, db_path: str, capsys: pytest.CaptureFixture[str]
@@ -412,6 +484,99 @@ class TestSqliteEventWriter:
         assert "timestamp_epoch" in columns
         writer.close()
 
+    def test_security_events_has_tracing_columns_and_indexes(
+        self, db_path: str
+    ) -> None:
+        writer = SqliteEventWriter(path=db_path)
+        writer.write(
+            SecurityEvent(
+                event_type="code_scan",
+                category="code_scan",
+                details={},
+                trace_id="trace-1",
+                session_id="session-1",
+                run_id="run-1",
+                call_id="call-1",
+                tool_call_id="tool-1",
+            )
+        )
+        writer.close()
+
+        conn = sqlite3.connect(db_path)
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(security_events)")}
+        indexes = {row[1] for row in conn.execute("PRAGMA index_list(security_events)")}
+        user_version = conn.execute("PRAGMA user_version").fetchone()[0]
+        conn.close()
+
+        assert user_version == 2
+        assert {"session_id", "run_id", "call_id", "tool_call_id"}.issubset(columns)
+        assert "idx_session_id_timestamp_epoch" in indexes
+        assert "idx_run_id_timestamp_epoch" in indexes
+        assert "idx_session_run_timestamp_epoch" in indexes
+        assert "idx_call_id_not_null" not in indexes
+        assert "idx_tool_call_id_not_null" not in indexes
+
+    def test_v1_database_migrates_on_write_and_preserves_old_rows(
+        self, db_path: str
+    ) -> None:
+        conn = sqlite3.connect(db_path)
+        conn.executescript("""
+            CREATE TABLE security_events (
+                event_id TEXT PRIMARY KEY,
+                event_type TEXT NOT NULL,
+                category TEXT NOT NULL,
+                result TEXT NOT NULL DEFAULT 'succeeded',
+                timestamp TEXT NOT NULL,
+                timestamp_epoch FLOAT NOT NULL,
+                trace_id TEXT NOT NULL DEFAULT '',
+                pid INTEGER NOT NULL,
+                uid INTEGER NOT NULL,
+                session_id TEXT,
+                details TEXT NOT NULL
+            );
+            PRAGMA user_version = 1;
+            """)
+        conn.execute("""
+            INSERT INTO security_events (
+                event_id, event_type, category, result, timestamp, timestamp_epoch,
+                trace_id, pid, uid, session_id, details
+            ) VALUES (
+                'old-event', 'code_scan', 'code_scan', 'succeeded',
+                '2026-05-19T00:00:00+00:00', 1779148800.0,
+                'old-trace', 1, 1, 'old-session', '{}'
+            )
+            """)
+        conn.commit()
+        conn.close()
+
+        writer = SqliteEventWriter(path=db_path, max_age_days=None)
+        writer.write(
+            SecurityEvent(
+                event_type="prompt_scan",
+                category="prompt_scan",
+                details={},
+                trace_id="new-trace",
+                session_id="new-session",
+                run_id="new-run",
+                call_id="new-call",
+                tool_call_id="new-tool",
+            )
+        )
+        writer.close()
+
+        conn = sqlite3.connect(db_path)
+        rows = conn.execute(
+            "SELECT event_id, run_id FROM security_events ORDER BY event_id"
+        ).fetchall()
+        user_version = conn.execute("PRAGMA user_version").fetchone()[0]
+        conn.close()
+
+        assert user_version == 2
+        assert ("old-event", None) in rows
+        assert any(
+            event_id != "old-event" and run_id == "new-run" for event_id, run_id in rows
+        )
+
     def test_schema_repairs_missing_indexes(self, db_path: str) -> None:
         conn = sqlite3.connect(db_path)
         conn.execute(
@@ -451,7 +616,7 @@ class TestSqliteEventWriter:
 
     def test_schema_error_requests_repair_for_next_write(self, db_path: str) -> None:
         conn = sqlite3.connect(db_path)
-        conn.execute("PRAGMA user_version = 1")
+        conn.execute("PRAGMA user_version = 2")
         conn.commit()
         conn.close()
 
@@ -491,6 +656,62 @@ class TestSqliteEventWriter:
         assert writer._engine is None
         assert writer._session_factory is None
 
+    def test_close_runs_prune_and_checkpoint_through_maintenance_gate(
+        self,
+        db_path: str,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        writer = SqliteEventWriter(path=db_path)
+        writer.write(_make_event())
+        gated_paths: list[Path] = []
+
+        def fake_run_sqlite_maintenance_if_due(
+            db_path_arg: str | Path,
+            maintenance: Callable[[], None],
+            *,
+            interval_seconds: float = 0,
+            now: float | None = None,
+        ) -> bool:
+            gated_paths.append(Path(db_path_arg))
+            maintenance()
+            return True
+
+        monkeypatch.setattr(
+            sqlite_writer_module,
+            "run_sqlite_maintenance_if_due",
+            fake_run_sqlite_maintenance_if_due,
+            raising=False,
+        )
+
+        writer.close()
+
+        assert gated_paths == [Path(db_path).resolve()]
+        assert writer._engine is None
+        assert writer._session_factory is None
+
+    def test_close_skips_repeated_maintenance_for_same_db_path(
+        self,
+        db_path: str,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        first_writer = SqliteEventWriter(path=db_path)
+        first_writer.write(_make_event())
+        first_writer.close()
+
+        second_writer = SqliteEventWriter(path=db_path)
+        second_writer.write(_make_event(event_type="second_event"))
+
+        def fail_if_maintenance_runs() -> None:
+            raise AssertionError("maintenance should be skipped while marker is fresh")
+
+        monkeypatch.setattr(
+            second_writer,
+            "_run_maintenance",
+            fail_if_maintenance_runs,
+        )
+
+        second_writer.close()
+
     def test_disabled_after_delete_failure(self, db_path: str) -> None:
         writer = SqliteEventWriter(path=db_path)
         writer.write(_make_event())
@@ -511,18 +732,6 @@ class TestSqliteEventWriter:
 
         # Subsequent writes should be no-ops
         writer2.write(_make_event())
-
-    def test_store_helpers_delegate_to_store(self, db_path: str) -> None:
-        writer = SqliteEventWriter(path=db_path)
-        writer.write(_make_event())
-        assert writer._engine is not None
-        assert writer._session_factory is not None
-        assert writer._ensure_session_factory() is writer._session_factory
-        assert not writer._disabled
-
-        writer._dispose_engine()
-        assert writer._engine is None
-        assert writer._session_factory is None
 
     def test_write_retries_after_corruption_error(
         self, db_path: str, monkeypatch: pytest.MonkeyPatch
@@ -546,6 +755,144 @@ class TestSqliteEventWriter:
         writer.write(_make_event())
 
         assert calls == 2
+
+    def test_write_logs_busy_insert_loss(
+        self,
+        db_path: str,
+        caplog: pytest.LogCaptureFixture,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        event = _make_event(event_type="busy_insert")
+        writer = SqliteEventWriter(path=db_path)
+
+        def raise_busy(_event: SecurityEvent) -> bool:
+            raise _busy_database_error()
+
+        monkeypatch.setattr(writer._repository, "insert", raise_busy)
+
+        with caplog.at_level(logging.WARNING, logger=SQLITE_WRITER_LOGGER):
+            writer.write(event)
+
+        matching = [
+            record
+            for record in caplog.records
+            if record.name == SQLITE_WRITER_LOGGER
+            and record.message == "sqlite busy dropped security event"
+        ]
+        assert len(matching) == 1
+        record = matching[0]
+        # Domain fields live under `data` in the new schema; trace_id stays
+        # top-level via the correlation slot.
+        assert record.data["phase"] == "insert"
+        assert record.data["event_id"] == event.event_id
+        assert record.data["event_type"] == "busy_insert"
+        assert record.data["category"] == event.category
+        assert record.data["error_type"] == "BusyError"
+
+    def test_write_logs_busy_session_factory_loss(
+        self,
+        db_path: str,
+        caplog: pytest.LogCaptureFixture,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        event = _make_event(event_type="busy_session_factory")
+        writer = SqliteEventWriter(path=db_path)
+
+        def raise_locked(_db_identity: tuple[int, int] | None) -> None:
+            raise _locked_database_error()
+
+        monkeypatch.setattr(writer._store, "_open_session_factory", raise_locked)
+
+        with caplog.at_level(logging.WARNING, logger=SQLITE_WRITER_LOGGER):
+            writer.write(event)
+
+        matching = [
+            record
+            for record in caplog.records
+            if record.name == SQLITE_WRITER_LOGGER
+            and record.message == "sqlite busy dropped security event"
+        ]
+        assert len(matching) == 1
+        record = matching[0]
+        assert record.data["phase"] == "insert"
+        assert record.data["event_id"] == event.event_id
+        assert record.data["event_type"] == "busy_session_factory"
+        assert record.data["error_type"] == "LockedError"
+
+    def test_write_logs_busy_corruption_retry_loss(
+        self,
+        db_path: str,
+        caplog: pytest.LogCaptureFixture,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        class CorruptError(Exception):
+            sqlite_errorcode = sqlite3.SQLITE_CORRUPT
+
+        event = _make_event(event_type="busy_corruption_retry")
+        writer = SqliteEventWriter(path=db_path)
+        calls = 0
+        dispose_calls: list[None] = []
+
+        def corrupt_then_busy(_event: SecurityEvent) -> bool:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise DatabaseError("INSERT", {}, CorruptError())
+            raise _busy_database_error()
+
+        def _track_dispose() -> None:
+            dispose_calls.append(None)
+
+        monkeypatch.setattr(writer._repository, "insert", corrupt_then_busy)
+        monkeypatch.setattr(writer._store, "handle_corruption", lambda _exc: None)
+        monkeypatch.setattr(writer._store, "dispose", _track_dispose)
+
+        with caplog.at_level(logging.WARNING, logger=SQLITE_WRITER_LOGGER):
+            writer.write(event)
+
+        matching = [
+            record
+            for record in caplog.records
+            if record.name == SQLITE_WRITER_LOGGER
+            and record.message == "sqlite busy dropped security event"
+        ]
+        assert len(matching) == 1
+        record = matching[0]
+        assert record.data["phase"] == "corruption_retry"
+        assert record.data["event_id"] == event.event_id
+        assert record.data["event_type"] == "busy_corruption_retry"
+        assert record.data["error_type"] == "BusyError"
+        assert dispose_calls == []
+
+    def test_write_disposes_on_corruption_retry_error(
+        self, db_path: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        class CorruptError(Exception):
+            sqlite_errorcode = sqlite3.SQLITE_CORRUPT
+
+        event = _make_event(event_type="corruption_retry_error")
+        writer = SqliteEventWriter(path=db_path)
+        calls = 0
+        dispose_calls: list[None] = []
+
+        def corrupt_then_sqlalchemy(_event: SecurityEvent) -> bool:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise DatabaseError("INSERT", {}, CorruptError())
+            raise SQLAlchemyError("retry driver fault")
+
+        def _track_dispose() -> None:
+            dispose_calls.append(None)
+
+        monkeypatch.setattr(writer._repository, "insert", corrupt_then_sqlalchemy)
+        monkeypatch.setattr(writer._store, "handle_corruption", lambda _exc: None)
+        monkeypatch.setattr(writer._store, "dispose", _track_dispose)
+
+        writer.write(event)
+
+        assert calls == 2
+        assert len(dispose_calls) == 1
 
     def test_write_disposes_on_sqlalchemy_error(
         self, db_path: str, monkeypatch: pytest.MonkeyPatch

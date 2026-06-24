@@ -1,38 +1,46 @@
 use regex::Regex;
 use serde_json::Value;
-use std::collections::HashSet;
+use std::sync::LazyLock;
+
+static CODE_BLOCK_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"```[\s\S]*?```").unwrap());
+static INLINE_CODE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"`[^`]+`").unwrap());
+static WHITESPACE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s+").unwrap());
+
+/// Convert a character count `n` to a byte offset in `s`. Returns `s.len()`
+/// when `n` exceeds the number of characters.
+fn char_index(s: &str, n: usize) -> usize {
+    s.char_indices().nth(n).map(|(i, _)| i).unwrap_or(s.len())
+}
 
 /// SchemaCompressor compresses OpenAI Function Calling schema
 /// by truncating descriptions, removing titles/examples, and applying
 /// smart compression to reduce token usage.
 pub struct SchemaCompressor {
-    #[allow(dead_code)]
-    protected_fields: HashSet<&'static str>,
     func_desc_max_len: usize,
     param_desc_max_len: usize,
     drop_examples: bool,
     drop_titles: bool,
     drop_markdown: bool,
+    max_depth: usize,
 }
 
 impl Default for SchemaCompressor {
     fn default() -> Self {
-        let mut protected_fields = HashSet::new();
-        protected_fields.insert("name");
-        protected_fields.insert("type");
-        protected_fields.insert("required");
-        protected_fields.insert("enum");
-        protected_fields.insert("default");
-        protected_fields.insert("properties");
-        protected_fields.insert("const");
-
         Self {
-            protected_fields,
             func_desc_max_len: 256,
             param_desc_max_len: 160,
             drop_examples: true,
             drop_titles: true,
             drop_markdown: true,
+            // Bound recursion to keep deeply-nested or pathological schemas
+            // (e.g. attacker-crafted ~1000-level JSON) from blowing the stack.
+            // Schemas tolerate more depth than runtime responses because
+            // OpenAPI/JSON-Schema definitions legitimately stack anyOf /
+            // oneOf / allOf branches several layers deep — 8 (the
+            // ResponseCompressor default) would truncate real-world tool
+            // descriptions. 32 keeps a wide safety margin below the
+            // ~1024-frame default stack while leaving real schemas intact.
+            max_depth: 32,
         }
     }
 }
@@ -70,6 +78,12 @@ impl SchemaCompressor {
     /// Set whether to drop markdown formatting from descriptions
     pub fn with_drop_markdown(mut self, drop: bool) -> Self {
         self.drop_markdown = drop;
+        self
+    }
+
+    /// Set the maximum recursion depth for nested schemas
+    pub fn with_max_depth(mut self, depth: usize) -> Self {
+        self.max_depth = depth;
         self
     }
 
@@ -137,6 +151,16 @@ impl SchemaCompressor {
 
     /// Recursively compress a JSON Schema
     pub fn compress_json_schema(&self, schema: &mut Value, depth: usize) {
+        // Stack-overflow guard for pathological schemas. Beyond max_depth we
+        // stop descending — the deepest nodes keep their original shape, which
+        // is acceptable since this path is best-effort token reduction.
+        // Use `>` (not `>=`) so the threshold matches response_compressor.rs
+        // semantics: a node at depth==max_depth is still processed, only its
+        // grandchildren (depth+1 > max_depth) are skipped.
+        if depth > self.max_depth {
+            return;
+        }
+
         let Some(obj) = schema.as_object_mut() else {
             return;
         };
@@ -217,30 +241,29 @@ impl SchemaCompressor {
         // Trim whitespace
         let mut text = desc.trim().to_string();
 
-        // Remove markdown code blocks if configured
         if self.drop_markdown {
-            // Remove fenced code blocks: ```...```
-            let code_block_re = Regex::new(r"```[\s\S]*?```").unwrap();
-            text = code_block_re.replace_all(&text, "").to_string();
-
-            // Remove inline code: `...`
-            let inline_code_re = Regex::new(r"`[^`]+`").unwrap();
-            text = inline_code_re.replace_all(&text, "").to_string();
+            text = CODE_BLOCK_RE.replace_all(&text, "").to_string();
+            text = INLINE_CODE_RE.replace_all(&text, "").to_string();
         }
 
-        // Collapse multiple whitespace/newlines into single space
-        let whitespace_re = Regex::new(r"\s+").unwrap();
-        text = whitespace_re.replace_all(&text, " ").to_string();
+        text = WHITESPACE_RE.replace_all(&text, " ").to_string();
         text = text.trim().to_string();
 
-        // If already within limit, return as-is
-        if text.len() <= max_len {
+        // If already within limit, return as-is (use char count, not byte length)
+        if text.chars().count() <= max_len {
             return text;
         }
 
         // Try to find a sentence boundary in the range [max_len*0.5, max_len]
-        let min_pos = (max_len as f64 * 0.5) as usize;
-        let search_range = &text[min_pos..max_len.min(text.len())];
+        // Convert char counts to byte positions via char_index so the search
+        // range and hard-truncation fallback use correct byte offsets even for
+        // multi-byte text (CJK, emoji, etc.). Previously max_len was passed
+        // directly as a byte position, truncating CJK text far more
+        // aggressively than expected (e.g. 300 chars cut to ~85 instead of 256).
+        let min_target = (max_len as f64 * 0.5) as usize;
+        let min_pos = char_index(&text, min_target);
+        let max_pos = char_index(&text, max_len.min(text.chars().count()));
+        let search_range = &text[min_pos..max_pos];
 
         // Look for sentence endings: . 。 ！ ？
         let sentence_endings = ['.', '。', '！', '？'];
@@ -257,13 +280,8 @@ impl SchemaCompressor {
             return text[..pos].trim().to_string();
         }
 
-        // No sentence boundary found, hard truncate
-        // Handle UTF-8 properly by finding char boundary
-        let mut truncate_pos = max_len;
-        while !text.is_char_boundary(truncate_pos) && truncate_pos > 0 {
-            truncate_pos -= 1;
-        }
-
+        // No sentence boundary found, hard truncate at max_len characters
+        let truncate_pos = char_index(&text, max_len);
         text[..truncate_pos].trim().to_string()
     }
 }
@@ -545,5 +563,52 @@ mod tests {
                 .get("title")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn max_depth_stops_recursion() {
+        // Build a 100-level schema and verify with_max_depth bounds the
+        // recursive descent — descriptions below the limit must be left
+        // untouched, descriptions above must be truncated.
+        let compressor = SchemaCompressor::new().with_max_depth(5);
+        let long_desc = "x".repeat(400);
+        let mut schema = json!({
+            "type": "string",
+            "description": long_desc.clone(),
+        });
+        for _ in 0..100 {
+            schema = json!({
+                "type": "object",
+                "description": long_desc.clone(),
+                "properties": {"nested": schema},
+            });
+        }
+        let result = compressor.compress(&schema);
+        // Top-level description (depth 0) must be truncated.
+        let top = result["description"].as_str().unwrap();
+        assert!(top.chars().count() <= 256);
+        // Walk down 10 levels — well past max_depth — and confirm we still
+        // see the original 400-char description (recursion stopped early).
+        let mut node = &result;
+        for _ in 0..10 {
+            node = &node["properties"]["nested"];
+        }
+        let deep = node["description"].as_str().unwrap();
+        assert_eq!(deep.chars().count(), 400);
+    }
+
+    #[test]
+    fn truncate_description_cjk_no_panic() {
+        let compressor = SchemaCompressor::new();
+        // 100 CJK chars fit within 256-char limit — no truncation needed
+        let cjk = "中".repeat(100);
+        let result = compressor.truncate_description(&cjk, 256);
+        assert!(result.chars().all(|c| c == '中'));
+        assert!(result.chars().count() <= 256);
+
+        // 300 CJK chars exceed 256-char limit — should be truncated
+        let cjk_long = "中".repeat(300);
+        let result_long = compressor.truncate_description(&cjk_long, 256);
+        assert!(result_long.chars().count() <= 256);
     }
 }

@@ -13,6 +13,7 @@ Tests are grouped into three categories:
    hook's decision/reason output for every known status.
 """
 
+import io
 import json
 import os
 import stat
@@ -33,13 +34,15 @@ _COSH_HOOK = str(
     / "skill_ledger_hook.py"
 )
 
+sys.path.insert(0, str(Path(_COSH_HOOK).parent))
+import skill_ledger_hook  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 
-def _run_hook(input_data, *, env_override=None):
+def _run_hook(input_data, *, env_override=None, return_stderr=False):
     """Run the hook as a subprocess with *input_data* as stdin JSON.
 
     Returns the parsed JSON output dict.
@@ -51,35 +54,111 @@ def _run_hook(input_data, *, env_override=None):
         [sys.executable, _COSH_HOOK],
         input=json.dumps(input_data) if isinstance(input_data, dict) else input_data,
         capture_output=True,
+        check=False,
         text=True,
         timeout=15,
         env=env,
     )
     assert proc.returncode == 0, f"Hook stderr: {proc.stderr}"
-    return json.loads(proc.stdout)
+    output = json.loads(proc.stdout)
+    if return_stderr:
+        return output, proc.stderr
+    return output
 
 
-def _make_skill_event(skill_name, cwd="."):
+def _make_skill_event(skill_name, cwd=".", skill_file_path=None):
     """Build a minimal PreToolUse event for the skill tool."""
-    return {
+    event = {
         "hook_event_name": "PreToolUse",
         "tool_name": "skill",
         "tool_input": {"skill": skill_name},
         "cwd": cwd,
     }
+    if skill_file_path is not None:
+        event["skill_context"] = {
+            "skill_name": skill_name,
+            "file_path": str(skill_file_path),
+        }
+    return event
 
 
-def _create_skill_dir(parent, name="test-skill"):
+def _create_skill_dir(parent, name="test-skill", manifest_name=None):
     """Create a minimal skill directory with a SKILL.md file.
 
     Returns the absolute path to ``<parent>/.copilot-shell/skills/<name>/``.
     """
+    manifest_name = manifest_name or name
     skill_dir = Path(parent) / ".copilot-shell" / "skills" / name
     skill_dir.mkdir(parents=True, exist_ok=True)
     (skill_dir / "SKILL.md").write_text(
-        "---\nname: test-skill\ndescription: A test skill\n---\nHello\n"
+        f"---\nname: {manifest_name}\ndescription: A test skill\n---\nHello\n"
     )
     return str(skill_dir)
+
+
+def test_injects_trace_context_into_skill_ledger_check_command(monkeypatch, capsys):
+    captured = {}
+
+    def fake_run(args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return subprocess.CompletedProcess(
+            args=args,
+            returncode=0,
+            stdout=json.dumps({"status": "pass"}),
+            stderr="",
+        )
+
+    monkeypatch.setattr(skill_ledger_hook, "_ensure_keys", lambda _input_data: None)
+    monkeypatch.setattr(
+        skill_ledger_hook,
+        "_resolve_skill_dir",
+        lambda _skill_name, _cwd: ("/project/.copilot-shell/skills/test-skill", False),
+    )
+    monkeypatch.setattr(skill_ledger_hook.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        skill_ledger_hook.sys,
+        "stdin",
+        io.StringIO(
+            json.dumps(
+                {
+                    "hook_event_name": "PreToolUse",
+                    "tool_name": "skill",
+                    "tool_input": {"skill": "test-skill"},
+                    "cwd": "/project",
+                    "trace_id": "trace-1",
+                    "session_id": "session-1",
+                    "run_id": "run-1",
+                    "tool_use_id": "tool-1",
+                }
+            )
+        ),
+    )
+
+    skill_ledger_hook.main()
+
+    output = json.loads(capsys.readouterr().out)
+    expected_context = json.dumps(
+        {
+            "agent_name": "cosh",
+            "trace_id": "trace-1",
+            "session_id": "session-1",
+            "run_id": "run-1",
+            "tool_call_id": "tool-1",
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    assert output == {"decision": "allow"}
+    assert captured["args"] == [
+        "agent-sec-cli",
+        "--trace-context",
+        expected_context,
+        "skill-ledger",
+        "check",
+        "/project/.copilot-shell/skills/test-skill",
+    ]
+    assert captured["kwargs"]["check"] is False
 
 
 # ---------------------------------------------------------------------------
@@ -186,6 +265,91 @@ class TestSkillDirResolution:
         assert output["decision"] == "allow"
         assert "reason" in output, "Skill dir not found — CLI was never called"
 
+    def test_skill_context_resolves_name_directory_mismatch(self, mock_cli_env):
+        """skill_context.file_path should locate project skills by real path.
+
+        This covers the case where the Skill tool receives the frontmatter
+        name, but the on-disk directory uses a different name.
+        """
+        skill_dir = _create_skill_dir(
+            mock_cli_env["cwd"],
+            name="directory-name",
+            manifest_name="frontmatter-name",
+        )
+        env = mock_cli_env["make_env"](json.dumps({"status": "warn"}))
+        output = _run_hook(
+            _make_skill_event(
+                "frontmatter-name",
+                mock_cli_env["cwd"],
+                Path(skill_dir) / "SKILL.md",
+            ),
+            env_override=env,
+        )
+        assert output["decision"] == "allow"
+        assert "low-risk" in output["reason"]
+
+    def test_skill_context_skips_only_unresolvable_supported_base(self, mock_cli_env):
+        """A bad project base should not discard user/system base checks."""
+        home = Path(mock_cli_env["cwd"]).parent / "home"
+        skill_dir = home / ".copilot-shell" / "skills" / "user-dir"
+        skill_dir.mkdir(parents=True)
+        skill_file = skill_dir / "SKILL.md"
+        skill_file.write_text(
+            "---\nname: user-skill\ndescription: A user skill\n---\nHello\n"
+        )
+
+        env = mock_cli_env["make_env"](json.dumps({"status": "warn"}))
+        env["HOME"] = str(home)
+        output = _run_hook(
+            _make_skill_event("user-skill", "\0bad-project", skill_file),
+            env_override=env,
+        )
+
+        assert output["decision"] == "allow"
+        assert "low-risk" in output["reason"]
+
+    @pytest.mark.parametrize("scope_name", ["custom", "extension", "remote"])
+    def test_skill_context_outside_supported_scope_debug_skips(
+        self, tmp_path, scope_name
+    ):
+        """custom/extension/remote paths are out of scope for this hook."""
+        home = tmp_path / "home"
+        project = tmp_path / "project"
+        home.mkdir()
+        project.mkdir()
+
+        if scope_name == "custom":
+            skill_dir = tmp_path / "custom-skills" / "custom-skill"
+        elif scope_name == "extension":
+            skill_dir = (
+                home
+                / ".copilot-shell"
+                / "extensions"
+                / "test-ext"
+                / "skills"
+                / "extension-skill"
+            )
+        else:
+            skill_dir = (
+                home / ".copilot-shell" / "remote-skills" / "system" / "remote-skill"
+            )
+
+        skill_dir.mkdir(parents=True)
+        skill_file = skill_dir / "SKILL.md"
+        skill_file.write_text(
+            f"---\nname: {scope_name}-skill\ndescription: A test skill\n---\n"
+        )
+
+        output, stderr = _run_hook(
+            _make_skill_event(f"{scope_name}-skill", str(project), skill_file),
+            env_override={"HOME": str(home)},
+            return_stderr=True,
+        )
+
+        assert output == {"decision": "allow"}
+        assert "outside current skill-ledger hook scope" in stderr
+        assert "project/user/system" in stderr
+
     def test_missing_skill_md_not_found(self):
         """Directory exists but no SKILL.md → not recognized as a skill."""
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -200,11 +364,11 @@ class TestSkillDirResolution:
 
 # A tiny script that pretends to be agent-sec-cli.
 # It reads _MOCK_CHECK_OUTPUT env var and prints it to stdout.
-# For "init-keys", it's a no-op.
+# For "init --no-baseline", it's a no-op.
 _MOCK_CLI_SCRIPT = f"#!{sys.executable}\n" + textwrap.dedent("""\
     import os, sys
-    # init-keys → silent success
-    if len(sys.argv) >= 3 and sys.argv[2] == "init-keys":
+    # init --no-baseline → silent success
+    if len(sys.argv) >= 4 and sys.argv[2] == "init" and sys.argv[3] == "--no-baseline":
         sys.exit(0)
     # check → return canned output from env
     output = os.environ.get("_MOCK_CHECK_OUTPUT", "")
@@ -268,14 +432,14 @@ class TestOutputMapping:
         )
         assert output == {"decision": "allow"}
 
-    def test_none_returns_warning(self, mock_cli_env):
-        """status=none → allow + 'not been security-scanned'."""
+    def test_none_requires_confirmation(self, mock_cli_env):
+        """status=none → ask + 'not been security-scanned'."""
         env = mock_cli_env["make_env"](json.dumps({"status": "none"}))
         output = _run_hook(
             _make_skill_event("test-skill", mock_cli_env["cwd"]),
             env_override=env,
         )
-        assert output["decision"] == "allow"
+        assert output["decision"] == "ask"
         assert "not been security-scanned" in output["reason"]
         assert "test-skill" in output["reason"]
 
@@ -289,34 +453,34 @@ class TestOutputMapping:
         assert output["decision"] == "allow"
         assert "low-risk" in output["reason"]
 
-    def test_deny_returns_warning(self, mock_cli_env):
-        """status=deny → allow + 'high-risk findings'."""
+    def test_deny_requires_confirmation(self, mock_cli_env):
+        """status=deny → ask + 'high-risk findings'."""
         env = mock_cli_env["make_env"](json.dumps({"status": "deny"}), rc=1)
         output = _run_hook(
             _make_skill_event("test-skill", mock_cli_env["cwd"]),
             env_override=env,
         )
-        assert output["decision"] == "allow"
+        assert output["decision"] == "ask"
         assert "high-risk" in output["reason"]
 
-    def test_drifted_returns_warning(self, mock_cli_env):
-        """status=drifted → allow + 'content has changed'."""
+    def test_drifted_requires_confirmation(self, mock_cli_env):
+        """status=drifted → ask + 'content has changed'."""
         env = mock_cli_env["make_env"](json.dumps({"status": "drifted"}), rc=1)
         output = _run_hook(
             _make_skill_event("test-skill", mock_cli_env["cwd"]),
             env_override=env,
         )
-        assert output["decision"] == "allow"
+        assert output["decision"] == "ask"
         assert "changed" in output["reason"]
 
-    def test_tampered_returns_warning(self, mock_cli_env):
-        """status=tampered → allow + 'signature verification failed'."""
+    def test_tampered_requires_confirmation(self, mock_cli_env):
+        """status=tampered → ask + 'signature verification failed'."""
         env = mock_cli_env["make_env"](json.dumps({"status": "tampered"}), rc=1)
         output = _run_hook(
             _make_skill_event("test-skill", mock_cli_env["cwd"]),
             env_override=env,
         )
-        assert output["decision"] == "allow"
+        assert output["decision"] == "ask"
         assert "signature verification failed" in output["reason"]
 
     def test_unknown_status_returns_warning(self, mock_cli_env):

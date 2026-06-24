@@ -36,6 +36,7 @@ describe('WebFetchTool', () => {
       setApprovalMode: vi.fn(),
       getProxy: vi.fn(),
       getGeminiClient: mockGetGeminiClient,
+      getModel: vi.fn(() => 'test-model'),
     } as unknown as Config;
   });
 
@@ -61,18 +62,177 @@ describe('WebFetchTool', () => {
       expect(result.error?.type).toBe(ToolErrorType.WEB_FETCH_FALLBACK_FAILED);
     });
 
-    it('should return WEB_FETCH_FALLBACK_FAILED on API processing failure', async () => {
+    it('should degrade to raw content when sub-model call throws', async () => {
       vi.spyOn(fetchUtils, 'isPrivateIp').mockReturnValue(false);
       vi.spyOn(fetchUtils, 'fetchWithTimeout').mockResolvedValue({
         ok: true,
-        text: () => Promise.resolve('<html><body>Test content</body></html>'),
+        text: () =>
+          Promise.resolve('<html><body>Hello world content</body></html>'),
       } as Response);
       mockGenerateContent.mockRejectedValue(new Error('API error'));
       const tool = new WebFetchTool(mockConfig);
       const params = { url: 'https://public.ip', prompt: 'summarize this' };
       const invocation = tool.build(params);
       const result = await invocation.execute(new AbortController().signal);
-      expect(result.error?.type).toBe(ToolErrorType.WEB_FETCH_FALLBACK_FAILED);
+
+      expect(result.error).toBeUndefined();
+      expect(result.llmContent).toContain(
+        'Sub-model summarization unavailable',
+      );
+      expect(result.llmContent).toContain('sub-model call failed: API error');
+      expect(result.llmContent).toContain('Hello world content');
+      expect(result.returnDisplay).toContain('returned raw content');
+    });
+
+    it('should degrade to raw content when sub-model returns empty text', async () => {
+      vi.spyOn(fetchUtils, 'isPrivateIp').mockReturnValue(false);
+      vi.spyOn(fetchUtils, 'fetchWithTimeout').mockResolvedValue({
+        ok: true,
+        text: () =>
+          Promise.resolve('<html><body>Doc body content</body></html>'),
+      } as Response);
+      mockGenerateContent.mockResolvedValue({
+        candidates: [
+          {
+            finishReason: 'STOP',
+            content: {
+              parts: [{ text: 'inner thought', thought: true }],
+            },
+          },
+        ],
+      });
+      const tool = new WebFetchTool(mockConfig);
+      const params = { url: 'https://public.ip', prompt: 'summarize this' };
+      const invocation = tool.build(params);
+      const result = await invocation.execute(new AbortController().signal);
+
+      expect(result.error).toBeUndefined();
+      expect(result.llmContent).toContain('returned empty text');
+      expect(result.llmContent).toContain('Doc body content');
+    });
+
+    it('should degrade to raw content on non-STOP finishReason', async () => {
+      vi.spyOn(fetchUtils, 'isPrivateIp').mockReturnValue(false);
+      vi.spyOn(fetchUtils, 'fetchWithTimeout').mockResolvedValue({
+        ok: true,
+        text: () =>
+          Promise.resolve('<html><body>Safe doc content</body></html>'),
+      } as Response);
+      mockGenerateContent.mockResolvedValue({
+        candidates: [
+          {
+            finishReason: 'SAFETY',
+            content: { parts: [{ text: 'Cannot answer.' }] },
+          },
+        ],
+      });
+      const tool = new WebFetchTool(mockConfig);
+      const params = { url: 'https://public.ip', prompt: 'summarize this' };
+      const invocation = tool.build(params);
+      const result = await invocation.execute(new AbortController().signal);
+
+      expect(result.error).toBeUndefined();
+      expect(result.llmContent).toContain('finishReason=SAFETY');
+      expect(result.llmContent).toContain('Safe doc content');
+    });
+
+    it('should degrade to raw content when sub-model returns a Chinese refusal', async () => {
+      vi.spyOn(fetchUtils, 'isPrivateIp').mockReturnValue(false);
+      vi.spyOn(fetchUtils, 'fetchWithTimeout').mockResolvedValue({
+        ok: true,
+        text: () =>
+          Promise.resolve(
+            '<html><body>Alinux4 Agentic Edition docs</body></html>',
+          ),
+      } as Response);
+      mockGenerateContent.mockResolvedValue({
+        candidates: [
+          {
+            finishReason: 'STOP',
+            content: {
+              parts: [
+                {
+                  text: '很抱歉，我无法访问外部网站或链接。请您将文档内容粘贴到对话中，我来帮您分析。',
+                },
+              ],
+            },
+          },
+        ],
+      });
+      const tool = new WebFetchTool(mockConfig);
+      const params = {
+        url: 'https://help.aliyun.com/zh/alinux/agentic-os',
+        prompt: 'what is different about agentic edition',
+      };
+      const invocation = tool.build(params);
+      const result = await invocation.execute(new AbortController().signal);
+
+      expect(result.error).toBeUndefined();
+      expect(result.llmContent).toContain('refusal response');
+      expect(result.llmContent).toContain('Alinux4 Agentic Edition docs');
+      expect(result.returnDisplay).toContain('returned raw content');
+    });
+
+    it('should degrade to raw content when sub-model returns an English refusal', async () => {
+      vi.spyOn(fetchUtils, 'isPrivateIp').mockReturnValue(false);
+      vi.spyOn(fetchUtils, 'fetchWithTimeout').mockResolvedValue({
+        ok: true,
+        text: () =>
+          Promise.resolve('<html><body>Real page content here</body></html>'),
+      } as Response);
+      mockGenerateContent.mockResolvedValue({
+        candidates: [
+          {
+            finishReason: 'STOP',
+            content: {
+              parts: [
+                {
+                  text: "I'm sorry, but I cannot access external websites or URLs. Please paste the content you'd like me to analyze.",
+                },
+              ],
+            },
+          },
+        ],
+      });
+      const tool = new WebFetchTool(mockConfig);
+      const params = {
+        url: 'https://example.com/docs',
+        prompt: 'summarize this page',
+      };
+      const invocation = tool.build(params);
+      const result = await invocation.execute(new AbortController().signal);
+
+      expect(result.error).toBeUndefined();
+      expect(result.llmContent).toContain('refusal response');
+      expect(result.llmContent).toContain('Real page content here');
+      expect(result.returnDisplay).toContain('returned raw content');
+    });
+
+    it('should include fetch and extraction stats in returnDisplay on success', async () => {
+      vi.spyOn(fetchUtils, 'isPrivateIp').mockReturnValue(false);
+      const html = '<html><body>Hello</body></html>';
+      vi.spyOn(fetchUtils, 'fetchWithTimeout').mockResolvedValue({
+        ok: true,
+        text: () => Promise.resolve(html),
+      } as Response);
+      mockGenerateContent.mockResolvedValue({
+        candidates: [
+          {
+            finishReason: 'STOP',
+            content: { parts: [{ text: 'It says hello.' }] },
+          },
+        ],
+      });
+      const tool = new WebFetchTool(mockConfig);
+      const params = { url: 'https://public.ip', prompt: 'summarize this' };
+      const invocation = tool.build(params);
+      const result = await invocation.execute(new AbortController().signal);
+
+      expect(result.error).toBeUndefined();
+      expect(result.llmContent).toBe('It says hello.');
+      expect(result.returnDisplay).toContain(`${html.length} bytes fetched`);
+      expect(result.returnDisplay).toContain('chars extracted');
+      expect(result.returnDisplay).toContain('processed successfully');
     });
   });
 

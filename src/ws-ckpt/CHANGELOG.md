@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.3.3
+
+### Features
+- Added per-workspace policy override with hermes/openclaw plugin support (#721)
+- Added `/proc` cwd occupant guard for init and rollback (#684)
+- Added Hermes adapter runner script (#617)
+
+### Bug Fixes
+- Fixed write lock contention and cwd guard deadlock in rollback (#721, #684)
+- Fixed input validation for non-UTF-8 paths and path-traversal snapshot IDs (#695, #678)
+- Fixed seccomp arch selection, workspace registry concurrency, and RPM packaging (#695, #684)
+
+## 0.3.2
+
+- Fixed openclaw uninstall to remove tool whitelist from config
+- Fixed parent path refusal to apply as workspace-level rules for skill and openclaw plugin
+
+## 0.3.1
+
+- Fixed plugin workspace config registration and auto-loading
+- Reject workspace paths that are hermes cwd itself or parent
+- Fixed plugin tool to prefer explicit workspace parameter over config
+- Fixed skill delete requiring --force flag
+- Fixed daemon workspace path validation and fswatch fd leak
+- Removed unused btrfs_ops.rs module
+
+## 0.3.0
+
+- Added openclaw plugin scaffolding for ws-ckpt
+- Added hermes plugin scaffolding for ws-ckpt
+- Made ws-ckpt skill agent-agnostic and prompted for workspace at invocation
+- Followed `make install` contract for build-all integration
+- Fixed bugs in list and diff sub-commands
+- Made daemon stateful
+
 ## 0.2.0
 
 - Added auto_cleanup feature and switch

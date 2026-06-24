@@ -4,7 +4,9 @@ Routes the ``command`` kwarg to the appropriate handler, returning a
 unified :class:`ActionResult`.
 """
 
+import copy
 import json
+import re
 from typing import Any
 
 from agent_sec_cli.security_middleware.backends.base import BaseBackend
@@ -12,7 +14,11 @@ from agent_sec_cli.security_middleware.context import RequestContext
 from agent_sec_cli.security_middleware.result import ActionResult
 from agent_sec_cli.skill_ledger.config import resolve_skill_dirs
 from agent_sec_cli.skill_ledger.core.auditor import audit
-from agent_sec_cli.skill_ledger.core.certifier import certify, certify_batch
+from agent_sec_cli.skill_ledger.core.certifier import (
+    certify,
+    scan_batch,
+    scan_skill,
+)
 from agent_sec_cli.skill_ledger.core.checker import check, check_batch
 from agent_sec_cli.skill_ledger.core.status import ledger_status
 from agent_sec_cli.skill_ledger.scanner.registry import ScannerRegistry
@@ -20,11 +26,94 @@ from agent_sec_cli.skill_ledger.signing.ed25519 import NativeEd25519Backend
 from agent_sec_cli.skill_ledger.signing.key_manager import (
     archive_current_public_key,
     ensure_keys_not_exist,
+    keys_exist,
 )
+
+_UNENCRYPTED_AUTO_KEY_WARNING = (
+    "Warning: created an unencrypted Skill Ledger signing key. Run "
+    "'agent-sec-cli skill-ledger init --force-keys --passphrase' to enable "
+    "passphrase protection."
+)
+_PASSPHRASE_EXISTING_KEY_ERROR = (
+    "key already exists; use "
+    "'agent-sec-cli skill-ledger init --force-keys --passphrase' to rotate it "
+    "with passphrase protection."
+)
+_CAMEL_ACRONYM_BOUNDARY_RE = re.compile(r"(.)([A-Z][a-z]+)")
+_CAMEL_WORD_BOUNDARY_RE = re.compile(r"([a-z0-9])([A-Z])")
+
+
+def _to_snake_case(value: str) -> str:
+    """Convert a JSON field name from camelCase/PascalCase to snake_case."""
+    value = value.replace("-", "_")
+    value = _CAMEL_ACRONYM_BOUNDARY_RE.sub(r"\1_\2", value)
+    return _CAMEL_WORD_BOUNDARY_RE.sub(r"\1_\2", value).lower()
+
+
+def _snake_case_event_keys(value: Any) -> Any:
+    """Return *value* with Skill Ledger event result keys normalized.
+
+    Scanner finding ``metadata`` is intentionally opaque because its contents are
+    scanner-owned rather than part of the Skill Ledger event contract.
+    """
+    if isinstance(value, list):
+        return [_snake_case_event_keys(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+
+    normalized: dict[str, Any] = {}
+    scan_status: Any = None
+    has_scan_status = False
+    for key, item in value.items():
+        if key == "metadata":
+            normalized[key] = copy.deepcopy(item)
+            continue
+        if key == "scanStatus":
+            scan_status = item
+            has_scan_status = True
+            continue
+        normalized[_to_snake_case(key)] = _snake_case_event_keys(item)
+
+    if has_scan_status:
+        normalized["verdict"] = scan_status
+    return normalized
+
+
+def _normalize_event_result(data: dict[str, Any]) -> dict[str, Any]:
+    """Build the Skill Ledger event-only result payload."""
+    return _snake_case_event_keys(data)
 
 
 class SkillLedgerBackend(BaseBackend):
     """Dispatch backend for all skill-ledger subcommands."""
+
+    @staticmethod
+    def _sanitize_request(kwargs: dict[str, Any]) -> dict[str, Any]:
+        """Return a log-safe copy of request kwargs."""
+        request = copy.deepcopy(kwargs)
+        if request.get("passphrase") is not None:
+            request["passphrase"] = "[REDACTED]"
+        return request
+
+    def build_event_details(
+        self, result: ActionResult, kwargs: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Build skill-ledger audit details without logging key passphrases."""
+        result_data = copy.deepcopy(result.data)
+        return {
+            "request": self._sanitize_request(kwargs),
+            "result": _normalize_event_result(result_data),
+        }
+
+    def build_error_details(
+        self, exception: Exception, kwargs: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Build skill-ledger failure audit details without logging key passphrases."""
+        return {
+            "request": self._sanitize_request(kwargs),
+            "error": str(exception),
+            "error_type": type(exception).__name__,
+        }
 
     def execute(self, ctx: RequestContext, **kwargs: Any) -> ActionResult:
         """Dispatch to the handler identified by ``command``."""
@@ -43,6 +132,82 @@ class SkillLedgerBackend(BaseBackend):
     # Handlers
     # ------------------------------------------------------------------
 
+    def _generate_keys(
+        self, *, force: bool = False, passphrase: str | None = None
+    ) -> dict:
+        """Generate key material and return the backend result dict."""
+        ensure_keys_not_exist(force=force)
+        # Archive the old public key into the keyring so that existing
+        # signatures remain verifiable after key rotation.
+        if force:
+            try:
+                archive_current_public_key()
+            except Exception as exc:
+                raise RuntimeError(
+                    f"failed to archive existing public key before rotation: {exc}"
+                ) from exc
+        backend = NativeEd25519Backend()
+        return backend.generate_keys(passphrase)
+
+    def _ensure_keys(self) -> tuple[bool, dict[str, Any] | None, list[str]]:
+        """Create default unencrypted keys when absent."""
+        if keys_exist():
+            return False, None, []
+        result = self._generate_keys(force=False, passphrase=None)
+        warnings = []
+        if result.get("encrypted") is False:
+            warnings.append(_UNENCRYPTED_AUTO_KEY_WARNING)
+        return True, result, warnings
+
+    def _do_init(
+        self,
+        ctx: RequestContext,
+        *,
+        baseline: bool = True,
+        passphrase: str | None = None,
+        passphrase_requested: bool = False,
+        force_keys: bool = False,
+        scanner_names: list[str] | None = None,
+        **kw: Any,
+    ) -> ActionResult:
+        key_created = False
+        key_result: dict[str, Any] | None = None
+        try:
+            if passphrase_requested and keys_exist() and not force_keys:
+                return ActionResult(
+                    success=False,
+                    error=_PASSPHRASE_EXISTING_KEY_ERROR,
+                    exit_code=1,
+                )
+            if force_keys or not keys_exist():
+                key_result = self._generate_keys(
+                    force=force_keys, passphrase=passphrase
+                )
+                key_created = True
+
+            results: list[dict[str, Any]] = []
+            if baseline:
+                dirs = resolve_skill_dirs()
+                if dirs:
+                    backend = NativeEd25519Backend()
+                    results = scan_batch(dirs, backend, scanner_names=scanner_names)
+            has_error = any(r.get("status") == "error" for r in results)
+            data = {
+                "command": "init",
+                "keyCreated": key_created,
+                "key": key_result,
+                "baseline": baseline,
+                "results": results,
+            }
+            return ActionResult(
+                success=not has_error,
+                stdout=json.dumps(data, ensure_ascii=False) + "\n",
+                data=data,
+                exit_code=1 if has_error else 0,
+            )
+        except Exception as exc:
+            return ActionResult(success=False, error=str(exc), exit_code=1)
+
     def _do_init_keys(
         self,
         ctx: RequestContext,
@@ -52,25 +217,7 @@ class SkillLedgerBackend(BaseBackend):
         **kw: Any,
     ) -> ActionResult:
         try:
-            ensure_keys_not_exist(force=force)
-        except Exception as exc:
-            return ActionResult(success=False, error=str(exc), exit_code=1)
-
-        # Archive the old public key into the keyring so that existing
-        # signatures remain verifiable after key rotation.
-        if force:
-            try:
-                archive_current_public_key()
-            except OSError as exc:
-                return ActionResult(
-                    success=False,
-                    error=f"Failed to archive public key before rotation: {exc}",
-                    exit_code=1,
-                )
-
-        backend = NativeEd25519Backend()
-        try:
-            result = backend.generate_keys(passphrase)
+            result = self._generate_keys(force=force, passphrase=passphrase)
         except Exception as exc:
             return ActionResult(success=False, error=str(exc), exit_code=1)
 
@@ -146,16 +293,67 @@ class SkillLedgerBackend(BaseBackend):
         scanner: str = "skill-vetter",
         scanner_version: str | None = None,
         scanner_names: list[str] | None = None,
+        delete_findings: bool = False,
         **kw: Any,
     ) -> ActionResult:
-        backend = NativeEd25519Backend()
+        try:
+            if all_skills or scanner_names:
+                return ActionResult(
+                    success=False,
+                    error="certify imports external findings only; use 'skill-ledger scan' for built-in scanners",
+                    exit_code=1,
+                )
+            if skill_dir is None:
+                return ActionResult(
+                    success=False,
+                    error="skill_dir is required",
+                    exit_code=1,
+                )
+            if findings is None:
+                return ActionResult(
+                    success=False,
+                    error="--findings is required for certify; use 'skill-ledger scan' for built-in scanners",
+                    exit_code=1,
+                )
+            key_created, key_result, warnings = self._ensure_keys()
+            backend = NativeEd25519Backend()
+            result = certify(
+                skill_dir,
+                backend,
+                findings_path=findings,
+                scanner=scanner,
+                scanner_version=scanner_version,
+                delete_findings=delete_findings,
+            )
+            result["keyCreated"] = key_created
+            if key_result is not None:
+                result["key"] = key_result
+            if warnings:
+                result["warnings"] = warnings
+            return ActionResult(
+                success=True,
+                stdout=json.dumps(result, ensure_ascii=False) + "\n",
+                data={"command": "certify", **result},
+            )
+        except Exception as exc:
+            return ActionResult(success=False, error=str(exc), exit_code=1)
 
+    def _do_scan(
+        self,
+        ctx: RequestContext,
+        *,
+        skill_dir: str | None = None,
+        all_skills: bool = False,
+        scanner_names: list[str] | None = None,
+        force: bool = False,
+        **kw: Any,
+    ) -> ActionResult:
         try:
             if all_skills:
-                if findings:
+                if skill_dir is not None:
                     return ActionResult(
                         success=False,
-                        error="--all and --findings are incompatible",
+                        error="--all and skill_dir are mutually exclusive.",
                         exit_code=1,
                     )
                 dirs = resolve_skill_dirs()
@@ -165,42 +363,54 @@ class SkillLedgerBackend(BaseBackend):
                         error="No skill directories found in config.json",
                         exit_code=1,
                     )
-                results = certify_batch(
+                key_created, key_result, warnings = self._ensure_keys()
+                backend = NativeEd25519Backend()
+                results = scan_batch(
                     dirs,
                     backend,
-                    findings_path=findings,
-                    scanner=scanner,
-                    scanner_version=scanner_version,
                     scanner_names=scanner_names,
+                    force=force,
                 )
                 has_error = any(r.get("status") == "error" for r in results)
-                data = {"command": "certify", "results": results}
+                data = {
+                    "command": "scan",
+                    "keyCreated": key_created,
+                    "results": results,
+                }
+                if key_result is not None:
+                    data["key"] = key_result
+                if warnings:
+                    data["warnings"] = warnings
                 return ActionResult(
                     success=not has_error,
-                    stdout=json.dumps({"results": results}, ensure_ascii=False) + "\n",
+                    stdout=json.dumps(data, ensure_ascii=False) + "\n",
                     data=data,
                     exit_code=1 if has_error else 0,
                 )
-            else:
-                if skill_dir is None:
-                    return ActionResult(
-                        success=False,
-                        error="skill_dir is required (or use --all)",
-                        exit_code=1,
-                    )
-                result = certify(
-                    skill_dir,
-                    backend,
-                    findings_path=findings,
-                    scanner=scanner,
-                    scanner_version=scanner_version,
-                    scanner_names=scanner_names,
-                )
+            if skill_dir is None:
                 return ActionResult(
-                    success=True,
-                    stdout=json.dumps(result, ensure_ascii=False) + "\n",
-                    data={"command": "certify", **result},
+                    success=False,
+                    error="skill_dir is required (or use --all)",
+                    exit_code=1,
                 )
+            key_created, key_result, warnings = self._ensure_keys()
+            backend = NativeEd25519Backend()
+            result = scan_skill(
+                skill_dir,
+                backend,
+                scanner_names=scanner_names,
+                force=force,
+            )
+            result["keyCreated"] = key_created
+            if key_result is not None:
+                result["key"] = key_result
+            if warnings:
+                result["warnings"] = warnings
+            return ActionResult(
+                success=True,
+                stdout=json.dumps(result, ensure_ascii=False) + "\n",
+                data={"command": "scan", **result},
+            )
         except Exception as exc:
             return ActionResult(success=False, error=str(exc), exit_code=1)
 
@@ -258,6 +468,7 @@ class SkillLedgerBackend(BaseBackend):
                     "type": s.type,
                     "parser": s.parser,
                     "enabled": s.enabled,
+                    "autoInvocable": s.enabled and s.type == "builtin",
                     "description": s.description,
                 }
             )

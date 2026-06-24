@@ -25,11 +25,34 @@ LOONGSHIELD_WITH_FAILURES = """\
 \x1b[32m[INFO  14:30:04]\x1b[0m engine.lua:292: SEHarden Finished. 20 passed, 0 fixed, 2 failed, 1 manual, 0 dry-run-pending / 23 total.
 """
 
+LOONGSHIELD_VERBOSE_SCAN_WITH_FAILURES = """\
+\x1b[1;36mSEHarden scan\x1b[0m: profile='loongshield_e2e', level='strict', 2 rule(s)
+  \x1b[1;32mPASS\x1b[0m [e2e.max_auth_tries] Ensure fixture MaxAuthTries is hardened
+  \x1b[1;31mFAIL\x1b[0m [e2e.strict_banner] Ensure fixture SSH banner is configured
+    \x1b[33mreason:\x1b[0m actual: nil
+\x1b[1;36mSummary:\x1b[0m \x1b[32m1 passed\x1b[0m, \x1b[32m0 fixed\x1b[0m, \x1b[31m1 failed\x1b[0m, \x1b[2m0 manual\x1b[0m, \x1b[2m0 dry-run-pending\x1b[0m / 2 total
+"""
+
 LOONGSHIELD_REINFORCE = """\
 \x1b[33m[WARN  14:30:01]\x1b[0m engine.lua:186: [fs.udf_disabled] FAIL: Ensure mounting of udf is disabled
 \x1b[31m[ERROR 14:30:04]\x1b[0m engine.lua:307: [fs.shadow_perms] FAILED-TO-FIX: Cannot set file permissions on /etc/shadow
 \x1b[31m[ERROR 14:30:04]\x1b[0m engine.lua:295: [kern.sysctl_apply] ENFORCE-ERROR: Failed to apply sysctl setting
 \x1b[32m[INFO  14:30:05]\x1b[0m engine.lua:292: SEHarden Finished. 18 passed, 1 fixed, 1 failed, 0 manual, 0 dry-run-pending / 20 total.
+"""
+
+LOONGSHIELD_REINFORCE_FIXED = """\
+  \x1b[1;31mFAIL\x1b[0m [e2e.max_auth_tries] Ensure fixture MaxAuthTries is hardened
+    \x1b[33mreason:\x1b[0m actual: 6
+\x1b[32m[INFO  14:30:05]\x1b[0m engine.lua:292: [e2e.max_auth_tries] FIXED: Ensure fixture MaxAuthTries is hardened
+\x1b[32m[INFO  14:30:06]\x1b[0m engine.lua:292: SEHarden Finished. 0 passed, 1 fixed, 0 failed, 0 manual, 0 dry-run-pending / 1 total.
+"""
+
+LOONGSHIELD_REINFORCE_MIXED_FAIL_AND_FIXED = """\
+  \x1b[1;31mFAIL\x1b[0m [e2e.strict_banner] Ensure fixture SSH banner is configured
+    \x1b[33mreason:\x1b[0m actual: nil
+\x1b[32m[INFO  14:30:05]\x1b[0m engine.lua:292: [e2e.max_auth_tries] FIXED: Ensure fixture MaxAuthTries is hardened
+\x1b[33m[WARN  14:30:06]\x1b[0m engine.lua:186: [fs.udf_disabled] FAIL: Ensure mounting of udf is disabled
+\x1b[32m[INFO  14:30:07]\x1b[0m engine.lua:292: SEHarden Finished. 0 passed, 2 fixed, 1 failed, 0 manual, 0 dry-run-pending / 3 total.
 """
 
 LOONGSHIELD_DRYRUN = """\
@@ -94,7 +117,10 @@ class TestHardeningExecute(unittest.TestCase):
         mock_isfile.return_value = False
         mock_access.return_value = False
 
-        result = self.backend.execute(self.ctx, args=["--scan"])
+        with self.assertLogs(
+            "agent_sec_cli.security_middleware.backends.hardening", level="WARNING"
+        ) as logs:
+            result = self.backend.execute(self.ctx, args=["--scan"])
 
         self.assertFalse(result.success)
         self.assertEqual(result.exit_code, 127)
@@ -102,6 +128,14 @@ class TestHardeningExecute(unittest.TestCase):
         self.assertEqual(result.data["argv"], ["loongshield", "seharden", "--scan"])
         self.assertEqual(result.data["failures"], [])
         self.assertEqual(result.data["fixed_items"], [])
+        self.assertEqual(len(logs.records), 1)
+        record = logs.records[0]
+        self.assertEqual(record.levelname, "WARNING")
+        self.assertEqual(record.trace_id, self.ctx.trace_id)
+        # Domain fields live under `data` in the new schema.
+        self.assertEqual(record.data["action"], "harden")
+        self.assertEqual(record.data["exit_code"], 127)
+        self.assertEqual(record.data["error_type"], "FileNotFoundError")
 
     @patch("agent_sec_cli.security_middleware.backends.hardening.subprocess.run")
     @patch("agent_sec_cli.security_middleware.backends.hardening.os.access")
@@ -208,6 +242,29 @@ class TestHardeningExecute(unittest.TestCase):
 
     @patch("agent_sec_cli.security_middleware.backends.hardening.subprocess.run")
     @patch("agent_sec_cli.security_middleware.backends.hardening.shutil.which")
+    def test_verbose_summary_and_rule_status_are_parsed(self, mock_which, mock_run):
+        mock_which.return_value = "/usr/bin/loongshield"
+        mock_run.return_value = _mock_proc(LOONGSHIELD_VERBOSE_SCAN_WITH_FAILURES, 1)
+
+        result = self.backend.execute(self.ctx, args=["--scan", "--verbose"])
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.data["passed"], 1)
+        self.assertEqual(result.data["failed"], 1)
+        self.assertEqual(result.data["total"], 2)
+        self.assertEqual(
+            result.data["failures"],
+            [
+                {
+                    "rule_id": "e2e.strict_banner",
+                    "status": "FAIL",
+                    "message": "Ensure fixture SSH banner is configured",
+                }
+            ],
+        )
+
+    @patch("agent_sec_cli.security_middleware.backends.hardening.subprocess.run")
+    @patch("agent_sec_cli.security_middleware.backends.hardening.shutil.which")
     def test_legacy_mode_and_config_are_translated(self, mock_which, mock_run):
         mock_which.return_value = "/usr/bin/loongshield"
         mock_run.return_value = _mock_proc(LOONGSHIELD_REINFORCE, 1)
@@ -252,6 +309,75 @@ class TestHardeningExecute(unittest.TestCase):
         statuses = [item["status"] for item in result.data["failures"]]
         self.assertIn("FAILED-TO-FIX", statuses)
         self.assertIn("ENFORCE-ERROR", statuses)
+
+    @patch("agent_sec_cli.security_middleware.backends.hardening.subprocess.run")
+    @patch("agent_sec_cli.security_middleware.backends.hardening.shutil.which")
+    def test_reinforce_fixed_status_is_preferred_over_verbose_fail(
+        self, mock_which, mock_run
+    ):
+        mock_which.return_value = "/usr/bin/loongshield"
+        mock_run.return_value = _mock_proc(LOONGSHIELD_REINFORCE_FIXED, 0)
+
+        result = self.backend.execute(
+            self.ctx, args=["--reinforce", "--verbose", "--config", "agentos_baseline"]
+        )
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.data["fixed"], 1)
+        self.assertEqual(result.data["failures"], [])
+        self.assertEqual(
+            result.data["fixed_items"],
+            [
+                {
+                    "rule_id": "e2e.max_auth_tries",
+                    "status": "FIXED",
+                    "message": "Ensure fixture MaxAuthTries is hardened",
+                }
+            ],
+        )
+
+    @patch("agent_sec_cli.security_middleware.backends.hardening.subprocess.run")
+    @patch("agent_sec_cli.security_middleware.backends.hardening.shutil.which")
+    def test_reinforce_distinguishes_verbose_fail_from_legacy_fail(
+        self, mock_which, mock_run
+    ):
+        mock_which.return_value = "/usr/bin/loongshield"
+        mock_run.return_value = _mock_proc(
+            LOONGSHIELD_REINFORCE_MIXED_FAIL_AND_FIXED, 1
+        )
+
+        result = self.backend.execute(
+            self.ctx, args=["--reinforce", "--verbose", "--config", "agentos_baseline"]
+        )
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.data["fixed"], 2)
+        self.assertEqual(result.data["failed"], 1)
+        self.assertEqual(
+            result.data["failures"],
+            [
+                {
+                    "rule_id": "e2e.strict_banner",
+                    "status": "FAIL",
+                    "message": "Ensure fixture SSH banner is configured",
+                }
+            ],
+        )
+        self.assertEqual(
+            result.data["fixed_items"],
+            [
+                {
+                    "rule_id": "e2e.max_auth_tries",
+                    "status": "FIXED",
+                    "message": "Ensure fixture MaxAuthTries is hardened",
+                },
+                {
+                    "rule_id": "fs.udf_disabled",
+                    "status": "FAIL",
+                    "message": "Ensure mounting of udf is disabled",
+                },
+            ],
+        )
 
     @patch("agent_sec_cli.security_middleware.backends.hardening.subprocess.run")
     @patch("agent_sec_cli.security_middleware.backends.hardening.shutil.which")
@@ -333,11 +459,24 @@ class TestHardeningExecute(unittest.TestCase):
         mock_which.return_value = "/usr/bin/loongshield"
         mock_run.side_effect = OSError("Permission denied")
 
-        result = self.backend.execute(self.ctx, args=["--scan"])
+        with self.assertLogs(
+            "agent_sec_cli.security_middleware.backends.hardening", level="ERROR"
+        ) as logs:
+            result = self.backend.execute(self.ctx, args=["--scan"])
 
         self.assertFalse(result.success)
         self.assertIn("Failed to execute `loongshield seharden`", result.error)
         self.assertIn("Permission denied", result.error)
+        self.assertEqual(len(logs.records), 1)
+        record = logs.records[0]
+        self.assertEqual(record.levelname, "ERROR")
+        self.assertEqual(record.trace_id, self.ctx.trace_id)
+        # action/exit_code go via `data`; error_type is derived from exc_info
+        # by the JSONL handler, so it does not need to be in `extra=`.
+        self.assertEqual(record.data["action"], "harden")
+        self.assertEqual(record.data["exit_code"], 1)
+        self.assertIsNotNone(record.exc_info)
+        self.assertIs(record.exc_info[0], OSError)
 
     def test_unknown_legacy_kwargs_are_rejected(self):
         with self.assertRaises(TypeError):

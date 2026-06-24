@@ -4,7 +4,10 @@ from pathlib import Path
 
 from agent_sec_cli.security_events.config import get_db_path
 from agent_sec_cli.security_events.orm_store import SqliteStore
-from agent_sec_cli.security_events.repositories import SecurityEventRepository
+from agent_sec_cli.security_events.repositories import (
+    CorrelationCandidate,
+    SecurityEventRepository,
+)
 from agent_sec_cli.security_events.schema import SecurityEvent
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
@@ -58,10 +61,33 @@ class SqliteEventReader:
             offset=offset,
         )
 
+    def query_correlation_candidates(
+        self,
+        *,
+        session_id: str,
+        categories: tuple[str, ...] | list[str],
+        run_id: str | None = None,
+        tool_call_id: str | None = None,
+        tool_call_ids: tuple[str, ...] | list[str] | None = None,
+        since_epoch: float | None = None,
+        until_epoch: float | None = None,
+    ) -> list[CorrelationCandidate]:
+        """Query up to 1000 read-only candidates for observability correlation."""
+        return self._repository.query_correlation_candidates(
+            session_id=session_id,
+            categories=categories,
+            run_id=run_id,
+            tool_call_id=tool_call_id,
+            tool_call_ids=tool_call_ids,
+            since_epoch=since_epoch,
+            until_epoch=until_epoch,
+        )
+
     def count(
         self,
         event_type: str | None = None,
         category: str | None = None,
+        trace_id: str | None = None,
         since: str | None = None,
         until: str | None = None,
         offset: int = 0,
@@ -70,6 +96,7 @@ class SqliteEventReader:
         return self._repository.count(
             event_type=event_type,
             category=category,
+            trace_id=trace_id,
             since=since,
             until=until,
             offset=offset,
@@ -78,6 +105,9 @@ class SqliteEventReader:
     def count_by(
         self,
         group_field: str,
+        event_type: str | None = None,
+        category: str | None = None,
+        trace_id: str | None = None,
         since: str | None = None,
         until: str | None = None,
         offset: int = 0,
@@ -85,6 +115,9 @@ class SqliteEventReader:
         """Count events grouped by a specific field."""
         return self._repository.count_by(
             group_field,
+            event_type=event_type,
+            category=category,
+            trace_id=trace_id,
             since=since,
             until=until,
             offset=offset,

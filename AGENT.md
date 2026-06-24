@@ -12,9 +12,12 @@ This file provides context for AI coding assistants (Qoder, Claude, etc.) workin
 | **agent-sec-core** | `src/agent-sec-core/` | Rust + Python | Linux only |
 | **agentsight** | `src/agentsight/` | Rust (eBPF) | Linux only |
 | **tokenless** | `src/tokenless/` | Rust | Linux only |
+| **agent-memory** (`memory`) | `src/agent-memory/` | Rust | Linux only |
 | **os-skills** | `src/os-skills/` | Python / Shell | All |
+| **anolisa** | `src/anolisa/` | Rust | Linux + macOS (arm64) |
+| **SkillFS** (`skillfs`) | `src/skillfs/` | Rust / FUSE | Linux only |
 
-> `agent-sec-core`, `agentsight`, and `tokenless` require Linux. Do **not** attempt to build them on macOS or Windows.
+> `agent-sec-core`, `agentsight`, `tokenless`, `agent-memory`, and `skillfs` require Linux. Do **not** attempt to build them on macOS or Windows.
 
 ## Development Commands
 
@@ -55,16 +58,85 @@ cd src/os-skills   # Skill definitions are static assets, no compilation needed
 cd src/tokenless
 cargo build --release
 cargo test
+
+# agent-memory (Linux only, per-component)
+cd src/agent-memory
+make build       # cargo build --release --locked
+make test        # cargo test --locked
+make smoke       # end-to-end MCP stdio smoke test
+
+# anolisa (per-component)
+cd src/anolisa
+cargo fmt --all --check
+cargo clippy --all-targets --locked -- -D warnings
+cargo test --locked
+
+# SkillFS (Linux only, per-component)
+cd src/skillfs
+cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+scripts/test.sh   # FUSE smoke test; skips itself if fuse3 or /dev/fuse is unavailable
 ```
 
 ## Commit Message Rules
 
 > **scope is mandatory** — CI will error if scope is missing.
 
-Format: `type(scope): description`
+### Subject line
+
+Format: `type(scope): imperative description`
+- **50 characters max** (type + scope + colon + space + description)
 - Language: **English only**
-- `description`: lowercase first letter, no trailing period
+- Imperative mood ("add", "fix", "remove" — not "added", "fixes", "removing")
+- Lowercase first letter, no trailing period
 - Breaking changes: append `!` before colon, e.g. `feat(cosh)!: remove legacy flag`
+
+### Body (when non-trivial)
+
+Separated from subject by a blank line. Cover three things:
+1. What architectural choice was made
+2. Why this approach over alternatives
+3. Known limitations or trade-offs
+
+Do **not** restate the diff line-by-line or paste design docs.
+
+### Trailers
+
+```
+Assisted-by: <tool>:<version>
+Signed-off-by: Name <email>
+```
+
+`Assisted-by` goes **above** `Signed-off-by`. Omit `Assisted-by` if no AI was involved.
+
+Use `--trailer` flags (not `-s`) to control ordering:
+
+```bash
+git commit \
+  --trailer "Assisted-by: Qoder:1.7.0" \
+  --trailer "Signed-off-by: $(git config user.name) <$(git config user.email)>" \
+  -m '...'
+```
+
+**Tool identifier detection** (for reference when writing `Assisted-by`):
+
+| Detection method | Tool identifier |
+|---|---|
+| `$QODER_VERSION` env var | `Qoder:<ver>` |
+| `$CLAUDE_CODE_VERSION` env var | `Claude Code:<ver>` |
+| Parent process is Qoder.app / QoderWork.app | Read `CFBundleShortVersionString` from app bundle |
+| Parent process is Claude.app | `Claude:<ver>` |
+| Parent process is Cursor.app | `Cursor:<ver>` |
+
+When generating commits, detect the active tool and fill in the actual version. Do **not** hardcode a fixed string like `Qoder:latest`.
+
+### Atomicity
+
+- One commit = one logical change
+- Scope must match the actual files changed
+- Every commit in a PR must compile independently
+- Squash fixup commits before merge
 
 ### Scope Inference (by changed file path)
 
@@ -75,6 +147,10 @@ Format: `type(scope): description`
 | `src/os-skills/` | `skill` |
 | `src/agentsight/` | `sight` |
 | `src/tokenless/` | `tokenless` |
+| `src/ws-ckpt/` | `ckpt` |
+| `src/agent-memory/` | `memory` |
+| `src/anolisa/` | `anolisa` |
+| `src/skillfs/` | `skillfs` |
 | `.github/workflows/` | `ci` |
 | `docs/` | `docs` |
 | `**/package*.json`, `Cargo.lock`, `*.toml` (dep bumps) | `deps` |
@@ -94,7 +170,17 @@ Closes #42
 
 ```
 feat(cosh): add --json flag to config command
+
+Scripts need machine-readable config output; chose flat JSON over
+nested to keep parsing trivial. Nested config support tracked in #55.
+
+Assisted-by: Qoder
+Signed-off-by: Zhang San <zhangsan@example.com>
+```
+
+```
 fix(sec-core): handle sandbox escape edge case
+feat(sight): add deadloop detection and auto-kill
 docs(docs): update installation guide for Linux
 chore(ci): pin ubuntu version to 22.04
 deps(deps): bump @types/node to 20.11.0
@@ -142,6 +228,10 @@ When generating a PR description, use `.github/pull_request_template.md` as the 
 - `skill` → any file under `src/os-skills/`
 - `sight` → any file under `src/agentsight/`
 - `tokenless` → any file under `src/tokenless/`
+- `ckpt` → any file under `src/ws-ckpt/`
+- `memory` → any file under `src/agent-memory/`
+- `anolisa` → any file under `src/anolisa/`
+- `skillfs` → any file under `src/skillfs/`
 - `Multiple / Project-wide` → cross-component or root-level changes
 
 **Checklist** — mark items that actually apply to this PR; skip items for unaffected components.
@@ -200,6 +290,16 @@ cd src/copilot-shell && make test
 
 Output schema is intentionally flat for now; nested config support tracked in #55.
 ```
+
+## Changelog Entries
+
+Each user-perceivable change requires a `CHANGELOG.md` entry in the affected component. Follow [Keep a Changelog](https://keepachangelog.com/) format (Added / Changed / Fixed).
+
+1. **One sentence per bullet** — max 25 English words / 40 Chinese characters
+2. **User perspective** — describe the behavior change ("X command now supports Y"), not the code change
+3. **No internal jargon** — command names and config keys are fine; kernel APIs, framework class names, and syscalls are not
+4. **One bullet, one change** — do not combine unrelated changes with "and"
+5. **Skip invisible changes** — pure refactors, test infra, and CI tweaks do not belong in the changelog
 
 ## Code Standards
 

@@ -3,12 +3,12 @@
 //! Defines `Http2FrameType` and `ParsedHttp2Frame` for zero-copy
 //! HTTP/2 binary frame representation.
 
+use crate::chrome_trace::{ChromeTraceEvent, ToChromeTraceEvent, TraceArgs, ns_to_us};
+use crate::probes::sslsniff::SslEvent;
+use hpack::Decoder;
+use serde_json::json;
 use std::fmt;
 use std::rc::Rc;
-use crate::probes::sslsniff::SslEvent;
-use crate::chrome_trace::{TraceArgs, ToChromeTraceEvent, ChromeTraceEvent, ns_to_us};
-use serde_json::json;
-use hpack::Decoder;
 
 /// HTTP/2 frame type (RFC 7540 Section 6)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,16 +105,24 @@ impl ParsedHttp2Frame {
         self.frame_type == Http2FrameType::Settings
     }
 
+    pub fn is_continuation(&self) -> bool {
+        self.frame_type == Http2FrameType::Continuation
+    }
+
     /// Check END_STREAM flag (0x01) on DATA/HEADERS frames
     pub fn has_end_stream(&self) -> bool {
-        matches!(self.frame_type, Http2FrameType::Data | Http2FrameType::Headers)
-            && (self.flags & 0x01) != 0
+        matches!(
+            self.frame_type,
+            Http2FrameType::Data | Http2FrameType::Headers
+        ) && (self.flags & 0x01) != 0
     }
 
     /// Check END_HEADERS flag (0x04) on HEADERS/CONTINUATION frames
     pub fn has_end_headers(&self) -> bool {
-        matches!(self.frame_type, Http2FrameType::Headers | Http2FrameType::Continuation)
-            && (self.flags & 0x04) != 0
+        matches!(
+            self.frame_type,
+            Http2FrameType::Headers | Http2FrameType::Continuation
+        ) && (self.flags & 0x04) != 0
     }
 
     /// Human-readable frame type name
@@ -127,24 +135,44 @@ impl ParsedHttp2Frame {
         let mut flags = Vec::new();
         match self.frame_type {
             Http2FrameType::Data => {
-                if self.flags & 0x01 != 0 { flags.push("END_STREAM"); }
-                if self.flags & 0x08 != 0 { flags.push("PADDED"); }
+                if self.flags & 0x01 != 0 {
+                    flags.push("END_STREAM");
+                }
+                if self.flags & 0x08 != 0 {
+                    flags.push("PADDED");
+                }
             }
             Http2FrameType::Headers => {
-                if self.flags & 0x01 != 0 { flags.push("END_STREAM"); }
-                if self.flags & 0x04 != 0 { flags.push("END_HEADERS"); }
-                if self.flags & 0x08 != 0 { flags.push("PADDED"); }
-                if self.flags & 0x20 != 0 { flags.push("PRIORITY"); }
+                if self.flags & 0x01 != 0 {
+                    flags.push("END_STREAM");
+                }
+                if self.flags & 0x04 != 0 {
+                    flags.push("END_HEADERS");
+                }
+                if self.flags & 0x08 != 0 {
+                    flags.push("PADDED");
+                }
+                if self.flags & 0x20 != 0 {
+                    flags.push("PRIORITY");
+                }
             }
             Http2FrameType::Settings | Http2FrameType::Ping => {
-                if self.flags & 0x01 != 0 { flags.push("ACK"); }
+                if self.flags & 0x01 != 0 {
+                    flags.push("ACK");
+                }
             }
             Http2FrameType::Continuation => {
-                if self.flags & 0x04 != 0 { flags.push("END_HEADERS"); }
+                if self.flags & 0x04 != 0 {
+                    flags.push("END_HEADERS");
+                }
             }
             Http2FrameType::PushPromise => {
-                if self.flags & 0x04 != 0 { flags.push("END_HEADERS"); }
-                if self.flags & 0x08 != 0 { flags.push("PADDED"); }
+                if self.flags & 0x04 != 0 {
+                    flags.push("END_HEADERS");
+                }
+                if self.flags & 0x08 != 0 {
+                    flags.push("PADDED");
+                }
             }
             _ => {}
         }
@@ -156,13 +184,13 @@ impl ParsedHttp2Frame {
     }
 
     /// Decode HPACK-encoded headers using a provided decoder
-    /// 
+    ///
     /// This method requires a stateful HPACK decoder because HTTP/2 header
     /// compression uses a dynamic table that persists across frames.
-    /// 
+    ///
     /// # Arguments
     /// * `decoder` - A mutable reference to an HPACK decoder (maintains dynamic table state)
-    /// 
+    ///
     /// # Returns
     /// * `Some(Vec<(String, String)>)` - Decoded header name-value pairs on success
     /// * `None` - If this is not a HEADERS frame or decoding failed
@@ -170,12 +198,12 @@ impl ParsedHttp2Frame {
         if !self.is_headers() && self.frame_type != Http2FrameType::Continuation {
             return None;
         }
-        
+
         let payload = self.payload();
         if payload.is_empty() {
             return Some(Vec::new());
         }
-        
+
         decoder.decode(payload).ok().map(|headers| {
             headers
                 .into_iter()
@@ -189,29 +217,29 @@ impl ParsedHttp2Frame {
     }
 
     /// Decode headers using only the static HPACK table (stateless)
-    /// 
+    ///
     /// This method does NOT maintain dynamic table state, so it can only
     /// decode headers that use static table indices. Useful for quick inspection
     /// without tracking connection state.
-    /// 
+    ///
     /// # Returns
     /// Decoded header name-value pairs (only static table entries will be resolved)
     pub fn decode_headers_stateless(&self) -> Vec<(String, Option<String>)> {
         if !self.is_headers() && self.frame_type != Http2FrameType::Continuation {
             return Vec::new();
         }
-        
+
         let payload = self.payload();
         if payload.is_empty() {
             return Vec::new();
         }
-        
+
         let mut result = Vec::new();
         let mut pos = 0;
-        
+
         while pos < payload.len() {
             let first_byte = payload[pos];
-            
+
             // Indexed Header Field (1xxxxxxx) - fully indexed in static or dynamic table
             if first_byte & 0x80 != 0 {
                 let index = (first_byte & 0x7F) as usize;
@@ -221,7 +249,7 @@ impl ParsedHttp2Frame {
                     break; // Invalid
                 } else {
                     // Dynamic table index - cannot decode without state
-                    result.push((format!("<dynamic:{}>", index), None));
+                    result.push((format!("<dynamic:{index}>"), None));
                 }
                 pos += 1;
             }
@@ -243,26 +271,31 @@ impl ParsedHttp2Frame {
                 pos += consumed;
             }
         }
-        
+
         result
     }
 
     /// Decode a literal header field
-    fn decode_literal_header(&self, payload: &[u8], start: usize, _indexed: bool) -> (String, String, usize) {
+    fn decode_literal_header(
+        &self,
+        payload: &[u8],
+        start: usize,
+        _indexed: bool,
+    ) -> (String, String, usize) {
         let mut pos = start;
         let first_byte = payload[pos];
         pos += 1;
-        
+
         // Extract name (either from static table or literal)
         let name: String;
         let name_index = (first_byte & 0x3F) as usize;
-        
+
         if name_index > 0 {
             // Name is in static table
             if let Some((n, _)) = Self::get_static_table_entry(name_index) {
                 name = n.to_string();
             } else {
-                name = format!("<unknown:{}>", name_index);
+                name = format!("<unknown:{name_index}>");
             }
         } else {
             // Name is literal string
@@ -270,11 +303,11 @@ impl ParsedHttp2Frame {
             name = lit_name;
             pos += consumed;
         }
-        
+
         // Decode value string
         let (value, consumed) = Self::decode_literal_string(payload, pos);
         pos += consumed;
-        
+
         (name, value, pos - start)
     }
 
@@ -283,15 +316,15 @@ impl ParsedHttp2Frame {
         if start >= payload.len() {
             return (String::new(), 0);
         }
-        
+
         let mut pos = start;
         let first_byte = payload[pos];
         let is_huffman = (first_byte & 0x80) != 0;
-        
+
         // Decode length (variable length integer, 7 bits in first byte)
         let mut length = (first_byte & 0x7F) as usize;
         pos += 1;
-        
+
         // Check if more length bytes follow (this is a simplification)
         // In full HPACK, length can be multi-byte
         if length == 0x7F && pos < payload.len() {
@@ -306,32 +339,33 @@ impl ParsedHttp2Frame {
                 }
             }
         }
-        
+
         if pos + length > payload.len() {
             return (String::new(), pos - start);
         }
-        
+
         let string_bytes = &payload[pos..pos + length];
-        
+
         let result = if is_huffman {
             // Huffman decode
             Self::huffman_decode(string_bytes)
         } else {
             String::from_utf8_lossy(string_bytes).to_string()
         };
-        
+
         (result, pos + length - start)
     }
 
-    /// Simple Huffman decoder for HPACK
+    /// Decode an HPACK Huffman-encoded string (RFC 7541 Appendix B) using the
+    /// hpack crate's canonical decoder. On decode error (corrupt/truncated data)
+    /// we fall back to a lossy view of the raw bytes rather than a placeholder,
+    /// so callers always get the most readable result available.
     fn huffman_decode(data: &[u8]) -> String {
-        // HPACK uses a specific Huffman code. For simplicity, we'll use
-        // a basic approach - in production, use the hpack crate's decoder
-        // which handles this correctly.
-        // 
-        // For now, return a placeholder indicating Huffman-encoded data
-        // The proper implementation would use the Huffman tree from RFC 7541
-        format!("<huffman:{} bytes>", data.len())
+        let mut decoder = hpack::huffman::HuffmanDecoder::new();
+        match decoder.decode(data) {
+            Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
+            Err(_) => String::from_utf8_lossy(data).to_string(),
+        }
     }
 
     /// Get an entry from the HPACK static table (RFC 7541 Appendix A)
@@ -420,7 +454,11 @@ impl TraceArgs for ParsedHttp2Frame {
             } else {
                 let preview = self.body_str();
                 if !preview.is_empty() {
-                    let truncated = if preview.len() > 200 { &preview[..200] } else { preview };
+                    let truncated = if preview.len() > 200 {
+                        &preview[..200]
+                    } else {
+                        preview
+                    };
                     args.insert("body_preview".to_string(), json!(truncated));
                 }
             }
@@ -437,7 +475,10 @@ impl TraceArgs for ParsedHttp2Frame {
                         (name, json!(v))
                     })
                     .collect();
-                args.insert("headers".to_string(), serde_json::Value::Object(headers_json));
+                args.insert(
+                    "headers".to_string(),
+                    serde_json::Value::Object(headers_json),
+                );
             }
         }
 
@@ -477,11 +518,17 @@ impl fmt::Debug for ParsedHttp2Frame {
             let body = self.payload();
             if let Ok(json) = serde_json::from_slice::<serde_json::Value>(body) {
                 let formatted = serde_json::to_string_pretty(&json).unwrap_or_default();
-                debug.field("body", &format!("(json, {} bytes)\n{}", body.len(), formatted));
+                debug.field(
+                    "body",
+                    &format!("(json, {} bytes)\n{}", body.len(), formatted),
+                );
             } else if let Ok(text) = std::str::from_utf8(body) {
                 let text = text.trim();
                 if text.len() > 200 {
-                    debug.field("body", &format!("(text, {} bytes)\n{}...", body.len(), &text[..200]));
+                    debug.field(
+                        "body",
+                        &format!("(text, {} bytes)\n{}...", body.len(), &text[..200]),
+                    );
                 } else {
                     debug.field("body", &format!("(text, {} bytes)\n{}", body.len(), text));
                 }
@@ -496,11 +543,9 @@ impl fmt::Debug for ParsedHttp2Frame {
             if !headers.is_empty() {
                 let header_strs: Vec<String> = headers
                     .into_iter()
-                    .map(|(name, value)| {
-                        match value {
-                            Some(v) => format!("  {}: {}", name, v),
-                            None => format!("  {}: <undecoded>", name),
-                        }
+                    .map(|(name, value)| match value {
+                        Some(v) => format!("  {name}: {v}"),
+                        None => format!("  {name}: <undecoded>"),
                     })
                     .collect();
                 debug.field("headers", &format!("\n{}", header_strs.join("\n")));
@@ -513,5 +558,35 @@ impl fmt::Debug for ParsedHttp2Frame {
             .field("timestamp_ns", &self.source_event.timestamp_ns);
 
         debug.finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_huffman_decode_rfc7541_vectors() {
+        // RFC 7541 C.4.1: "www.example.com"
+        let www = [
+            0xf1, 0xe3, 0xc2, 0xe5, 0xf2, 0x3a, 0x6b, 0xa0, 0xab, 0x90, 0xf4, 0xff,
+        ];
+        assert_eq!(ParsedHttp2Frame::huffman_decode(&www), "www.example.com");
+
+        // RFC 7541 C.4.2: "no-cache"
+        let no_cache = [0xa8, 0xeb, 0x10, 0x64, 0x9c, 0xbf];
+        assert_eq!(ParsedHttp2Frame::huffman_decode(&no_cache), "no-cache");
+
+        // RFC 7541 C.6.1: ":status" value "302" -> Huffman 0x6402
+        let s302 = [0x64, 0x02];
+        assert_eq!(ParsedHttp2Frame::huffman_decode(&s302), "302");
+    }
+
+    #[test]
+    fn test_huffman_decode_invalid_falls_back_to_lossy() {
+        // Not a valid complete Huffman sequence: must not panic and must not
+        // return the old "<huffman:N bytes>" placeholder.
+        let out = ParsedHttp2Frame::huffman_decode(&[0x00]);
+        assert!(!out.starts_with("<huffman:"));
     }
 }

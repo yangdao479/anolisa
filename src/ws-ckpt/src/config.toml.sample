@@ -25,7 +25,7 @@
 # field below them takes effect immediately. Empty sections behave exactly
 # the same as omitted sections (all fields fall back to defaults).
 [backend]
-# type = "auto"                       # "auto" | "btrfs-base" | "btrfs-loop" | "overlayfs"
+# type = "auto"                       # "auto" | "btrfs-base" | "btrfs-loop"
 
 # ── BtrfsLoop backend ──
 # NOTE: The following fields only take effect during daemon bootstrap.
@@ -38,6 +38,3 @@
 # ── BtrfsBase backend ──
 [backend.btrfs-base]
 # btrfs_mount = "/data"               # (reserved) Target btrfs partition
-
-# ── OverlayFS backend ──
-[backend.overlayfs]                   # (reserved, not yet implemented)

@@ -62,7 +62,9 @@ describe('HookSystem', () => {
 
     mockHookEventHandler = {
       fireUserPromptSubmitEvent: vi.fn(),
+      firePreToolUseEvent: vi.fn(),
       fireStopEvent: vi.fn(),
+      firePostToolUseEvent: vi.fn(),
     } as unknown as HookEventHandler;
 
     vi.mocked(HookRegistry).mockImplementation(() => mockHookRegistry);
@@ -153,6 +155,37 @@ describe('HookSystem', () => {
 
       expect(hooks).toEqual(mockHooks);
       expect(mockHookRegistry.getAllHooks).toHaveBeenCalled();
+    });
+  });
+
+  describe('firePreToolUseEvent', () => {
+    it('should pass toolUseId through to the event handler', async () => {
+      const mockResult = {
+        success: true,
+        allOutputs: [],
+        errors: [],
+        totalDuration: 12,
+        finalOutput: {
+          decision: 'allow' as HookDecision,
+        },
+      };
+      vi.mocked(mockHookEventHandler.firePreToolUseEvent).mockResolvedValue(
+        mockResult,
+      );
+
+      await hookSystem.firePreToolUseEvent(
+        'shell',
+        { command: 'ls' },
+        undefined,
+        'tool-call-1',
+      );
+
+      expect(mockHookEventHandler.firePreToolUseEvent).toHaveBeenCalledWith(
+        'shell',
+        { command: 'ls' },
+        undefined,
+        'tool-call-1',
+      );
     });
   });
 
@@ -323,6 +356,93 @@ describe('HookSystem', () => {
 
       expect(result).toBeDefined();
       expect(result?.getAdditionalContext()).toBe('Some additional context');
+    });
+  });
+
+  describe('firePostToolUseEvent', () => {
+    it('should attach aggregator notifications to the returned output', async () => {
+      const notifications = [
+        {
+          hookName: 'audit-hook',
+          message: 'Tool output flagged for follow-up review',
+          decision: 'allow' as HookDecision,
+        },
+      ];
+      const mockResult = {
+        success: true,
+        allOutputs: [],
+        errors: [],
+        totalDuration: 12,
+        finalOutput: {
+          decision: 'allow' as HookDecision,
+          reason: 'Tool output flagged for follow-up review',
+        },
+        notifications,
+      };
+      vi.mocked(mockHookEventHandler.firePostToolUseEvent).mockResolvedValue(
+        mockResult,
+      );
+
+      const result = await hookSystem.firePostToolUseEvent(
+        'shell',
+        { command: 'ls' },
+        { llmContent: 'output' },
+      );
+
+      expect(result).toBeDefined();
+      expect(result?.notifications).toEqual(notifications);
+    });
+
+    it('should leave notifications undefined when aggregator emits none', async () => {
+      const mockResult = {
+        success: true,
+        allOutputs: [],
+        errors: [],
+        totalDuration: 12,
+        finalOutput: {
+          decision: 'allow' as HookDecision,
+        },
+      };
+      vi.mocked(mockHookEventHandler.firePostToolUseEvent).mockResolvedValue(
+        mockResult,
+      );
+
+      const result = await hookSystem.firePostToolUseEvent(
+        'shell',
+        { command: 'ls' },
+        { llmContent: 'output' },
+      );
+
+      expect(result).toBeDefined();
+      expect(result?.notifications).toBeUndefined();
+    });
+
+    it('should return undefined when no final output', async () => {
+      const mockResult = {
+        success: true,
+        allOutputs: [],
+        errors: [],
+        totalDuration: 0,
+        finalOutput: undefined,
+        notifications: [
+          {
+            hookName: 'audit-hook',
+            message: 'noise that should be discarded',
+            decision: 'allow' as HookDecision,
+          },
+        ],
+      };
+      vi.mocked(mockHookEventHandler.firePostToolUseEvent).mockResolvedValue(
+        mockResult,
+      );
+
+      const result = await hookSystem.firePostToolUseEvent(
+        'shell',
+        { command: 'ls' },
+        { llmContent: 'output' },
+      );
+
+      expect(result).toBeUndefined();
     });
   });
 });

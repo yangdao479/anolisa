@@ -8,7 +8,7 @@ A curated collection of operational skills for AI Agents, covering system admini
 
 | Category | Directory | Description |
 |----------|-----------|-------------|
-| **AI Tools** | `ai/` | AI programming tool integration (Claude Code, OpenClaw, CoPaw, MCP setup) |
+| **AI Tools** | `ai/` | AI programming tool integration (Claude Code, OpenClaw, QwenPaw, MCP setup) |
 | **System Admin** | `system-admin/` | Package management, storage, networking, kernel, shell scripting |
 | **DevOps** | `devops/` | Git workflows, CI/CD, kernel development, diagnostics |
 | **Alibaba Cloud** | `aliyun/` | ECS instance management, cloud networking, GPU/AI deployment |
@@ -20,9 +20,9 @@ A curated collection of operational skills for AI Agents, covering system admini
 
 ### AI Tools
 - **install-claude-code** — Install and configure Claude Code IDE
-- **install-copaw** — Deploy CoPaw AI assistant with DingTalk integration
+- **install-qwenpaw** — Deploy QwenPaw AI assistant with DingTalk integration
 - **install-openclaw** — Install and configure OpenClaw
-- **copaw-usage** — CoPaw usage guide
+- **qwenpaw-usage** — QwenPaw usage guide
 - **setup-mcp** — Configure MCP servers in Copilot Shell
 
 ### System Admin

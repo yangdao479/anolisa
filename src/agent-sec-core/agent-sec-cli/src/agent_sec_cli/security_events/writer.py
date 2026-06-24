@@ -2,15 +2,42 @@
 
 import fcntl
 import json
+import logging
 import re
 import shutil
-import sys
 import threading
+from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 from agent_sec_cli.security_events.config import get_log_path
 from agent_sec_cli.security_events.schema import SecurityEvent
+
+_logger = logging.getLogger("agent_sec_cli.security_events.writer")
+
+
+def _log_security_events_write_failure(exc: Exception) -> None:
+    """Surface a security-events JSONL write failure via the diagnostic stream.
+
+    Goes through the ``agent_sec_cli`` logger tree, which is routed to
+    ``cli.jsonl`` by ``JsonlCliLogHandler``. The handler's own writer is
+    constructed *without* an ``on_error`` callback, so any failure to record
+    this warning cannot loop back into another security-events write.
+    """
+    try:
+        _logger.warning(
+            "security events JSONL write failed",
+            extra={
+                "data": {
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                }
+            },
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
 
 # Default maximum log file size before rotation (100 MB)
 DEFAULT_MAX_BYTES = 100 * 1024 * 1024
@@ -23,8 +50,8 @@ DEFAULT_BACKUP_COUNT = 10
 _BACKUP_SUFFIX_RE = re.compile(r"^\d{8}-\d{6}\.\d{3}(\.\d+)?$")
 
 
-class SecurityEventWriter:
-    """Append ``SecurityEvent`` records to a JSONL file.
+class JsonlEventWriter:
+    """Append JSON-serializable records to a JSONL file.
 
     * **Thread-safe** — every ``write()`` is guarded by a ``threading.Lock``.
     * **Auto-rotation** — automatically rotates the log file when it exceeds
@@ -40,18 +67,39 @@ class SecurityEventWriter:
 
     def __init__(
         self,
-        path: str | Path | None = None,
+        path: str | Path,
         max_bytes: int = DEFAULT_MAX_BYTES,
         backup_count: int = DEFAULT_BACKUP_COUNT,
+        *,
+        error_prefix: str = "[security_events]",
+        on_error: Callable[[Exception], None] | None = None,
     ) -> None:
-        self._path: Path = Path(path) if path else Path(get_log_path())
+        self._path: Path = Path(path).expanduser()
         self._max_bytes = max_bytes
         self._backup_count = backup_count
+        self._error_prefix = error_prefix
+        self._on_error = on_error
         self._lock = threading.Lock()
+        self._dir_created = False
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _notify_error(self, exc: Exception) -> None:
+        """Best-effort diagnostic callback for swallowed writer failures."""
+        if self._on_error is None:
+            return
+        try:
+            self._on_error(exc)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _ensure_parent_dir(self) -> None:
+        if self._dir_created:
+            return
+        self._path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self._dir_created = True
 
     def _needs_rotation(self, additional_bytes: int = 0) -> bool:
         """Check if the current log file would exceed the size limit after adding additional_bytes."""
@@ -88,10 +136,7 @@ class SecurityEventWriter:
         try:
             shutil.move(self._path, backup_path)
         except OSError as exc:
-            print(
-                f"[security_events] rotation failed: {exc}",
-                file=sys.stderr,
-            )
+            self._notify_error(exc)
             return
 
         # Clean up old backups exceeding backup_count
@@ -111,6 +156,7 @@ class SecurityEventWriter:
         lock_fd = None
         lock_acquired = False
         try:
+            self._ensure_parent_dir()
             lock_fd = lock_path.open("w")
             fcntl.flock(lock_fd, fcntl.LOCK_EX)
             lock_acquired = True
@@ -174,30 +220,73 @@ class SecurityEventWriter:
                 oldest_path, _ = backup_files.pop(0)
                 try:
                     oldest_path.unlink()
-                except OSError:
+                except OSError as exc:
+                    self._notify_error(exc)
                     pass
         except OSError as exc:
-            print(
-                f"[security_events] cleanup failed: {exc}",
-                file=sys.stderr,
-            )
+            self._notify_error(exc)
+            pass
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
-    def write(self, event: SecurityEvent) -> None:
-        """Serialize *event* and append it as a single JSONL line.
+    def _append_record(self, record: Mapping[str, Any]) -> None:
+        line = json.dumps(record, ensure_ascii=False) + "\n"
+        line_bytes = len(line.encode("utf-8"))
+        self._write_under_flock(line, line_bytes)
+
+    def write(self, record: Mapping[str, Any]) -> None:
+        """Serialize *record* and append it as a single JSONL line.
 
         This method is safe to call from any thread and will never raise.
+        Failures are forwarded to the ``on_error`` callback when configured;
+        the callback itself is wrapped to ensure it never re-raises.
         """
         with self._lock:
             try:
-                line = json.dumps(event.to_dict(), ensure_ascii=False) + "\n"
-                line_bytes = len(line.encode("utf-8"))
-                self._write_under_flock(line, line_bytes)
+                self._append_record(record)
             except Exception as exc:  # noqa: BLE001
-                print(
-                    f"[security_events] write error: {exc}",
-                    file=sys.stderr,
-                )
+                self._notify_error(exc)
+
+    def write_or_raise(self, record: Mapping[str, Any]) -> None:
+        """Serialize *record* and append it as a single JSONL line.
+
+        Unlike ``write()``, this method surfaces serialization and persistence
+        failures to callers that need a reliable ingestion contract.
+        """
+        with self._lock:
+            self._append_record(record)
+
+
+class SecurityEventWriter(JsonlEventWriter):
+    """Append ``SecurityEvent`` records to the security-events JSONL file."""
+
+    def __init__(
+        self,
+        path: str | Path | None = None,
+        max_bytes: int = DEFAULT_MAX_BYTES,
+        backup_count: int = DEFAULT_BACKUP_COUNT,
+    ) -> None:
+        super().__init__(
+            path=path or get_log_path(),
+            max_bytes=max_bytes,
+            backup_count=backup_count,
+            error_prefix="[security_events]",
+            on_error=_log_security_events_write_failure,
+        )
+
+    def write(self, record: SecurityEvent | Mapping[str, Any]) -> None:
+        """Serialize *record* and append it as a single JSONL line."""
+        if isinstance(record, SecurityEvent):
+            super().write(record.to_dict())
+            return
+        super().write(record)
+
+
+__all__ = [
+    "DEFAULT_BACKUP_COUNT",
+    "DEFAULT_MAX_BYTES",
+    "JsonlEventWriter",
+    "SecurityEventWriter",
+]

@@ -18,14 +18,15 @@ bash ./build-rpm.sh
 ## 安装到系统
 
 ```bash
-rpm -ivh ws-ckpt-0.2.0-1.x86_64.rpm
+rpm -ivh ws-ckpt-<VERSION>-1.x86_64.rpm
 ```
+
+> 将 `<VERSION>` 替换为实际版本号(如 `0.3.0`),与 `src/Cargo.toml` 的 `version` 字段一致。
 
 安装过程会自动：
 
-- 将 `ws-ckpt` 二进制部署到 `/usr/bin/`
-- 安装 systemd 服务文件到 `/etc/systemd/system/`
-- 创建运行时目录（`/run/ws-ckpt`、`/data/ws-ckpt`、`/mnt/btrfs-workspace`）
+- 将 `ws-ckpt` 二进制部署到 `/usr/local/bin/`
+- 安装 systemd 服务文件到 `/usr/lib/systemd/system/`
 - 执行 `systemctl daemon-reload` 并 `enable` 服务
 
 ## 验证安装

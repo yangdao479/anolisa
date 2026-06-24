@@ -48,6 +48,7 @@ BuildRequires:  make
 Requires:       agent-sec-cli = %{version}-%{release}
 Requires:       agent-sec-cosh-hook = %{version}-%{release}
 Requires:       agent-sec-openclaw-hook = %{version}-%{release}
+Requires:       agent-sec-hermes-hook = %{version}-%{release}
 Requires:       agent-sec-skills = %{version}-%{release}
 
 %description
@@ -73,6 +74,15 @@ Built with maturin as a Rust native Python extension.
 %defattr(0644,root,root,0755)
 %attr(0755,root,root) /usr/bin/agent-sec-cli
 /opt/agent-sec/lib/python3.11/site-packages/*
+%dir %{_datadir}/anolisa
+%dir %{_datadir}/anolisa/adapters
+%dir %{_datadir}/anolisa/adapters/sec-core
+%{_datadir}/anolisa/adapters/sec-core/manifest.json
+%dir %{_datadir}/anolisa/adapters/sec-core/common
+%{_datadir}/anolisa/adapters/sec-core/common/manifest.sh
+%dir %{_datadir}/anolisa/components
+%dir %{_datadir}/anolisa/components/sec-core
+%{_datadir}/anolisa/components/sec-core/component.toml
 %license LICENSE
 
 # =============================================================================
@@ -113,10 +123,34 @@ Hooks into OpenClaw to perform code scanning before tool execution.
 %defattr(0644,root,root,0755)
 %attr(0755,root,root) /opt/agent-sec/openclaw-plugin/scripts/deploy.sh
 /opt/agent-sec/openclaw-plugin/
+%dir %{_datadir}/anolisa/adapters/sec-core/openclaw
+%dir %{_datadir}/anolisa/adapters/sec-core/openclaw/scripts
+%attr(0755,root,root) %{_datadir}/anolisa/adapters/sec-core/openclaw/scripts/*.sh
 %license LICENSE
 
 # =============================================================================
-# Subpackage 4: agent-sec-skills
+# Subpackage 4: agent-sec-hermes-hook
+# =============================================================================
+%package -n agent-sec-hermes-hook
+Summary:        Hermes Agent plugin for agent security
+Requires:       agent-sec-cli = %{version}-%{release}
+Requires:       jq
+
+%description -n agent-sec-hermes-hook
+Hermes Agent security plugin powered by agent-sec-core.
+Provides OS-level security guardrails for Hermes Agent via agent-sec-cli.
+
+%files -n agent-sec-hermes-hook
+%defattr(0644,root,root,0755)
+%attr(0755,root,root) /opt/agent-sec/hermes-plugin/scripts/deploy.sh
+/opt/agent-sec/hermes-plugin/
+%dir %{_datadir}/anolisa/adapters/sec-core/hermes
+%dir %{_datadir}/anolisa/adapters/sec-core/hermes/scripts
+%attr(0755,root,root) %{_datadir}/anolisa/adapters/sec-core/hermes/scripts/*.sh
+%license LICENSE
+
+# =============================================================================
+# Subpackage 5: agent-sec-skills
 # =============================================================================
 %package -n agent-sec-skills
 Summary:        Agent security skill definitions for copilot-shell
@@ -157,7 +191,16 @@ rm -rf $RPM_BUILD_ROOT
 make install-all-for-rpmbuild DESTDIR=$RPM_BUILD_ROOT
 
 %changelog
-* Fri May 09 2026 YiZheng Yang <YiZheng.Yang@linux.alibaba.com> - 0.4.0-1
+* Fri Jun 05 2026 YiZheng Yang <YiZheng.Yang@linux.alibaba.com> - 0.6.0-1
+- Update version to 0.6.0
+
+* Fri May 22 2026 YiZheng Yang <YiZheng.Yang@linux.alibaba.com> - 0.5.0-1
+- Update version to 0.5.0
+
+* Wed May 13 2026 YiZheng Yang <YiZheng.Yang@linux.alibaba.com> - 0.4.1-1
+- Update version to 0.4.1
+
+* Sat May 09 2026 YiZheng Yang <YiZheng.Yang@linux.alibaba.com> - 0.4.0-1
 - Update version to 0.4.0
 
 * Sun Apr 26 2026 YiZheng Yang <YiZheng.Yang@linux.alibaba.com> - 0.3.0-1

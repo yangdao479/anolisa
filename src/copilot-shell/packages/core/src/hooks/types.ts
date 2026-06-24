@@ -101,6 +101,7 @@ export type HookDecision = 'ask' | 'block' | 'deny' | 'approve' | 'allow';
  */
 export interface HookInput {
   session_id: string;
+  run_id?: string;
   transcript_path: string;
   cwd: string;
   hook_event_name: string;
@@ -416,6 +417,7 @@ export interface SkillToolContext {
 }
 
 export interface PreToolUseInput extends HookInput {
+  tool_use_id?: string; // Unique identifier for the tool use
   permission_mode?: PermissionMode;
   tool_name: string;
   tool_input: Record<string, unknown>;

@@ -4,6 +4,7 @@ The backend preserves the wrapper's legacy defaults and structured event data
 while allowing callers to forward raw seharden arguments directly.
 """
 
+import logging
 import os
 import re
 import shutil
@@ -26,14 +27,20 @@ _MISSING_LOONGSHIELD_ERROR = (
     "If it is already installed, please make sure the `loongshield` binary is "
     "available in PATH."
 )
+logger = logging.getLogger(__name__)
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 _RULE_STATUS_RE = re.compile(
-    r"\[(?P<rule_id>[\w.]+)\]\s+"
-    r"(?P<status>FAIL|FAILED|FAILED-TO-FIX|ERROR|ENFORCE-ERROR|DRY-RUN|MANUAL|SKIP):\s*"
+    r"\[(?P<rule_id>[^\]\s]+)\]\s+"
+    r"(?P<status>FAIL|FAILED|FIXED|FAILED-TO-FIX|ERROR|ENFORCE-ERROR|DRY-RUN|MANUAL|SKIP):\s*"
     r"(?P<message>.+?)\s*$"
 )
-_ENGINE_ERROR_RE = re.compile(r"Engine\s+Error:\s*(?P<message>.+?)\s*$")
+_VERBOSE_RULE_STATUS_RE = re.compile(
+    r"^\s*(?P<status>PASS|FAIL)\s+\[(?P<rule_id>[^\]\s]+)\]\s+" r"(?P<message>.+?)\s*$"
+)
+_ENGINE_ERROR_RE = re.compile(
+    r"(?:\[(?P<rule_id>[^\]\s]+)\]\s+)?Engine\s+Error:\s*" r"(?P<message>.+?)\s*$"
+)
 
 
 def _strip_ansi(text: str) -> str:
@@ -41,17 +48,49 @@ def _strip_ansi(text: str) -> str:
     return _ANSI_RE.sub("", text)
 
 
+def _parse_rule_status_line(line: str) -> dict[str, str] | None:
+    """Parse supported loongshield per-rule status line formats."""
+    match = _RULE_STATUS_RE.search(line)
+    if match:
+        return {
+            "rule_id": match.group("rule_id"),
+            "status": match.group("status"),
+            "message": match.group("message").strip(),
+            "_source": "legacy",
+        }
+
+    match = _VERBOSE_RULE_STATUS_RE.search(line)
+    if not match or match.group("status") == "PASS":
+        return None
+
+    return {
+        "rule_id": match.group("rule_id"),
+        "status": match.group("status"),
+        "message": match.group("message").strip(),
+        "_source": "verbose",
+    }
+
+
+def _public_entry(entry: dict[str, str]) -> dict[str, str]:
+    """Return a parsed rule entry without internal parser metadata."""
+    return {
+        "rule_id": entry["rule_id"],
+        "status": entry["status"],
+        "message": entry["message"],
+    }
+
+
 class HardeningBackend(BaseBackend):
     """Execute `loongshield seharden` and keep structured hardening results."""
 
     _SUMMARY_RE = re.compile(
-        r"SEHarden\s+Finished\.\s*"
+        r"(?:SEHarden\s+Finished\.|Summary:)\s*"
         r"(?P<passed>\d+)\s+passed,\s*"
         r"(?P<fixed>\d+)\s+fixed,\s*"
         r"(?P<failed>\d+)\s+failed,\s*"
         r"(?P<manual>\d+)\s+manual,\s*"
         r"(?P<dry_run_pending>\d+)\s+dry-run-pending\s*/\s*"
-        r"(?P<total>\d+)\s+total\."
+        r"(?P<total>\d+)\s+total\.?"
     )
 
     def execute(
@@ -74,6 +113,18 @@ class HardeningBackend(BaseBackend):
         )
 
         if not loongshield_path:
+            logger.warning(
+                "loongshield command not found",
+                extra={
+                    "trace_id": ctx.trace_id,
+                    "data": {
+                        "action": ctx.action,
+                        "caller": ctx.caller,
+                        "exit_code": 127,
+                        "error_type": "FileNotFoundError",
+                    },
+                },
+            )
             return ActionResult(
                 success=False,
                 exit_code=127,
@@ -90,9 +141,22 @@ class HardeningBackend(BaseBackend):
                 text=True,
             )
         except OSError as exc:
+            exit_code = getattr(exc, "errno", 1) or 1
+            logger.error(
+                "failed to execute loongshield seharden",
+                exc_info=True,
+                extra={
+                    "trace_id": ctx.trace_id,
+                    "data": {
+                        "action": ctx.action,
+                        "caller": ctx.caller,
+                        "exit_code": exit_code,
+                    },
+                },
+            )
             return ActionResult(
                 success=False,
-                exit_code=getattr(exc, "errno", 1) or 1,
+                exit_code=exit_code,
                 error=f"Failed to execute `loongshield seharden`: {exc}",
                 data=data,
             )
@@ -228,38 +292,52 @@ class HardeningBackend(BaseBackend):
 
         entries: list[dict[str, str]] = []
         for line in clean_output.splitlines():
-            match = _RULE_STATUS_RE.search(line)
+            match = _parse_rule_status_line(line)
             if match:
-                entries.append(
-                    {
-                        "rule_id": match.group("rule_id"),
-                        "status": match.group("status"),
-                        "message": match.group("message").strip(),
-                    }
-                )
+                entries.append(match)
                 continue
 
             engine_match = _ENGINE_ERROR_RE.search(line)
             if engine_match:
                 entries.append(
                     {
-                        "rule_id": "",
+                        "rule_id": engine_match.group("rule_id") or "",
                         "status": "Engine Error",
                         "message": engine_match.group("message").strip(),
+                        "_source": "engine",
                     }
                 )
 
         mode = data.get("mode")
-        fixed_statuses = frozenset({"FAIL", "FAILED"})
+        fixed_statuses = {"FIXED"}
+        legacy_fixed_statuses = frozenset({"FAIL", "FAILED"})
         if mode == "reinforce":
-            data["failures"] = [
-                entry for entry in entries if entry["status"] not in fixed_statuses
-            ]
-            data["fixed_items"] = [
-                entry for entry in entries if entry["status"] in fixed_statuses
-            ]
+            fixed_rule_ids = {
+                entry["rule_id"]
+                for entry in entries
+                if entry["status"] in fixed_statuses
+            }
+            failures: list[dict[str, str]] = []
+            fixed_items: list[dict[str, str]] = []
+            for entry in entries:
+                status = entry["status"]
+                source = entry.get("_source")
+                rule_id = entry["rule_id"]
+                if status in fixed_statuses:
+                    fixed_items.append(_public_entry(entry))
+                elif status in legacy_fixed_statuses and source == "legacy":
+                    if rule_id not in fixed_rule_ids:
+                        fixed_items.append(_public_entry(entry))
+                elif status in legacy_fixed_statuses and source == "verbose":
+                    if rule_id not in fixed_rule_ids:
+                        failures.append(_public_entry(entry))
+                else:
+                    failures.append(_public_entry(entry))
+
+            data["failures"] = failures
+            data["fixed_items"] = fixed_items
         else:
-            data["failures"] = entries
+            data["failures"] = [_public_entry(entry) for entry in entries]
 
         reported_nonpass = (
             data.get("failed", 0)

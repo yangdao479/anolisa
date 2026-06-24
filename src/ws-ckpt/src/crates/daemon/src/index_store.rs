@@ -52,6 +52,9 @@ pub async fn rebuild_from_fs(
             metadata: None,
             pinned: false,
             created_at: chrono::Utc::now(),
+            missing: false,
+            parent_id: None,
+            child_ids: vec![],
         };
         index.snapshots.insert(name, meta);
     }
@@ -76,6 +79,9 @@ mod tests {
                 metadata: Some(serde_json::json!({"event": "init"})),
                 pinned: true,
                 created_at: chrono::Utc::now(),
+                missing: false,
+                parent_id: None,
+                child_ids: vec![],
             },
         );
 

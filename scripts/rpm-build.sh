@@ -5,7 +5,7 @@
 #   ./scripts/rpm-build.sh <package>        Build a single package
 #   ./scripts/rpm-build.sh all              Build all packages
 #
-# Packages: copilot-shell, agent-sec-core, os-skills, agentsight, tokenless
+# Packages: copilot-shell, agent-sec-core, os-skills, agentsight, tokenless, agent-memory
 #
 # Environment variables:
 #   VERSION    Override version for .spec.in templates (default: auto-detect)
@@ -25,6 +25,19 @@ SEC_DIR="${ROOT_DIR}/src/agent-sec-core"
 SKILLS_DIR="${ROOT_DIR}/src/os-skills"
 SIGHT_DIR="${ROOT_DIR}/src/agentsight"
 TOKEN_DIR="${ROOT_DIR}/src/tokenless"
+MEM_DIR="${ROOT_DIR}/src/agent-memory"
+SANDBOX_PKG_DIR="${ROOT_DIR}/src/anolisa/packaging/sandbox"
+
+# gVisor upstream release (overridable via env). Format: YYYYMMDD
+GVISOR_RELEASE="${GVISOR_RELEASE:-20260601}"
+GVISOR_RELEASE_VERSION="${GVISOR_RELEASE}.0"
+GVISOR_BASE_URL="${GVISOR_BASE_URL:-https://storage.googleapis.com/gvisor/releases/release}"
+
+# Distro tag override (e.g. .alinux4 / .alinux3). Empty = let rpmbuild choose.
+DIST_TAG="${DIST_TAG:-}"
+
+# Architecture detection (host arch, override with TARGET_ARCH=x86_64|aarch64)
+HOST_ARCH="${TARGET_ARCH:-$(uname -m)}"
 
 # Colors
 RED='\033[0;31m'
@@ -209,7 +222,7 @@ build_agent_sec_core() {
     local tmp_dir
     tmp_dir=$(mktemp -d)
     local pkg_dir="${tmp_dir}/${pkg_name}-${version}"
-    mkdir -p "$pkg_dir"/{skills,linux-sandbox,agent-sec-cli,cosh-extension,openclaw-plugin,scripts}
+    mkdir -p "$pkg_dir"/{skills,linux-sandbox,agent-sec-cli,cosh-extension,openclaw-plugin,hermes-plugin,scripts,tools}
 
     # skills: use cp -rp dir/. to include hidden files/directories
     cp -rp "${SEC_DIR}/skills/." "$pkg_dir/skills/"
@@ -217,7 +230,9 @@ build_agent_sec_core() {
     rm -f "$pkg_dir/linux-sandbox/rust-toolchain.toml"
     cp -rp "${SEC_DIR}/cosh-extension/"* "$pkg_dir/cosh-extension/"
     cp -p "${SEC_DIR}/scripts/agent-sec-cli-wrapper.sh" "$pkg_dir/scripts/"
+    cp -p "${SEC_DIR}/tools/sign-skill.sh" "$pkg_dir/tools/"
     cp "${SEC_DIR}/Makefile" "$pkg_dir/"
+    tar -cf - -C "${SEC_DIR}" adapters/ | tar -xf - -C "$pkg_dir/"
     [ -f "${SEC_DIR}/LICENSE" ] && cp "${SEC_DIR}/LICENSE" "$pkg_dir/"
     [ -f "${SEC_DIR}/README.md" ] && cp "${SEC_DIR}/README.md" "$pkg_dir/"
 
@@ -226,6 +241,11 @@ build_agent_sec_core() {
         --exclude='node_modules' \
         --exclude='.tsbuildinfo' \
         openclaw-plugin/ | tar -xf - -C "$pkg_dir/"
+
+    # hermes-plugin (exclude __pycache__ and dev artifacts)
+    tar -cf - -C "${SEC_DIR}" \
+        --exclude='__pycache__' \
+        hermes-plugin/src hermes-plugin/scripts | tar -xf - -C "$pkg_dir/"
 
     # Include agent-sec-cli source for maturin wheel build
     # Exclude development artifacts (.venv, target, __pycache__, .egg-info, dist)
@@ -351,6 +371,16 @@ build_agentsight() {
     fi
     (
         cd "$SIGHT_DIR"
+        # Build frontend (embed into Rust binary via include_dir!)
+        if [ -d "dashboard" ] && command -v npm &>/dev/null; then
+            log "Building frontend..."
+            cd dashboard
+            npm install
+            npm run build:embed
+            cd "$SIGHT_DIR"
+        else
+            warn "Skipping frontend build (dashboard/ not found or npm unavailable)"
+        fi
         cargo build --release
     )
 
@@ -366,6 +396,8 @@ build_agentsight() {
 
     # Copy relevant files
     cp -rp "${SIGHT_DIR}/target/release/agentsight" "$pkg_dir/" 2>/dev/null || warn "Binary missing"
+    [ -f "${SIGHT_DIR}/scripts/agentsight.service" ] && cp "${SIGHT_DIR}/scripts/agentsight.service" "$pkg_dir/"
+    [ -f "${SIGHT_DIR}/scripts/agentsight-start.sh" ] && cp "${SIGHT_DIR}/scripts/agentsight-start.sh" "$pkg_dir/agentsight-start"
     [ -f "${SIGHT_DIR}/README.md" ] && cp "${SIGHT_DIR}/README.md" "$pkg_dir/"
     [ -f "${SIGHT_DIR}/README_CN.md" ] && cp "${SIGHT_DIR}/README_CN.md" "$pkg_dir/"
     [ -f "${SIGHT_DIR}/LICENSE" ] && cp "${SIGHT_DIR}/LICENSE" "$pkg_dir/"
@@ -416,19 +448,15 @@ build_tokenless() {
     local spec_file
     spec_file=$(process_spec_template "$spec_in" "$version")
 
-    log "Step 1/3: Initializing submodules..."
+    log "Step 1/3: Setting up rtk vendored source..."
+    command -v just &>/dev/null || { err "'just' is required for RPM build. Install: cargo install just"; exit 1; }
     (
         cd "$TOKEN_DIR"
+        # Clone rtk into third_party/ (no submodule — uses justfile setup-rtk)
+        # Note: rtk source in tarball is already patched via justfile setup-rtk
         if [ ! -d "third_party/rtk/.git" ]; then
-            log "Initializing git submodules..."
-            git submodule update --init
+            just setup-rtk
         fi
-        # Build tokenless
-        cargo build --release --workspace
-        # Build rtk from submodule
-        cargo build --release --manifest-path third_party/rtk/Cargo.toml
-        # Build toon from submodule (fallback to pre-built binary if Rust < 1.88)
-        cargo build --release --manifest-path third_party/toon/Cargo.toml --features cli || true
     )
 
     log "Step 2/3: Creating source tarball ${tarball_name}..."
@@ -437,12 +465,25 @@ build_tokenless() {
     local pkg_dir="${tmp_dir}/${pkg_name}"
     mkdir -p "$pkg_dir"
 
-    # Copy full source tree, excluding build artifacts and VCS
+    # Copy full source tree (including vendored rtk), excluding build artifacts and VCS
+    # Note: third_party/rtk must be included — it's built separately via --manifest-path
+    # Adapter config files (manifest.json, package.json, openclaw.plugin.json, plugin.yaml)
+    # are excluded because they are generated from .in templates by
+    # stamp-adapter-templates during rpmbuild %build (make build-openclaw-plugin).
     tar -cf - -C "$TOKEN_DIR" \
         --exclude='target' \
         --exclude='.git' \
-        --exclude='.gitmodules' \
         --exclude='node_modules' \
+        --exclude='__pycache__' \
+        --exclude='*.pyc' \
+        --exclude='adapters/tokenless/manifest.json' \
+        --exclude='adapters/tokenless/openclaw/package.json' \
+        --exclude='adapters/tokenless/openclaw/openclaw.plugin.json' \
+        --exclude='adapters/tokenless/hermes/plugin.yaml' \
+        --exclude='adapters/tokenless/qoder/.qoder-plugin/plugin.json' \
+        --exclude='adapters/tokenless/claude-code/.claude-plugin/plugin.json' \
+        --exclude='adapters/tokenless/codex/.codex-plugin/plugin.json' \
+        --exclude='adapters/tokenless/qwencode/qwen-extension.json' \
         . | tar -xf - -C "$pkg_dir"
 
     tar -czf "${BUILD_DIR}/SOURCES/${tarball_name}" -C "$tmp_dir" "${pkg_name}"
@@ -457,22 +498,398 @@ build_tokenless() {
 }
 
 # =============================================================================
+# agent-memory
+# =============================================================================
+build_agent_memory() {
+    log "=========================================="
+    log "Building RPM: agent-memory"
+    log "=========================================="
+
+    local spec_in="${MEM_DIR}/agent-memory.spec.in"
+    if [ ! -f "$spec_in" ]; then
+        err "Spec template not found: $spec_in"
+        return 1
+    fi
+
+    # Always clean source-tree vendoring artefacts on exit (success or
+    # failure), so a `set -e` mid-build can't leave $MEM_DIR/vendor/
+    # and $MEM_DIR/.cargo/ behind to pollute the developer's git tree
+    # or confuse subsequent non-vendored cargo builds.
+    # shellcheck disable=SC2064  # we want $MEM_DIR expanded now
+    trap "rm -rf '${MEM_DIR}/vendor' '${MEM_DIR}/.cargo'" RETURN
+
+    # Version from env, Cargo.toml, then spec fallback
+    local version="${VERSION:-}"
+    if [ -z "$version" ]; then
+        version=$(grep -m1 '^version' "${MEM_DIR}/Cargo.toml" | sed 's/version = "\(.*\)"/\1/' 2>/dev/null || true)
+    fi
+    if [ -z "$version" ]; then
+        version=$(grep -m1 -oE '[0-9]+\.[0-9]+\.[0-9]+' "$spec_in" | head -1)
+    fi
+    if [ -z "$version" ]; then
+        # Hard fail rather than burying a stale fallback that drifts from
+        # Cargo.toml. The build must derive its version from the
+        # authoritative source (Cargo.toml → spec.in @VERSION@).
+        err "Could not derive agent-memory version from VERSION env, Cargo.toml, or ${spec_in}"
+        exit 1
+    fi
+
+    local pkg_name
+    pkg_name=$(parse_spec_name "$spec_in")
+    local tarball_name="${pkg_name}-${version}.tar.gz"
+
+    local spec_file
+    spec_file=$(process_spec_template "$spec_in" "$version")
+
+    # Build the OpenClaw TS plugin first so its dist/ is part of the
+    # source archive — the spec's %install copies the prebuilt bundle
+    # rather than running npm during rpmbuild (no network in mock).
+    log "Step 1/4: Building OpenClaw TS plugin..."
+    cd "$MEM_DIR" && make build-openclaw-plugin
+
+    # The source-archive top-level dir must match `%setup -n %{name}-%{version}`
+    # in the spec, so the unpacked tree lines up with the CI-produced
+    # archive from .github/actions/package-source.
+    log "Step 2/4: Creating source tarball ${tarball_name}..."
+    local tmp_dir
+    tmp_dir=$(mktemp -d)
+    local pkg_dir="${tmp_dir}/${pkg_name}-${version}"
+    mkdir -p "$pkg_dir"
+
+    # Single tar pass: copy the whole source tree minus build artefacts.
+    # The previous two-pass implementation hard-failed under `set -e`
+    # because the first pass referenced an `adapters/` directory that
+    # only existed in agent-sec-core. Now agent-memory ships its own
+    # adapters/ (the OpenClaw plugin built above) so a single pass
+    # captures it via the default include.
+    tar -cf - -C "$MEM_DIR" \
+        --exclude='target' \
+        --exclude='dist' \
+        --exclude='.git' \
+        --exclude='vendor' \
+        --exclude='.cargo' \
+        --exclude='node_modules' \
+        --exclude='.tsbuildinfo' \
+        --exclude='tests' \
+        . | tar -xf - -C "$pkg_dir"
+
+    # Vendor tarball for --offline cargo build. Must run BEFORE copying
+    # .cargo/config.toml into the source tarball so the vendored-sources
+    # config (not the original crates-io one) ends up in Source0.
+    log "Step 3/4: Creating vendor tarball..."
+    cd "$MEM_DIR" && cargo vendor vendor/
+    mkdir -p "$MEM_DIR"/.cargo
+    printf '[source.crates-io]\nreplace-with = "vendored-sources"\n\n[source.vendored-sources]\ndirectory = "vendor"\n' > "$MEM_DIR"/.cargo/config.toml
+    local vendor_tmp
+    vendor_tmp=$(mktemp -d)
+    cp -R "$MEM_DIR"/vendor "$vendor_tmp"/vendor
+    tar czf "${BUILD_DIR}/SOURCES/${pkg_name}-${version}-vendor.tar.gz" -C "$vendor_tmp" vendor
+    rm -rf "$vendor_tmp"
+
+    # .cargo/config.toml is now the vendored-sources version; copy it
+    # into Source0 so cargo --offline can find the local vendor/ dir.
+    # vendor/ itself is in Source1, extracted by %setup -a 1.
+    mkdir -p "$pkg_dir"/.cargo
+    cp "$MEM_DIR"/.cargo/config.toml "$pkg_dir"/.cargo/
+
+    tar -czf "${BUILD_DIR}/SOURCES/${tarball_name}" -C "$tmp_dir" "${pkg_name}-${version}"
+    rm -rf "$tmp_dir"
+
+    log "Step 4/4: Running rpmbuild..."
+    "$RPMBUILD" -ba --nodeps \
+        --define "_topdir ${BUILD_DIR}" \
+        "$spec_file"
+
+    ok "agent-memory RPM built successfully"
+}
+
+# =============================================================================
+# sandbox: shared helpers
+# =============================================================================
+
+# Map architecture to gVisor release directory naming
+gvisor_arch() {
+    case "$HOST_ARCH" in
+        x86_64|amd64)  echo "x86_64" ;;
+        aarch64|arm64) echo "aarch64" ;;
+        *) err "Unsupported arch: $HOST_ARCH"; return 1 ;;
+    esac
+}
+
+# Run rpmbuild with optional --define dist override (alinux4/alinux3 etc.)
+rpmbuild_with_dist() {
+    local spec_file="$1"
+    local extra_defines=()
+    # Pass spec_release_suffix through if set (used by cmdoutput-fix.patch path).
+    if [ -n "${SPEC_RELEASE_SUFFIX:-}" ]; then
+        extra_defines+=( --define "spec_release_suffix ${SPEC_RELEASE_SUFFIX}" )
+    fi
+    if [ -n "$DIST_TAG" ]; then
+        "$RPMBUILD" -ba --nodeps \
+            --define "_topdir ${BUILD_DIR}" \
+            --define "dist ${DIST_TAG}" \
+            "${extra_defines[@]}" \
+            "$spec_file"
+    else
+        "$RPMBUILD" -ba --nodeps \
+            --define "_topdir ${BUILD_DIR}" \
+            "${extra_defines[@]}" \
+            "$spec_file"
+    fi
+}
+
+# Download upstream gvisor binary + sha512 with retry. Idempotent.
+# Args: <name> <out_dir>   where <name> ∈ runsc | containerd-shim-runsc-v1
+fetch_gvisor_binary() {
+    local bin_name="$1"
+    local out_dir="$2"
+    local arch
+    arch="$(gvisor_arch)" || return 1
+
+    install -d -m 0755 "$out_dir"
+
+    # Local-binary override hook (cmdoutput-fix.patch RPM build path).
+    # When SHIM_LOCAL_BINARY is set and we are fetching the shim, copy the
+    # locally-built patched ELF instead of pulling from upstream. This is the
+    # only injection point needed because the spec is a rebrand-only wrapper:
+    # %install just `install -p -m 0755 <bin> /usr/bin/<bin>`.
+    if [ "$bin_name" = "containerd-shim-runsc-v1" ] && [ -n "${SHIM_LOCAL_BINARY:-}" ]; then
+        if [ ! -f "$SHIM_LOCAL_BINARY" ]; then
+            err "SHIM_LOCAL_BINARY=$SHIM_LOCAL_BINARY does not exist"; return 1
+        fi
+        if ! file "$SHIM_LOCAL_BINARY" 2>/dev/null | grep -q 'ELF.*executable'; then
+            warn "SHIM_LOCAL_BINARY=$SHIM_LOCAL_BINARY is not an ELF executable"
+        fi
+        log "Using local patched binary: $SHIM_LOCAL_BINARY (overrides upstream fetch)"
+        install -p -m 0755 "$SHIM_LOCAL_BINARY" "${out_dir}/${bin_name}"
+        ( cd "$out_dir" && sha512sum "$bin_name" > "${bin_name}.sha512" )
+        ok "local binary staged: ${bin_name} ($(du -h "${out_dir}/${bin_name}" | cut -f1))"
+        return 0
+    fi
+
+    local url="${GVISOR_BASE_URL}/${GVISOR_RELEASE}/${arch}/${bin_name}"
+    local sha_url="${url}.sha512"
+
+    log "Fetching ${bin_name} from ${url}"
+    curl -fL --retry 3 --retry-delay 2 -o "${out_dir}/${bin_name}" "$url" || {
+        err "Failed to download ${bin_name} from upstream"; return 1; }
+    curl -fL --retry 3 --retry-delay 2 -o "${out_dir}/${bin_name}.sha512" "$sha_url" || {
+        warn "sha512 sidecar not available for ${bin_name}; skipping integrity check"; }
+
+    if [ -f "${out_dir}/${bin_name}.sha512" ]; then
+        ( cd "$out_dir" && sha512sum -c "${bin_name}.sha512" ) \
+            || { err "sha512 mismatch for ${bin_name}"; return 1; }
+        ok "sha512 verified: ${bin_name}"
+    fi
+    chmod 0755 "${out_dir}/${bin_name}"
+}
+
+# Generic packager for sandbox specs that wrap an upstream binary.
+# Args: <pkg_name> <bin_name>
+_build_sandbox_upstream() {
+    local pkg_name="$1"
+    local bin_name="$2"
+    local spec_in="${SANDBOX_PKG_DIR}/${pkg_name}.spec.in"
+    [ -f "$spec_in" ] || { err "Spec template not found: $spec_in"; return 1; }
+
+    local version="${VERSION:-$GVISOR_RELEASE_VERSION}"
+    local tarball_name="${pkg_name}-${version}.tar.gz"
+
+    local spec_file
+    spec_file=$(process_spec_template "$spec_in" "$version")
+
+    log "Step 1/3: Fetching upstream binary (${bin_name})..."
+    local tmp_dir
+    tmp_dir=$(mktemp -d)
+    local pkg_dir="${tmp_dir}/${pkg_name}-${version}"
+    mkdir -p "$pkg_dir"
+    fetch_gvisor_binary "$bin_name" "$pkg_dir" || { rm -rf "$tmp_dir"; return 1; }
+
+    # LICENSE / README placeholders (so spec %doc works under --strict)
+    cat > "${pkg_dir}/LICENSE" <<'EOF'
+Copyright 2018 The gVisor Authors. Licensed under Apache-2.0.
+Full text: https://www.apache.org/licenses/LICENSE-2.0.txt
+EOF
+    cat > "${pkg_dir}/README.md" <<EOF
+# ${pkg_name} ${version}
+
+Repackaged upstream gVisor binary — see
+https://gvisor.dev/docs/architecture_guide/ and
+ANOLISA-design/docs/anolisa/osbase/sandbox/sandbox-rpm-packaging.md
+EOF
+
+    log "Step 2/3: Creating source tarball ${tarball_name}..."
+    tar -czf "${BUILD_DIR}/SOURCES/${tarball_name}" -C "$tmp_dir" "${pkg_name}-${version}"
+    rm -rf "$tmp_dir"
+
+    log "Step 3/3: Running rpmbuild..."
+    rpmbuild_with_dist "$spec_file"
+    ok "${pkg_name} RPM built successfully"
+}
+
+# Generic packager for sandbox specs whose source is just a placeholder shim
+# (atelet, ateom-gvisor). Spec generates the binary at %install time.
+# Args: <pkg_name> <default_version>
+_build_sandbox_placeholder() {
+    local pkg_name="$1"
+    local default_version="$2"
+    local spec_in="${SANDBOX_PKG_DIR}/${pkg_name}.spec.in"
+    [ -f "$spec_in" ] || { err "Spec template not found: $spec_in"; return 1; }
+
+    local version="${VERSION:-$default_version}"
+    local tarball_name="${pkg_name}-${version}.tar.gz"
+
+    local spec_file
+    spec_file=$(process_spec_template "$spec_in" "$version")
+
+    log "Step 1/2: Creating placeholder source tarball ${tarball_name}..."
+    local tmp_dir
+    tmp_dir=$(mktemp -d)
+    local pkg_dir="${tmp_dir}/${pkg_name}-${version}"
+    mkdir -p "$pkg_dir"
+    cat > "${pkg_dir}/LICENSE" <<'EOF'
+Copyright 2026 The ANOLISA Authors. Licensed under Apache-2.0.
+Full text: https://www.apache.org/licenses/LICENSE-2.0.txt
+EOF
+    cat > "${pkg_dir}/README.md" <<EOF
+# ${pkg_name} ${version}
+
+Placeholder ANOLISA Substrate component. Real implementation pending —
+see ANOLISA-design/docs/anolisa/osbase/sandbox/sandbox-rpm-packaging.md
+EOF
+    tar -czf "${BUILD_DIR}/SOURCES/${tarball_name}" -C "$tmp_dir" "${pkg_name}-${version}"
+    rm -rf "$tmp_dir"
+
+    log "Step 2/2: Running rpmbuild..."
+    rpmbuild_with_dist "$spec_file"
+    ok "${pkg_name} RPM built successfully"
+}
+
+build_gvisor_runsc() {
+    log "=========================================="
+    log "Building RPM: gvisor-runsc (release-${GVISOR_RELEASE_VERSION}, arch=$(gvisor_arch))"
+    log "=========================================="
+    _build_sandbox_upstream "gvisor-runsc" "runsc"
+}
+
+build_containerd_shim_runsc_v1() {
+    log "=========================================="
+    if [ -n "${SHIM_LOCAL_BINARY:-}" ]; then
+        : "${SPEC_RELEASE_SUFFIX:=.cmdoutput.fix1}"
+        export SPEC_RELEASE_SUFFIX
+        log "Building RPM: containerd-shim-runsc-v1 (release-${GVISOR_RELEASE_VERSION}${SPEC_RELEASE_SUFFIX}) [PATCHED via SHIM_LOCAL_BINARY]"
+    else
+        log "Building RPM: containerd-shim-runsc-v1 (release-${GVISOR_RELEASE_VERSION})"
+    fi
+    log "=========================================="
+    _build_sandbox_upstream "containerd-shim-runsc-v1" "containerd-shim-runsc-v1"
+}
+
+build_atelet() {
+    log "=========================================="
+    log "Building RPM: atelet (placeholder)"
+    log "=========================================="
+    _build_sandbox_placeholder "atelet" "0.1.0"
+}
+
+build_ateom_gvisor() {
+    log "=========================================="
+    log "Building RPM: ateom-gvisor (placeholder)"
+    log "=========================================="
+    _build_sandbox_placeholder "ateom-gvisor" "0.1.0"
+}
+
+build_sandbox_all() {
+    build_gvisor_runsc
+    build_containerd_shim_runsc_v1
+    build_atelet
+    build_ateom_gvisor
+    # Repo metadata is the final stitch that makes the 4 RPMs consumable via
+    # `dnf install -y gvisor-runsc ...`. We attempt to generate it, but DO NOT
+    # fail the build if createrepo_c is missing — operators can run
+    # `bash scripts/rpm-build.sh sandbox-repo` later (or the SRE pipeline will
+    # do it on the internal yum host). See sandbox-rpm-packaging.md §8.5.
+    if command -v createrepo_c >/dev/null 2>&1 || command -v createrepo >/dev/null 2>&1; then
+        build_sandbox_repo
+    else
+        log "createrepo_c not installed; skipping repodata generation."
+        log "Install with: dnf install -y createrepo_c"
+        log "Then run: bash scripts/rpm-build.sh sandbox-repo"
+    fi
+}
+
+# Generate yum/dnf repo metadata for the sandbox RPM set.
+# Writes repodata/ in BOTH locations:
+#   1. ${BUILD_DIR}/RPMS/<arch>/   (the local rpmbuild tree)
+#   2. The dist staging tree if SANDBOX_DIST_DIR is set, e.g.
+#      SANDBOX_DIST_DIR=$REPO/dist/sandbox/alinux4 with subdirs RPMS/ SRPMS/
+build_sandbox_repo() {
+    log "=========================================="
+    log "Generating sandbox yum/dnf repo metadata"
+    log "=========================================="
+    local createrepo
+    if command -v createrepo_c >/dev/null 2>&1; then
+        createrepo="createrepo_c"
+    elif command -v createrepo >/dev/null 2>&1; then
+        createrepo="createrepo"
+    else
+        err "createrepo_c (or createrepo) is required. Install: dnf install -y createrepo_c"
+        return 1
+    fi
+
+    local arch_dir="${BUILD_DIR}/RPMS/$(gvisor_arch)"
+    if [ -d "$arch_dir" ]; then
+        log "createrepo on ${arch_dir}"
+        "$createrepo" --update "$arch_dir"
+    fi
+
+    if [ -n "${SANDBOX_DIST_DIR:-}" ] && [ -d "$SANDBOX_DIST_DIR" ]; then
+        for sub in RPMS SRPMS; do
+            if [ -d "${SANDBOX_DIST_DIR}/${sub}" ]; then
+                log "createrepo on ${SANDBOX_DIST_DIR}/${sub}"
+                "$createrepo" --update "${SANDBOX_DIST_DIR}/${sub}"
+            fi
+        done
+    fi
+
+    log "Repo metadata ready. Sample dnf repo file:"
+    cat <<'REPO_EOF'
+[anolisa-sandbox]
+name=ANOLISA Sandbox RPMs (gvisor-runsc, containerd-shim-runsc-v1, atelet, ateom-gvisor)
+baseurl=file://<absolute-path-to-RPMS-dir>
+enabled=1
+gpgcheck=0
+REPO_EOF
+}
+
+# =============================================================================
 # Main
 # =============================================================================
 usage() {
     echo "Usage: $0 <package|all>"
     echo ""
     echo "Packages:"
-    echo "  copilot-shell       Build copilot-shell RPM"
-    echo "  agent-sec-core      Build agent-sec-core RPM"
-    echo "  os-skills           Build os-skills RPM"
-    echo "  agentsight          Build agentsight RPM"
-    echo "  tokenless           Build tokenless RPM"
-    echo "  all                 Build all RPM packages"
+    echo "  copilot-shell             Build copilot-shell RPM"
+    echo "  agent-sec-core            Build agent-sec-core RPM"
+    echo "  os-skills                 Build os-skills RPM"
+    echo "  agentsight                Build agentsight RPM"
+    echo "  tokenless                 Build tokenless RPM"
+    echo "  agent-memory              Build agent-memory RPM"
+    echo "  gvisor-runsc              Build gvisor-runsc RPM (sandbox)"
+    echo "  containerd-shim-runsc-v1  Build containerd-shim-runsc-v1 RPM (sandbox)"
+    echo "  atelet                    Build atelet RPM (sandbox, placeholder)"
+    echo "  ateom-gvisor              Build ateom-gvisor RPM (sandbox, placeholder)"
+    echo "  sandbox-all               Build all 4 sandbox RPMs"
+    echo "  sandbox-repo              Generate yum/dnf repo metadata (createrepo_c) for sandbox RPMs"
+    echo "  all                       Build all RPM packages (legacy 6 only)"
     echo ""
     echo "Environment variables:"
-    echo "  VERSION             Override version for .spec.in templates"
-    echo "  RPMBUILD            Path to rpmbuild binary (default: rpmbuild)"
+    echo "  VERSION                   Override version for .spec.in templates"
+    echo "  RPMBUILD                  Path to rpmbuild binary (default: rpmbuild)"
+    echo "  DIST_TAG                  Override %{dist} (e.g. .alinux4, .alinux3)"
+    echo "  GVISOR_RELEASE            gVisor upstream release date (default: 20260601)"
+    echo "  GVISOR_BASE_URL           gVisor mirror base URL (overridable for offline)"
+    echo "  TARGET_ARCH               Force arch (x86_64|aarch64; default: uname -m)"
     echo ""
     echo "Output: scripts/rpmbuild/RPMS/"
 }
@@ -508,12 +925,34 @@ case "$TARGET" in
     tokenless)
         build_tokenless
         ;;
+    agent-memory)
+        build_agent_memory
+        ;;
+    gvisor-runsc)
+        build_gvisor_runsc
+        ;;
+    containerd-shim-runsc-v1)
+        build_containerd_shim_runsc_v1
+        ;;
+    atelet)
+        build_atelet
+        ;;
+    ateom-gvisor)
+        build_ateom_gvisor
+        ;;
+    sandbox-all)
+        build_sandbox_all
+        ;;
+    sandbox-repo)
+        build_sandbox_repo
+        ;;
     all)
         build_copilot_shell
         build_agent_sec_core
         build_agentic_os_skills
         build_agentsight
         build_tokenless
+        build_agent_memory
         ;;
     *)
         err "Unknown package: $TARGET"

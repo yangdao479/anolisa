@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 /// Unified message role across different LLM providers
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum MessageRole {
     /// System message (instructions/context)
     /// Note: Some newer OpenAI models use "developer" instead of "system"
@@ -24,17 +25,12 @@ pub enum MessageRole {
     /// Used for developer instructions that should take precedence over user messages
     Developer,
     /// User message (human input)
+    #[default]
     User,
     /// Assistant message (LLM response)
     Assistant,
     /// Tool/Function message
     Tool,
-}
-
-impl Default for MessageRole {
-    fn default() -> Self {
-        MessageRole::User
-    }
 }
 
 // ============================================================================
@@ -462,6 +458,16 @@ pub enum AnthropicContentBlock {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cache_control: Option<serde_json::Value>,
     },
+    /// Thinking content block (extended thinking / chain-of-thought)
+    #[serde(rename = "thinking")]
+    Thinking {
+        /// The thinking/reasoning content
+        #[serde(default)]
+        thinking: String,
+        /// Cryptographic signature for thinking verification
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
+    },
     /// Image content block
     #[serde(rename = "image")]
     Image {
@@ -610,9 +616,7 @@ pub struct OpenAiSseDelta {
 #[serde(rename_all = "snake_case")]
 pub enum AnthropicSseEvent {
     /// Message start event (contains initial message metadata)
-    MessageStart {
-        message: AnthropicSseMessageStart,
-    },
+    MessageStart { message: AnthropicSseMessageStart },
     /// Content block start event
     ContentBlockStart {
         index: u32,
@@ -624,9 +628,7 @@ pub enum AnthropicSseEvent {
         delta: AnthropicSseDelta,
     },
     /// Content block stop event
-    ContentBlockStop {
-        index: u32,
-    },
+    ContentBlockStop { index: u32 },
     /// Message delta event (stop_reason, usage update)
     MessageDelta {
         delta: AnthropicSseMessageDelta,
@@ -637,9 +639,7 @@ pub enum AnthropicSseEvent {
     /// Ping event
     Ping,
     /// Error event
-    Error {
-        error: serde_json::Value,
-    },
+    Error { error: serde_json::Value },
 }
 
 /// Anthropic SSE message start data
@@ -673,13 +673,16 @@ pub struct AnthropicSseMessageStart {
 #[serde(rename_all = "snake_case")]
 pub enum AnthropicSseDelta {
     /// Text delta
-    TextDelta {
-        text: String,
+    TextDelta { text: String },
+    /// Thinking delta (extended thinking / chain-of-thought)
+    ThinkingDelta { thinking: String },
+    /// Signature delta (thinking block signature)
+    SignatureDelta {
+        #[serde(default)]
+        signature: String,
     },
     /// Input JSON delta (for tool use)
-    InputJsonDelta {
-        partial_json: String,
-    },
+    InputJsonDelta { partial_json: String },
 }
 
 /// Anthropic SSE message delta
@@ -775,6 +778,21 @@ impl ParsedApiMessage {
         }
     }
 
+    /// Extract session_id from request metadata (Anthropic only).
+    ///
+    /// Priority:
+    /// 1. `metadata.session_id` or `metadata.sessionId` (direct string)
+    /// 2. `metadata.user_id` — JSON-encoded object with `session_id`, or `_session_<UUID>` pattern
+    pub fn request_metadata_session_id(&self) -> Option<String> {
+        match self {
+            ParsedApiMessage::AnthropicMessage { request, .. } => {
+                let meta = request.as_ref()?.metadata.as_ref()?;
+                session_id_from_metadata(meta)
+            }
+            _ => None,
+        }
+    }
+
     /// Check if streaming was requested
     pub fn is_streaming(&self) -> Option<bool> {
         match self {
@@ -789,6 +807,44 @@ impl ParsedApiMessage {
             }
         }
     }
+}
+
+/// Extract session_id from a metadata JSON value (Anthropic format).
+///
+/// Priority:
+/// 1. `metadata.session_id` or `metadata.sessionId` (direct string)
+/// 2. `metadata.user_id` — JSON-encoded object with `session_id`, or `_session_<UUID>` pattern
+pub(crate) fn session_id_from_metadata(meta: &serde_json::Value) -> Option<String> {
+    // 1. Direct session_id / sessionId
+    if let Some(sid) = meta.get("session_id").and_then(|v| v.as_str()) {
+        if !sid.is_empty() {
+            return Some(sid.to_string());
+        }
+    }
+    if let Some(sid) = meta.get("sessionId").and_then(|v| v.as_str()) {
+        if !sid.is_empty() {
+            return Some(sid.to_string());
+        }
+    }
+    // 2. user_id field — try JSON decode, then substring pattern
+    if let Some(user_id) = meta.get("user_id").and_then(|v| v.as_str()) {
+        // 2a. JSON-encoded object: {"session_id": "..."}
+        if let Ok(obj) = serde_json::from_str::<serde_json::Value>(user_id) {
+            if let Some(sid) = obj.get("session_id").and_then(|v| v.as_str()) {
+                if !sid.is_empty() {
+                    return Some(sid.to_string());
+                }
+            }
+        }
+        // 2b. Pattern: ..._session_<UUID>
+        if let Some(pos) = user_id.find("_session_") {
+            let after = &user_id[pos + "_session_".len()..];
+            if !after.is_empty() {
+                return Some(after.to_string());
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -896,7 +952,9 @@ mod tests {
     #[test]
     fn test_openai_content_parts_with_image() {
         let parts = OpenAIContent::Parts(vec![
-            OpenAIContentPart::Text { text: "Look at this:".to_string() },
+            OpenAIContentPart::Text {
+                text: "Look at this:".to_string(),
+            },
             OpenAIContentPart::ImageUrl {
                 image_url: OpenAIImageUrl {
                     url: "https://example.com/img.png".to_string(),
@@ -929,7 +987,8 @@ mod tests {
 
     #[test]
     fn test_anthropic_system_prompt_blocks() {
-        let json_str = r#"[{"type": "text", "text": "Part 1"}, {"type": "text", "text": "Part 2"}]"#;
+        let json_str =
+            r#"[{"type": "text", "text": "Part 1"}, {"type": "text", "text": "Part 2"}]"#;
         let blocks: Vec<AnthropicSystemBlock> = serde_json::from_str(json_str).unwrap();
         let prompt = AnthropicSystemPrompt::Blocks(blocks);
         assert_eq!(prompt.as_text(), "Part 1\nPart 2");
@@ -969,8 +1028,14 @@ mod tests {
         assert_eq!(text.as_text(), "simple");
 
         let blocks = AnthropicMessageContent::Blocks(vec![
-            AnthropicContentBlock::Text { text: "part1".to_string(), cache_control: None },
-            AnthropicContentBlock::Text { text: "part2".to_string(), cache_control: None },
+            AnthropicContentBlock::Text {
+                text: "part1".to_string(),
+                cache_control: None,
+            },
+            AnthropicContentBlock::Text {
+                text: "part2".to_string(),
+                cache_control: None,
+            },
         ]);
         assert_eq!(blocks.as_text(), "part1part2");
     }
@@ -1033,12 +1098,22 @@ mod tests {
             request: Some(OpenAIRequest {
                 model: "gpt-4".to_string(),
                 messages: vec![],
-                temperature: None, max_tokens: None, stream: None,
-                top_p: None, n: None, stop: None,
-                presence_penalty: None, frequency_penalty: None,
-                user: None, tools: None, tool_choice: None,
-                response_format: None, seed: None, logprobs: None,
-                top_logprobs: None, parallel_tool_calls: None,
+                temperature: None,
+                max_tokens: None,
+                stream: None,
+                top_p: None,
+                n: None,
+                stop: None,
+                presence_penalty: None,
+                frequency_penalty: None,
+                user: None,
+                tools: None,
+                tool_choice: None,
+                response_format: None,
+                seed: None,
+                logprobs: None,
+                top_logprobs: None,
+                parallel_tool_calls: None,
             }),
             response: None,
         };
@@ -1053,8 +1128,11 @@ mod tests {
             response: Some(OpenAIResponse {
                 id: "chatcmpl-xyz".to_string(),
                 object: "chat.completion".to_string(),
-                created: 0, model: "gpt-4".to_string(),
-                choices: vec![], usage: None, system_fingerprint: None,
+                created: 0,
+                model: "gpt-4".to_string(),
+                choices: vec![],
+                usage: None,
+                system_fingerprint: None,
             }),
         };
         assert_eq!(msg.response_id(), Some("chatcmpl-xyz"));
@@ -1077,5 +1155,135 @@ mod tests {
         let msg: OpenAIChatMessage = serde_json::from_str(json_str).unwrap();
         assert!(msg.content.is_none());
         assert_eq!(msg.tool_calls.as_ref().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_request_metadata_session_id_direct() {
+        // Anthropic metadata.session_id 直接取
+        let msg = ParsedApiMessage::AnthropicMessage {
+            request: Some(AnthropicRequest {
+                model: "claude-3".to_string(),
+                messages: vec![],
+                max_tokens: 4096,
+                system: None,
+                stream: None,
+                temperature: None,
+                top_p: None,
+                top_k: None,
+                stop_sequences: None,
+                tools: None,
+                tool_choice: None,
+                metadata: Some(serde_json::json!({"session_id": "abc-123"})),
+            }),
+            response: None,
+        };
+        assert_eq!(
+            msg.request_metadata_session_id(),
+            Some("abc-123".to_string())
+        );
+    }
+
+    #[test]
+    fn test_request_metadata_session_id_user_id_json() {
+        // metadata.user_id 是 JSON 编码的对象
+        let msg = ParsedApiMessage::AnthropicMessage {
+            request: Some(AnthropicRequest {
+                model: "claude-3".to_string(),
+                messages: vec![],
+                max_tokens: 4096,
+                system: None,
+                stream: None,
+                temperature: None,
+                top_p: None,
+                top_k: None,
+                stop_sequences: None,
+                tools: None,
+                tool_choice: None,
+                metadata: Some(serde_json::json!({"user_id": "{\"session_id\":\"sess-456\"}"})),
+            }),
+            response: None,
+        };
+        assert_eq!(
+            msg.request_metadata_session_id(),
+            Some("sess-456".to_string())
+        );
+    }
+
+    #[test]
+    fn test_request_metadata_session_id_user_id_pattern() {
+        // metadata.user_id 是 ..._session_<UUID> 格式
+        let msg = ParsedApiMessage::AnthropicMessage {
+            request: Some(AnthropicRequest {
+                model: "claude-3".to_string(),
+                messages: vec![],
+                max_tokens: 4096,
+                system: None,
+                stream: None,
+                temperature: None,
+                top_p: None,
+                top_k: None,
+                stop_sequences: None,
+                tools: None,
+                tool_choice: None,
+                metadata: Some(serde_json::json!({"user_id": "proj_abc_session_uuid-789-xyz"})),
+            }),
+            response: None,
+        };
+        assert_eq!(
+            msg.request_metadata_session_id(),
+            Some("uuid-789-xyz".to_string())
+        );
+    }
+
+    #[test]
+    fn test_request_metadata_session_id_none_fallback() {
+        // 无 metadata 时返回 None（反向：不误报）
+        let msg = ParsedApiMessage::AnthropicMessage {
+            request: Some(AnthropicRequest {
+                model: "claude-3".to_string(),
+                messages: vec![],
+                max_tokens: 4096,
+                system: None,
+                stream: None,
+                temperature: None,
+                top_p: None,
+                top_k: None,
+                stop_sequences: None,
+                tools: None,
+                tool_choice: None,
+                metadata: None,
+            }),
+            response: None,
+        };
+        assert_eq!(msg.request_metadata_session_id(), None);
+    }
+
+    #[test]
+    fn test_request_metadata_session_id_openai_returns_none() {
+        // OpenAI 不走 metadata 抽取，始终返回 None
+        let msg = ParsedApiMessage::OpenAICompletion {
+            request: Some(OpenAIRequest {
+                model: "gpt-4".to_string(),
+                messages: vec![],
+                max_tokens: None,
+                temperature: None,
+                top_p: None,
+                frequency_penalty: None,
+                presence_penalty: None,
+                n: None,
+                stream: None,
+                stop: None,
+                user: Some("user-session-abc".to_string()),
+                tools: None,
+                tool_choice: None,
+                response_format: None,
+                seed: None,
+                logprobs: None,
+                top_logprobs: None,
+                parallel_tool_calls: None,
+            }),
+            response: None,
+        };
+        assert_eq!(msg.request_metadata_session_id(), None);
     }
 }

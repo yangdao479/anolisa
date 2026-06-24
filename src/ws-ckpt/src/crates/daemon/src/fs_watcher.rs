@@ -2,15 +2,12 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use notify::event::{AccessKind, AccessMode};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tracing::warn;
 
-/// Watches a workspace directory tree for write activity.
-///
-/// Uses the `notify` crate in recursive mode so that writes happening in any
-/// subdirectory (not just the top level) flip the write flag. On Linux the
-/// recommended backend is inotify with recursive registration handled by the
-/// crate itself, including newly created subdirectories.
+/// Recursive workspace write watcher. CLOSE_WRITE clears the flag so
+/// checkpoint can skip the quiescence wait when all writers have closed.
 pub struct WorkspaceWatcher {
     is_writing: Arc<AtomicBool>,
     /// Hold the watcher so its background thread stays alive; dropping the
@@ -47,11 +44,15 @@ impl WorkspaceWatcher {
         tokio::spawn(async move {
             while let Some(res) = rx.recv().await {
                 match res {
-                    Ok(event) => {
-                        if is_write_event(&event.kind) {
+                    Ok(event) => match &event.kind {
+                        EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_) => {
                             writing.store(true, Ordering::Release);
                         }
-                    }
+                        EventKind::Access(AccessKind::Close(AccessMode::Write)) => {
+                            writing.store(false, Ordering::Release);
+                        }
+                        _ => {}
+                    },
                     Err(e) => {
                         warn!("notify error for {:?}: {}", log_path, e);
                     }
@@ -99,14 +100,48 @@ impl WorkspaceWatcher {
     }
 }
 
-/// Return true for event kinds that represent actual write activity.
-///
-/// We intentionally treat Create / Modify / Remove / (file) Rename as writes.
-/// Access-only events (e.g. metadata-only access timestamps) are ignored to
-/// avoid false positives.
-fn is_write_event(kind: &EventKind) -> bool {
-    matches!(
-        kind,
-        EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
-    )
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    #[tokio::test]
+    async fn start_valid_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let watcher = WorkspaceWatcher::start(dir.path()).unwrap();
+        assert_eq!(watcher.workspace_path(), dir.path());
+    }
+
+    #[tokio::test]
+    async fn quiescent_when_idle() {
+        let dir = tempfile::tempdir().unwrap();
+        let watcher = WorkspaceWatcher::start(dir.path()).unwrap();
+        assert!(watcher.check_quiescent().await);
+    }
+
+    #[tokio::test]
+    async fn not_quiescent_when_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let watcher = WorkspaceWatcher::start(dir.path()).unwrap();
+        let flag = watcher.is_writing_flag();
+        // Simulate ongoing writes: a background task keeps setting the flag
+        let flag_c = flag.clone();
+        let handle = tokio::spawn(async move {
+            loop {
+                flag_c.store(true, Ordering::Release);
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        });
+        flag.store(true, Ordering::Release);
+        assert!(!watcher.check_quiescent().await);
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn stop_is_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let watcher = WorkspaceWatcher::start(dir.path()).unwrap();
+        watcher.stop();
+        assert_eq!(watcher.workspace_path(), dir.path());
+    }
 }

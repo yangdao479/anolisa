@@ -242,6 +242,130 @@ class TestHardeningSummary:
         # Latest harden failed -> needs_attention (not critical)
         assert "Needs attention" in output
 
+    def test_failed_scan_with_stats_still_shows_compliance(self):
+        events = [
+            _make_event(
+                event_type="harden",
+                category="hardening",
+                result="failed",
+                details={
+                    "request": {
+                        "args": ["--scan", "--config", "agentos_baseline", "--verbose"]
+                    },
+                    "result": {
+                        "mode": "scan",
+                        "config": "agentos_baseline",
+                        "passed": 20,
+                        "failed": 3,
+                        "total": 23,
+                        "failures": [
+                            {
+                                "rule_id": "SEC-001",
+                                "status": "FAIL",
+                                "message": "issue",
+                            }
+                        ],
+                        "fixed": 0,
+                        "manual": 0,
+                        "dry_run_pending": 0,
+                        "fixed_items": [],
+                    },
+                },
+                timestamp=_ts_minutes_ago(5),
+            )
+        ]
+
+        output = format_summary(events, "last 24 hours")
+
+        assert "Scans performed:  1 (succeeded: 0, failed: 1)" in output
+        assert "Latest scan result:" in output
+        assert "Compliance: 20/23 rules passed (87.0%)" in output
+        assert "Latest scan failed" not in output
+        assert "agent-sec-cli harden --reinforce" in output
+
+    def test_failed_reinforce_with_stats_contributes_fixed_count(self):
+        events = [
+            _make_event(
+                event_type="harden",
+                category="hardening",
+                result="failed",
+                details={
+                    "request": {
+                        "args": ["--scan", "--config", "agentos_baseline", "--verbose"]
+                    },
+                    "result": {
+                        "mode": "scan",
+                        "config": "agentos_baseline",
+                        "passed": 20,
+                        "failed": 3,
+                        "total": 23,
+                        "failures": [
+                            {
+                                "rule_id": "SEC-001",
+                                "status": "FAIL",
+                                "message": "issue",
+                            }
+                        ],
+                        "fixed": 0,
+                        "manual": 0,
+                        "dry_run_pending": 0,
+                        "fixed_items": [],
+                    },
+                },
+                timestamp=_ts_minutes_ago(10),
+            ),
+            _make_event(
+                event_type="harden",
+                category="hardening",
+                result="failed",
+                details={
+                    "request": {
+                        "args": [
+                            "--reinforce",
+                            "--config",
+                            "agentos_baseline",
+                            "--verbose",
+                        ]
+                    },
+                    "result": {
+                        "mode": "reinforce",
+                        "config": "agentos_baseline",
+                        "passed": 20,
+                        "failed": 1,
+                        "total": 23,
+                        "failures": [
+                            {
+                                "rule_id": "SEC-003",
+                                "status": "FAIL",
+                                "message": "still failing",
+                            }
+                        ],
+                        "fixed": 2,
+                        "manual": 0,
+                        "dry_run_pending": 0,
+                        "fixed_items": [
+                            {
+                                "rule_id": "SEC-001",
+                                "status": "FIXED",
+                                "message": "fixed",
+                            },
+                            {
+                                "rule_id": "SEC-002",
+                                "status": "FIXED",
+                                "message": "fixed",
+                            },
+                        ],
+                    },
+                },
+                timestamp=_ts_minutes_ago(5),
+            ),
+        ]
+
+        output = format_summary(events, "last 24 hours")
+
+        assert "Reinforcements:   1 (succeeded: 0, failed: 1)" in output
+        assert "Compliance: 22/23 rules passed (20 passed + 2 fixed, 95.7%)" in output
+
 
 # ---------------------------------------------------------------------------
 # Test: asset verify summary
@@ -914,6 +1038,38 @@ class TestSuggestionsEdgeCases:
         output = format_summary(events, "last 24 hours")
         assert "agent-sec-cli harden --reinforce" not in output
 
+    def test_no_reinforce_suggestion_when_failed_harden_has_parser_failure(self):
+        events = [
+            _make_event(
+                event_type="harden",
+                category="hardening",
+                result="failed",
+                details={
+                    "request": {"args": ["--scan"]},
+                    "result": {
+                        "mode": "scan",
+                        "passed": 22,
+                        "failed": 1,
+                        "total": 23,
+                        "failures": [
+                            {
+                                "rule_id": "",
+                                "status": "UNKNOWN",
+                                "message": "Summary reports non-pass rules but details failed.",
+                            }
+                        ],
+                    },
+                },
+                timestamp=_ts_minutes_ago(5),
+            )
+        ]
+
+        output = format_summary(events, "last 24 hours")
+
+        assert "Compliance: 22/23 rules passed" in output
+        assert "Latest scan failed" not in output
+        assert "agent-sec-cli harden --reinforce" not in output
+
     def test_no_suggestion_when_no_hardening_events(self):
         """Only sandbox events — no suggestion at all."""
         events = [
@@ -1275,6 +1431,23 @@ class TestSkillLedgerSummary:
         output = format_summary(events, "last 24 hours")
         assert "Certifications:   2 (pass: 1, warn: 1)" in output
 
+    def test_certification_counts_accept_event_verdict(self):
+        events = [
+            _make_skill_ledger_event(
+                "certify",
+                result_extra={"verdict": "pass", "version_id": "v000001"},
+                minutes_ago=1,
+            ),
+            _make_skill_ledger_event(
+                "certify",
+                result_extra={"verdict": "warn", "version_id": "v000001"},
+                skill_dir="/opt/skills/b",
+                minutes_ago=2,
+            ),
+        ]
+        output = format_summary(events, "last 24 hours")
+        assert "Certifications:   2 (pass: 1, warn: 1)" in output
+
     def test_status_distribution(self):
         events = [
             _make_skill_ledger_event(
@@ -1431,7 +1604,7 @@ class TestSkillLedgerSuggestions:
             ),
         ]
         output = format_summary(events, "last 24 hours")
-        assert "Re-certify drifted skills" in output
+        assert "Re-scan drifted skills" in output
 
     def test_none_suggestion(self):
         events = [
@@ -1440,7 +1613,7 @@ class TestSkillLedgerSuggestions:
             ),
         ]
         output = format_summary(events, "last 24 hours")
-        assert "Certify unchecked skills" in output
+        assert "Scan unchecked skills" in output
 
     def test_no_suggestion_when_all_pass(self):
         events = [
@@ -1487,3 +1660,40 @@ class TestSkillLedgerMixed:
         harden_pos = output.index("--- Hardening ---")
         ledger_pos = output.index("--- Skill Ledger ---")
         assert harden_pos < ledger_pos
+
+
+# ---------------------------------------------------------------------------
+# Test: pii_scan summary
+# ---------------------------------------------------------------------------
+
+
+class TestPiiScanSummary:
+    def test_pii_scan_section_and_deny_posture(self):
+        events = [
+            _make_event(
+                event_type="pii_scan",
+                category="pii_scan",
+                result="succeeded",
+                details={
+                    "request": {"source": "tool_output", "text_length": 32},
+                    "result": {
+                        "ok": True,
+                        "verdict": "deny",
+                        "summary": {
+                            "total": 1,
+                            "by_type": {"api_key": 1},
+                            "by_category": {"credential": 1},
+                            "by_severity": {"deny": 1},
+                        },
+                        "findings": [],
+                    },
+                },
+            )
+        ]
+
+        output = format_summary(events, "last 24 hours")
+
+        assert "System Status: Needs attention" in output
+        assert "--- PII Scan ---" in output
+        assert "Verdict breakdown: deny: 1" in output
+        assert "Finding types: api_key: 1" in output

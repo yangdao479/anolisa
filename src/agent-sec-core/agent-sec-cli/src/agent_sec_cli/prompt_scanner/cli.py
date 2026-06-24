@@ -6,6 +6,13 @@ from pathlib import Path
 from typing import Any
 
 import typer
+from agent_sec_cli.correlation_context import (
+    get_current_trace_context,
+    trace_context_to_payload,
+)
+from agent_sec_cli.daemon.client import DaemonClient
+from agent_sec_cli.daemon.env import daemon_disabled
+from agent_sec_cli.daemon.protocol import DaemonResponse
 from agent_sec_cli.prompt_scanner.config import ScanMode
 from agent_sec_cli.prompt_scanner.result import Verdict
 from agent_sec_cli.prompt_scanner.scanner import PromptScanner
@@ -14,6 +21,7 @@ from agent_sec_cli.security_middleware import invoke
 scanner_app = typer.Typer(
     name="scan-prompt", help="Prompt injection / jailbreak scanner"
 )
+DAEMON_REQUEST_TIMEOUT_MS = 30_000
 
 
 @scanner_app.command("warmup")
@@ -143,6 +151,8 @@ def scan_prompt(
     texts: list[str]
     if text is not None:
         # --text flag takes precedence
+        if not text.strip():
+            raise typer.Exit(code=0)
         texts = [text]
     elif input_file:
         try:
@@ -161,9 +171,11 @@ def scan_prompt(
             raise typer.Exit(code=1)
         texts = [raw]
 
-    # --- Scan (via security_middleware for unified lifecycle/audit) ---
+    use_daemon = _should_use_daemon()
+
+    # --- Scan through daemon unless explicitly disabled, otherwise use local middleware ---
     # Each text is scanned individually so that every invocation gets its own
-    # trace_id and SecurityEvent record.  This ensures precise per-input
+    # daemon request or local SecurityEvent record.  This ensures precise per-input
     # auditability: when a threat is detected, the audit log pinpoints exactly
     # which input triggered it.  Batching would collapse multiple inputs into a
     # single trace_id, losing that granularity without any performance benefit:
@@ -171,33 +183,115 @@ def scan_prompt(
     # HuggingFace tokenizer (Rust-backed, uses RefCell internally) is NOT
     # thread-safe — all inference is serialised behind _inference_lock.
     for t in texts:
+        if use_daemon:
+            try:
+                response = _call_scan_prompt_daemon(t, scan_mode.value, source)
+            except Exception as exc:
+                _print_error_json(_daemon_unavailable_message(str(exc)))
+                raise typer.Exit(code=0)
+
+            if not response.ok:
+                _print_error_json(response.stderr or _daemon_error_message(response))
+                raise typer.Exit(code=0)
+
+            daemon_exit_code = _print_daemon_response(response, output_format)
+            if daemon_exit_code:
+                raise typer.Exit(code=daemon_exit_code)
+            continue
+
         try:
             mw_result = invoke(
                 "prompt_scan",
                 text=t,
-                mode=scan_mode,
+                mode=scan_mode.value,
                 source=source,
             )
         except Exception as exc:
-            typer.echo(
-                json.dumps(
-                    _build_error_output(f"Scanner error: {exc}"),
-                    indent=2,
-                    ensure_ascii=False,
-                )
-            )
-            raise typer.Exit(code=0)  # exit 0: scanner ran, verdict in JSON
+            _print_error_json(f"Scanner error: {exc}")
+            raise typer.Exit(code=0)
 
         # --- Output ---
         if output_format == "text":
             if not mw_result.data:
                 typer.echo(f"Error: {mw_result.error}", err=True)
-                raise typer.Exit(code=mw_result.exit_code)
+                raise typer.Exit(code=mw_result.exit_code or 1)
             _print_text(mw_result.data)
         else:
-            typer.echo(mw_result.stdout)
+            if mw_result.stdout:
+                typer.echo(mw_result.stdout)
+            elif mw_result.data:
+                typer.echo(json.dumps(mw_result.data, indent=2, ensure_ascii=False))
+            else:
+                _print_error_json(mw_result.error or "scan-prompt returned no output")
 
     raise typer.Exit(code=0)
+
+
+def _call_scan_prompt_daemon(
+    text: str,
+    mode: str,
+    source: str,
+) -> DaemonResponse:
+    """Call the daemon scan-prompt method with CLI-resolved params."""
+    return DaemonClient(timeout_ms=DAEMON_REQUEST_TIMEOUT_MS).call(
+        "scan-prompt",
+        params={"text": text, "mode": mode, "source": source},
+        trace_context=trace_context_to_payload(get_current_trace_context()),
+        caller="cli",
+        timeout_ms=DAEMON_REQUEST_TIMEOUT_MS,
+    )
+
+
+def _should_use_daemon() -> bool:
+    """Return whether the CLI should try the daemon path for scan-prompt."""
+    return not daemon_disabled()
+
+
+def _daemon_unavailable_message(detail: str) -> str:
+    return (
+        "Error: agent-sec daemon is unavailable for scan-prompt. " f"Detail: {detail}"
+    )
+
+
+def _daemon_error_message(response: DaemonResponse) -> str:
+    if response.error:
+        return response.error.get("message", "daemon request failed")
+    return "daemon request failed"
+
+
+def _daemon_unavailable_message(detail: str) -> str:
+    return (
+        "Error: agent-sec daemon is unavailable for scan-prompt. " f"Detail: {detail}"
+    )
+
+
+def _print_error_json(message: str) -> None:
+    """Print a scanner-compatible ERROR verdict payload."""
+    typer.echo(json.dumps(_build_error_output(message), indent=2, ensure_ascii=False))
+
+
+def _print_daemon_response(response: DaemonResponse, output_format: str) -> int:
+    """Print a successful daemon scan-prompt response and return a CLI exit code."""
+    if output_format == "text":
+        if response.data:
+            _print_text(response.data)
+            return 0
+        typer.echo(
+            f"Error: {response.stderr or 'scan-prompt returned no result data'}",
+            err=True,
+        )
+        return response.exit_code or 1
+
+    if response.stdout:
+        typer.echo(response.stdout)
+    elif response.data:
+        typer.echo(json.dumps(response.data, indent=2, ensure_ascii=False))
+    else:
+        _print_error_json(
+            response.stderr
+            or f"scan-prompt returned no output (exit code {response.exit_code})"
+        )
+    return 0
 
 
 def _print_text(d: dict[str, Any]) -> None:

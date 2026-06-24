@@ -1,5 +1,5 @@
 import type { SecurityCapability } from "../types.js";
-import { callAgentSecCli } from "../utils.js";
+import { buildTraceContext, callAgentSecCli } from "../utils.js";
 
 /**
  * 用户输入 Prompt 注入 / 越狱检测。
@@ -21,7 +21,7 @@ export const promptScan: SecurityCapability = {
   hooks: ["before_dispatch"],
   register(api) {
     const cfg = (api.pluginConfig as Record<string, any>) ?? {};
-    api.on("before_dispatch", async (event: any) => {
+    api.on("before_dispatch", async (event: any, ctx: any) => {
       try {
         const text = String(event.content ?? event.body ?? "");
         if (!text.trim()) {
@@ -30,7 +30,7 @@ export const promptScan: SecurityCapability = {
 
         const result = await callAgentSecCli(
           ["scan-prompt", "--text", text, "--mode", "standard", "--format", "json", "--source", "user_input"],
-          { timeout: 10000 },
+          { timeout: 10000, traceContext: buildTraceContext(event, ctx) },
         );
 
         if (result.exitCode !== 0) {
@@ -46,23 +46,32 @@ export const promptScan: SecurityCapability = {
           return undefined;
         }
 
-        const summary: string = scanResult.summary ?? "";
         const threatType: string = scanResult.threat_type ?? "";
-        const msg = `[prompt-scan] ${summary || threatType || "Prompt rejected by security policy"}`;
+        const riskLevel: string = scanResult.risk_level ?? "unknown";
+        const confidence: number | undefined = scanResult.confidence;
+
+        const detailLines: string[] = [
+          `  攻击类型 : ${threatType || "unknown"}`,
+          `  风险等级 : ${riskLevel}`,
+          `  拦截环节 : 用户输入扫描 (before_dispatch)`,
+          ...(confidence != null ? [`  模型置信度: ${(confidence * 100).toFixed(1)}%`] : []),
+        ];
+        const detailMsg = detailLines.join("\n");
 
         if (verdict === "deny") {
-          api.logger.warn(`[prompt-scan] DENY — ${msg}`);
+          const text = `[prompt-scan] 检测到安全风险\n${detailMsg}`;
+          api.logger.warn(text);
           // handled: true + text → text sent as final reply, LLM call skipped
           // handled: false + text → text ignored, event passes through to LLM
           // promptScanBlock=true (openclaw.json) 开启拦截模式
           api.logger.warn(`[prompt-scan] promptScanBlock=${cfg.promptScanBlock}`);
           const blockEnabled = cfg.promptScanBlock === true;
-          return { handled: blockEnabled, text: msg };
+          return { handled: blockEnabled, text };
         }
 
         if (verdict === "warn") {
           api.logger.warn(`[prompt-scan] WARN — passing user prompt with warning`);
-          return { handled: false, text: `[Security Warning] ${msg}` };
+          return { handled: false, text: `[Security Warning] ${detailMsg}` };
         }
 
         return undefined;

@@ -39,7 +39,9 @@ ws-ckpt checkpoint -w ws-6d5aaa -i test --metadata '{"tool":"write","file":"main
 
 ```
 
-### 2.2 回滚到指定快照
+### 2.2 回滚快照
+
+#### 2.2.1 回滚到指定快照
 
 ```bash
 ws-ckpt rollback -w <workspace> -s <snapshot>
@@ -56,6 +58,30 @@ ws-ckpt rollback -w <workspace> -s <snapshot>
 # 按快照 ID 回滚
 ws-ckpt rollback -w ./my-project -s test
 ```
+
+#### 2.2.2 按祖先链回滚
+
+```bash
+ws-ckpt rollback -w <workspace> -n <N>
+```
+
+`--num-ancestors` 简写 `-n`，沿 parent 链回退 N 个祖先：
+- `-n 1`：回退到 head（上次 checkpoint）
+- `-n 2`：回退到 head 的 parent
+- `-n 3`：回退到 head.parent.parent
+
+与 `--snapshot/-s` 互斥。
+
+**示例**：
+
+```bash
+# 回退到上次快照
+ws-ckpt rollback -w ./my-project -n 1
+# 回退两步
+ws-ckpt rollback -w ./my-project -n 2
+```
+
+> **注意**：对于升级前创建的旧快照（无血缘信息），`-n` 会返回错误，需使用 `-s` 指定目标快照 ID。
 
 ### 2.3 列出快照
 
@@ -106,19 +132,23 @@ ws-ckpt delete -w ./my-project -s test --force
 ### 2.5 查看快照间差异
 
 ```bash
-ws-ckpt diff -w <workspace> -f <snapshot> -t <snapshot>
+ws-ckpt diff -w <workspace> -f <snapshot> [-t <snapshot>]
 ```
 
 | 参数            | 简写   | 必填 | 说明            |
 | --------------- | ------ | ---- | --------------- |
 | `--workspace` | `-w` | 是   | 工作区路径或 ID |
 | `--from`      | `-f` | 是   | 起始快照 ID     |
-| `--to`        | `-t` | 是   | 目标快照 ID     |
+| `--to`        | `-t` | 否   | 目标快照 ID；省略时与当前工作区比较 |
 
 **示例**：
 
 ```bash
+# 比较两个快照
 ws-ckpt diff -w ./my-project -f msg1-step0 -t test
+
+# 与当前工作区比较
+ws-ckpt diff -w ./my-project -f msg1-step0
 ```
 
 **输出标记说明**：
@@ -176,26 +206,49 @@ ws-ckpt status -w ./my-project
 
 ### 2.8 查看或修改配置
 
-配置以 `/etc/ws-ckpt/config.toml` 为持久化入口，`ws-ckpt config --<flag>` 写入该文件并通知 daemon reload。
+配置分两层:**全局**(`/etc/ws-ckpt/config.toml`,daemon-wide 默认值)和**局部**(`/var/lib/ws-ckpt/indexes/<ws_id>/policy.toml`,per-workspace 覆盖)。`ws-ckpt config` 通过 scope 决定作用范围:
+
+- 不带 scope:打印只读 overview(全局配置 + workspace 覆盖统计),修改类 flag 会被拒绝
+- `-g` / `--global` 查看或修改全局
+- `-w <workspace>` / `--workspace <workspace>` 查看或修改单个 workspace 的 `policy.toml`
+
+`-w` 只能覆盖 `auto_cleanup` 与 `auto_cleanup_keep`,其他字段(interval / image / health check)是 daemon-wide,只能 `-g` 设置。
 
 ```bash
-# 查看当前配置
-ws-ckpt config
+# === 全局 ===
+# 查看
+ws-ckpt config -g
 
 # 开/关后台 auto-cleanup
-ws-ckpt config --enable-auto-cleanup
-ws-ckpt config --disable-auto-cleanup
+ws-ckpt config -g --enable-auto-cleanup
+ws-ckpt config -g --disable-auto-cleanup
 
-# 保留策略：整数=按数量，时长=按时间（单位 s/m/h/d/w）
-ws-ckpt config --auto-cleanup-keep 10
-ws-ckpt config --auto-cleanup-keep 30d
+# 保留策略:整数=按数量,时长=按时间(单位 s/m/h/d/w)
+ws-ckpt config -g --auto-cleanup-keep 10
+ws-ckpt config -g --auto-cleanup-keep 30d
 
-# 调度 / 健康检查间隔（秒，0 禁用）
-ws-ckpt config --auto-cleanup-interval 3600
-ws-ckpt config --health-check-interval 300
+# 调度 / 健康检查间隔(秒,0 禁用)
+ws-ckpt config -g --auto-cleanup-interval 3600
+ws-ckpt config -g --health-check-interval 300
 
-# BtrfsLoop 镜像容量（指定后需要重启 daemon 生效）
-ws-ckpt config --img-size 30 --img-max-percent 40
+# BtrfsLoop 镜像容量(指定后需要重启 daemon 生效)
+ws-ckpt config -g --img-size 30 --img-max-percent 40
+
+# === 局部(per-workspace 覆盖) ===
+# 三栏视图: effective / local / global
+ws-ckpt config -w ~/proj
+
+# 这个 workspace 单独保留 5 份
+ws-ckpt config -w ~/proj --auto-cleanup-keep 5
+
+# 这个 workspace 关掉 auto-cleanup,即便全局是开的
+ws-ckpt config -w ~/proj --disable-auto-cleanup
+
+# 这个 workspace 反之: 全局关闭时单独打开
+ws-ckpt config -w ~/proj --enable-auto-cleanup
+
+# 删除该 workspace 的 policy.toml,回到沿用全局
+ws-ckpt config -w ~/proj --reset
 ```
 
 ### 2.9 重新加载配置

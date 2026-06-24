@@ -83,10 +83,10 @@ graph TB
 | **L1: Capture** | `src/probes/`, `src/event.rs` | 探针加载、事件轮询、统一事件类型 | → L0 |
 | **L2: Parse** | `src/parser/` | HTTP/1.x, HTTP/2, SSE, ProcTrace 协议解析 | → L1 |
 | **L3: Aggregate** | `src/aggregator/` | 请求-响应关联、进程生命周期聚合 | → L2 |
-| **L4: Analyze** | `src/analyzer/`, `src/tokenizer/` | Token 提取、审计记录、消息解析 | → L3 |
-| **L5: Semantic** | `src/genai/`, `src/atif/` | 语义事件构建、轨迹格式导出 | → L4 |
+| **L4: Analyze** | `src/analyzer/`, `src/tokenizer/` | Token 提取、审计记录、消息解析 | → L3, L2 |
+| **L5: Semantic** | `src/genai/`, `src/atif/` | 语义事件构建、轨迹格式导出 | → L4, L3, L2, Cross |
 | **L6: Persist** | `src/storage/` | SQLite 持久化、SLS 远程导出 | → L4, L5 |
-| **L7: Serve** | `src/server/`, `src/health/` | HTTP API、前端、健康检查 | → L6 |
+| **L7: Serve** | `src/server/`, `src/health/`, `src/agent_sec/` | HTTP API、前端、agent-sec daemon 代理、健康检查 | → L6, L5 |
 | **L8: Entry** | `src/bin/`, `src/unified.rs`, `src/config.rs` | CLI 入口、编排器、配置 | → L1-L7 |
 | **Cross** | `src/discovery/` | Agent 进程发现与匹配 | 被 L1, L8 使用 |
 
@@ -106,6 +106,7 @@ graph LR
     discovery[discovery]
     health[health]
     atif[atif]
+    agent_sec[agent_sec]
     server[server]
     unified[unified]
 
@@ -121,14 +122,24 @@ graph LR
 
     probes --> event
     parser --> probes
+    parser --> event
     aggregator --> parser
+    aggregator --> probes
+    aggregator --> event
     analyzer --> aggregator
     analyzer --> tokenizer
+    analyzer --> parser
     genai --> analyzer
     genai --> discovery
+    genai --> aggregator
+    genai --> parser
     storage --> analyzer
+    storage --> genai
     server --> storage
     server --> health
+    server --> atif
+    server --> agent_sec
+    health --> storage
     atif --> genai
     atif --> storage
 ```
@@ -264,6 +275,9 @@ src/
 ├── atif/                  # ATIF 轨迹格式
 │   ├── schema.rs          # ATIF v1.6 数据结构
 │   └── converter.rs       # GenAI → ATIF 转换
+├── agent_sec/             # agent-sec daemon 查询代理
+│   ├── mod.rs             # 模块导出
+│   └── client.rs          # Unix socket NDJSON client
 ├── server/                # HTTP 服务器（feature=server）
 │   ├── mod.rs             # Actix-web 服务器 + 前端嵌入
 │   └── handlers.rs        # API 处理函数

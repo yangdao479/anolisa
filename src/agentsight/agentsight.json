@@ -1,0 +1,34 @@
+{
+  "runtime": {
+    "sls_logtail_path": ""
+  },
+  "deadloop": {
+    "enabled": false,
+    "kill_after_count": 3
+  },
+  "https": [{"rule": ["dashscope.aliyuncs.com"]}],
+  "http": [],
+  "encryption": {
+    "public_key": ""
+  },
+  "cmdline": {
+    "allow": [
+      {"rule": ["hermes*"], "agent_name": "Hermes"},
+      {"rule": ["*python*", "*hermes*"], "agent_name": "Hermes"},
+      {"rule": ["*python*", "-m", "*hermes*"], "agent_name": "Hermes"},
+      {"rule": ["node*", "*/bin/co*"], "agent_name": "Cosh"},
+      {"rule": ["node*", "*/bin/cosh*"], "agent_name": "Cosh"},
+      {"rule": ["node*", "*/bin/copliot*"], "agent_name": "Cosh"},
+      {"rule": ["node*", "*copilot-shell*"], "agent_name": "Cosh"},
+      {"rule": ["*node*", "*copilot-shell*"], "agent_name": "Cosh"},
+      {"rule": ["*node*", "*cosh*"], "agent_name": "Cosh"},
+      {"rule": ["*node*", "*/bin/co*"], "agent_name": "Cosh"},
+      {"rule": ["*node*", "*os-copilot*"], "agent_name": "Cosh"},
+      {"rule": ["*openclaw-gatewa*"], "agent_name": "OpenClaw"},
+      {"rule": ["node*", "*openclaw*"], "agent_name": "OpenClaw"},
+      {"rule": ["*node*", "*openclaw*", "gatewa*"], "agent_name": "OpenClaw"},
+      {"rule": ["openclaw"], "agent_name": "OpenClaw"},
+      {"rule": ["claude*"], "agent_name": "Claude"}
+    ]
+  }
+}

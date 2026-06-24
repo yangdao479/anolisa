@@ -11,7 +11,7 @@ Test groups:
    G3  Happy-path lifecycle (check → certify → check → audit)
    G4  check state machine
    G5  certify command
-   G6  certify --all
+   G6  scan --all
    G7  audit
    G8  status (human-readable)
    G9  stubs & edge cases
@@ -30,39 +30,21 @@ Usage::
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
-# ── Colours ────────────────────────────────────────────────────────────────
-
-RED = "\033[0;31m"
-GREEN = "\033[0;32m"
-YELLOW = "\033[1;33m"
-BLUE = "\033[0;34m"
-BOLD = "\033[1m"
-NC = "\033[0m"
+import pytest
 
 # ── Globals ────────────────────────────────────────────────────────────────
 
 CLI_BIN = shutil.which("agent-sec-cli")
 VERBOSE = False
-
-
-# ── Result tracker ─────────────────────────────────────────────────────────
-
-
-@dataclass
-class Results:
-    passed: int = 0
-    failed: int = 0
-    errors: list = field(default_factory=list)
-
-
-results = Results()
 
 
 # ── Constants ─────────────────────────────────────────────────────────────
@@ -119,7 +101,12 @@ def make_skill(parent: Path, name: str, files: dict[str, str]) -> Path:
     ``validate_skill_dir()`` passes.
     """
     if "SKILL.md" not in files:
-        files = {"SKILL.md": f"# {name}\nTest skill.\n", **files}
+        files = {
+            "SKILL.md": (
+                f"---\nname: {name}\ndescription: Test skill\n---\n# {name}\n"
+            ),
+            **files,
+        }
     skill_dir = parent / name
     for rel, content in files.items():
         p = skill_dir / rel
@@ -135,23 +122,6 @@ def write_findings_file(parent: Path, name: str, findings: list | dict) -> Path:
     return path
 
 
-def test(name: str, fn):
-    """Run a single named test, catch exceptions, record results."""
-    print(f"\n{BLUE}--- {name} ---{NC}")
-    try:
-        fn()
-        print(f"{GREEN}✓ PASS{NC}")
-        results.passed += 1
-    except AssertionError as exc:
-        print(f"{RED}✗ FAIL  {exc}{NC}")
-        results.failed += 1
-        results.errors.append((name, exc))
-    except Exception as exc:
-        print(f"{RED}✗ ERROR {exc}{NC}")
-        results.failed += 1
-        results.errors.append((name, exc))
-
-
 # ── Workspace ──────────────────────────────────────────────────────────────
 
 
@@ -164,6 +134,12 @@ class Workspace:
         self.xdg_config = self.root / "xdg_config"
         self.xdg_data.mkdir()
         self.xdg_config.mkdir()
+        config_dir = self.xdg_config / "agent-sec" / "skill-ledger"
+        config_dir.mkdir(parents=True)
+        (config_dir / "config.json").write_text(
+            json.dumps({"enableDefaultSkillDirs": False, "managedSkillDirs": []}),
+            encoding="utf-8",
+        )
         self.skills_dir = self.root / "skills"
         self.skills_dir.mkdir()
         self.fixtures = self.root / "fixtures"
@@ -191,10 +167,20 @@ class Workspace:
         shutil.rmtree(self.root, ignore_errors=True)
 
 
+@dataclass(frozen=True)
+class E2ECase:
+    """One named skill-ledger E2E scenario."""
+
+    name: str
+    fn: Callable[[Workspace], None]
+    requires_hook: bool = False
+    init_default_keys: bool = True
+
+
 # ── G1: Pre-flight & help ─────────────────────────────────────────────────
 
 
-def test_help_available(ws: Workspace):
+def case_help_available(ws: Workspace):
     """``agent-sec-cli skill-ledger --help`` → exit 0."""
     r = run_skill_ledger(["--help"], env_extra=ws.env())
     assert r.returncode == 0, f"--help returned {r.returncode}: {r.stderr}"
@@ -206,7 +192,7 @@ def test_help_available(ws: Workspace):
 # ── G2: init-keys ─────────────────────────────────────────────────────────
 
 
-def test_init_keys_no_passphrase(ws: Workspace):
+def case_init_keys_no_passphrase(ws: Workspace):
     """init-keys without passphrase → exit 0, encrypted: false."""
     r = run_skill_ledger(["init-keys"], env_extra=ws.env())
     assert r.returncode == 0, f"exit {r.returncode}: {r.stderr}"
@@ -215,7 +201,7 @@ def test_init_keys_no_passphrase(ws: Workspace):
     assert out.get("fingerprint", "").startswith("sha256:"), f"bad fingerprint: {out}"
 
 
-def test_init_keys_json_structure(ws: Workspace):
+def case_init_keys_json_structure(ws: Workspace):
     """JSON output must contain all 4 expected fields."""
     r = run_skill_ledger(["init-keys", "--force"], env_extra=ws.env())
     assert r.returncode == 0, f"exit {r.returncode}: {r.stderr}"
@@ -227,7 +213,7 @@ def test_init_keys_json_structure(ws: Workspace):
     assert len(out["privateKeyPath"]) > 0
 
 
-def test_init_keys_reject_duplicate(ws: Workspace):
+def case_init_keys_reject_duplicate(ws: Workspace):
     """Second init-keys without --force → exit 1."""
     alt_data = ws.root / "alt_data"
     alt_data.mkdir()
@@ -242,7 +228,7 @@ def test_init_keys_reject_duplicate(ws: Workspace):
     ), f"Expected 'already exists' message: stdout={r2.stdout}, stderr={r2.stderr}"
 
 
-def test_init_keys_force_overwrite(ws: Workspace):
+def case_init_keys_force_overwrite(ws: Workspace):
     """--force overwrites existing keys and produces a new fingerprint."""
     alt_data = ws.root / "force_data"
     alt_data.mkdir()
@@ -257,7 +243,7 @@ def test_init_keys_force_overwrite(ws: Workspace):
     assert fp1 != fp2, f"Fingerprint should change after --force: {fp1}"
 
 
-def test_init_keys_with_passphrase_env(ws: Workspace):
+def case_init_keys_with_passphrase_env(ws: Workspace):
     """SKILL_LEDGER_PASSPHRASE env var → encrypted: true."""
     alt_data = ws.root / "pass_data"
     alt_data.mkdir()
@@ -276,7 +262,7 @@ def test_init_keys_with_passphrase_env(ws: Workspace):
 # ── G3: Happy-path lifecycle ──────────────────────────────────────────────
 
 
-def test_full_lifecycle_pass(ws: Workspace):
+def case_full_lifecycle_pass(ws: Workspace):
     """init-keys → check (none) → certify (pass) → check (pass) → audit (valid)."""
     skill = make_skill(
         ws.skills_dir,
@@ -313,7 +299,7 @@ def test_full_lifecycle_pass(ws: Workspace):
     assert out["valid"] is True, f"expected valid=true, got {out}"
 
 
-def test_multi_version_lifecycle(ws: Workspace):
+def case_multi_version_lifecycle(ws: Workspace):
     """certify → modify file → certify → audit validates 2-version chain."""
     skill = make_skill(ws.skills_dir, "multi-ver", {"data.txt": "v1"})
     env = ws.env()
@@ -346,7 +332,7 @@ def test_multi_version_lifecycle(ws: Workspace):
     assert out["versions_checked"] == 2, f"expected 2, got {out['versions_checked']}"
 
 
-def test_lifecycle_with_warn_findings(ws: Workspace):
+def case_lifecycle_with_warn_findings(ws: Workspace):
     """certify with warn findings → check returns warn, exit 0."""
     skill = make_skill(ws.skills_dir, "lifecycle-warn", {"app.sh": "#!/bin/bash\n"})
     env = ws.env()
@@ -378,19 +364,20 @@ def test_lifecycle_with_warn_findings(ws: Workspace):
 # ── G4: check state machine ──────────────────────────────────────────────
 
 
-def test_check_no_manifest_auto_creates(ws: Workspace):
-    """First check on new skill → auto-create manifest, status=none."""
+def case_check_no_manifest_is_read_only(ws: Workspace):
+    """First check on new skill → status=none without writing metadata."""
     skill = make_skill(ws.skills_dir, "check-new", {"f.txt": "hello"})
     env = ws.env()
     r = run_skill_ledger(["check", str(skill)], env_extra=env)
     assert r.returncode == 0
     out = parse_json_output(r.stdout)
     assert out["status"] == "none"
-    latest = skill / ".skill-meta" / "latest.json"
-    assert latest.exists(), f"latest.json not created: {list(skill.rglob('*'))}"
+    assert out["versionId"] is None
+    assert not (skill / ".skill-meta" / "latest.json").exists()
+    assert not (skill / ".skill-meta" / "versions").exists()
 
 
-def test_check_after_file_add_drifted(ws: Workspace):
+def case_check_after_file_add_drifted(ws: Workspace):
     """Adding a file after certify → status=drifted."""
     skill = make_skill(ws.skills_dir, "check-add", {"original.txt": "content"})
     env = ws.env()
@@ -410,7 +397,7 @@ def test_check_after_file_add_drifted(ws: Workspace):
     assert "new_file.txt" in out.get("added", [])
 
 
-def test_check_after_file_modify_drifted(ws: Workspace):
+def case_check_after_file_modify_drifted(ws: Workspace):
     """Modifying a file after certify → status=drifted."""
     skill = make_skill(ws.skills_dir, "check-modify", {"data.txt": "original"})
     env = ws.env()
@@ -430,7 +417,7 @@ def test_check_after_file_modify_drifted(ws: Workspace):
     assert "data.txt" in out.get("modified", [])
 
 
-def test_check_after_file_remove_drifted(ws: Workspace):
+def case_check_after_file_remove_drifted(ws: Workspace):
     """Removing a file after certify → status=drifted."""
     skill = make_skill(
         ws.skills_dir,
@@ -454,7 +441,7 @@ def test_check_after_file_remove_drifted(ws: Workspace):
     assert "delete_me.txt" in out.get("removed", [])
 
 
-def test_check_tampered_manifest_hash(ws: Workspace):
+def case_check_tampered_manifest_hash(ws: Workspace):
     """Tamper with latest.json without re-hashing → status=tampered, exit 1."""
     skill = make_skill(ws.skills_dir, "check-tamper", {"f.txt": "safe"})
     env = ws.env()
@@ -476,7 +463,7 @@ def test_check_tampered_manifest_hash(ws: Workspace):
     assert out["status"] == "tampered", f"expected tampered, got {out}"
 
 
-def test_check_deny_exit_code_1(ws: Workspace):
+def case_check_deny_exit_code_1(ws: Workspace):
     """Certify with deny findings → check returns deny with exit 1."""
     skill = make_skill(ws.skills_dir, "check-deny", {"danger.sh": "rm -rf /"})
     env = ws.env()
@@ -497,7 +484,7 @@ def test_check_deny_exit_code_1(ws: Workspace):
 # ── G5: certify command ──────────────────────────────────────────────────
 
 
-def test_certify_external_findings_bare_array(ws: Workspace):
+def case_certify_external_findings_bare_array(ws: Workspace):
     """--findings with bare JSON array → exit 0, correct scanStatus."""
     skill = make_skill(ws.skills_dir, "certify-bare", {"a.txt": "a"})
     env = ws.env()
@@ -517,7 +504,7 @@ def test_certify_external_findings_bare_array(ws: Workspace):
     assert out["scanStatus"] == "warn"
 
 
-def test_certify_external_findings_wrapped(ws: Workspace):
+def case_certify_external_findings_wrapped(ws: Workspace):
     """--findings with {"findings": [...]} wrapper → exit 0."""
     skill = make_skill(ws.skills_dir, "certify-wrap", {"b.txt": "b"})
     env = ws.env()
@@ -534,7 +521,7 @@ def test_certify_external_findings_wrapped(ws: Workspace):
     assert out["scanStatus"] == "pass"
 
 
-def test_certify_deny_finding_produces_deny(ws: Workspace):
+def case_certify_deny_finding_produces_deny(ws: Workspace):
     """deny-level finding → scanStatus=deny."""
     skill = make_skill(ws.skills_dir, "certify-deny", {"c.txt": "c"})
     env = ws.env()
@@ -554,7 +541,7 @@ def test_certify_deny_finding_produces_deny(ws: Workspace):
     assert out["scanStatus"] == "deny"
 
 
-def test_certify_missing_findings_file(ws: Workspace):
+def case_certify_missing_findings_file(ws: Workspace):
     """--findings pointing to nonexistent file → exit 1."""
     skill = make_skill(ws.skills_dir, "certify-missing", {"d.txt": "d"})
     env = ws.env()
@@ -565,7 +552,7 @@ def test_certify_missing_findings_file(ws: Workspace):
     assert r.returncode == 1, f"expected exit 1, got {r.returncode}"
 
 
-def test_certify_invalid_json_findings(ws: Workspace):
+def case_certify_invalid_json_findings(ws: Workspace):
     """--findings with invalid JSON → exit 1."""
     skill = make_skill(ws.skills_dir, "certify-badjson", {"e.txt": "e"})
     env = ws.env()
@@ -577,32 +564,46 @@ def test_certify_invalid_json_findings(ws: Workspace):
     assert r.returncode == 1, f"expected exit 1 for invalid JSON, got {r.returncode}"
 
 
-def test_certify_no_findings_auto_invoke(ws: Workspace):
-    """certify without --findings → auto-invoke mode, exit 0."""
-    skill = make_skill(ws.skills_dir, "certify-auto", {"f.txt": "f"})
+def case_scan_auto_invoke_default_scanners(ws: Workspace):
+    """scan runs default built-in scanners."""
+    skill = make_skill(
+        ws.skills_dir,
+        "certify-auto",
+        {
+            "SKILL.md": "---\nname: certify-auto\ndescription: Clean test skill\n---\n",
+            "f.txt": "f",
+        },
+    )
     env = ws.env()
-    r = run_skill_ledger(["certify", str(skill)], env_extra=env)
+    r = run_skill_ledger(["scan", str(skill)], env_extra=env)
     assert r.returncode == 0, f"exit {r.returncode}: {r.stderr}"
     out = parse_json_output(r.stdout)
-    assert "scanStatus" in out
+    assert out["scanStatus"] == "pass"
+
+    manifest = json.loads((skill / ".skill-meta" / "latest.json").read_text())
+    scans = {entry["scanner"]: entry for entry in manifest["scans"]}
+    assert "code-scanner" in scans
+    assert "static-scanner" in scans
+    assert scans["code-scanner"]["status"] == "pass"
+    assert scans["static-scanner"]["status"] == "pass"
 
 
-def test_certify_no_skill_dir_no_all(ws: Workspace):
+def case_certify_no_skill_dir_no_all(ws: Workspace):
     """certify without skill_dir and without --all → exit 1."""
     env = ws.env()
     r = run_skill_ledger(["certify"], env_extra=env)
-    assert r.returncode == 1, f"expected exit 1, got {r.returncode}"
+    assert r.returncode != 0, f"expected nonzero exit, got {r.returncode}"
     combined = r.stdout + r.stderr
     assert (
         "required" in combined.lower() or "skill_dir" in combined.lower()
     ), f"Expected error about missing skill_dir: {combined}"
 
 
-# ── G6: certify --all ────────────────────────────────────────────────────
+# ── G6: scan --all ───────────────────────────────────────────────────────
 
 
-def test_certify_all_multiple_skills(ws: Workspace):
-    """--all certifies all skills from config.json skillDirs (auto-invoke mode)."""
+def case_scan_all_multiple_skills(ws: Workspace):
+    """--all scans all skills from config.json managedSkillDirs."""
     env = ws.env()
     batch_root = ws.root / "batch_skills"
     batch_root.mkdir()
@@ -611,12 +612,14 @@ def test_certify_all_multiple_skills(ws: Workspace):
 
     config_dir = ws.xdg_config / "agent-sec" / "skill-ledger"
     config_dir.mkdir(parents=True, exist_ok=True)
-    config = {"skillDirs": [str(batch_root / "*")]}
+    config = {
+        "enableDefaultSkillDirs": False,
+        "managedSkillDirs": [str(batch_root / "*")],
+    }
     (config_dir / "config.json").write_text(json.dumps(config))
 
-    # --all without --findings (auto-invoke mode)
     r = run_skill_ledger(
-        ["certify", "--all"],
+        ["scan", "--all"],
         env_extra=env,
     )
     assert r.returncode == 0, f"exit {r.returncode}: {r.stderr}"
@@ -625,14 +628,14 @@ def test_certify_all_multiple_skills(ws: Workspace):
     assert len(out["results"]) == 3, f"Expected 3 results, got {len(out['results'])}"
 
 
-def test_certify_all_no_skill_dirs(ws: Workspace):
-    """--all with empty skillDirs → exit 1."""
+def case_scan_all_no_skill_dirs(ws: Workspace):
+    """--all with default dirs disabled and empty managedSkillDirs → exit 1."""
     env = ws.env()
     config_dir = ws.xdg_config / "agent-sec" / "skill-ledger"
     config_dir.mkdir(parents=True, exist_ok=True)
-    config = {"skillDirs": []}
+    config = {"enableDefaultSkillDirs": False, "managedSkillDirs": []}
     (config_dir / "config.json").write_text(json.dumps(config))
-    r = run_skill_ledger(["certify", "--all"], env_extra=env)
+    r = run_skill_ledger(["scan", "--all"], env_extra=env)
     assert r.returncode == 1, f"expected exit 1, got {r.returncode}"
     combined = r.stdout + r.stderr
     assert (
@@ -643,7 +646,7 @@ def test_certify_all_no_skill_dirs(ws: Workspace):
 # ── G7: audit command ────────────────────────────────────────────────────
 
 
-def test_audit_valid_chain(ws: Workspace):
+def case_audit_valid_chain(ws: Workspace):
     """Multi-version audit → valid=true, exit 0."""
     skill = make_skill(ws.skills_dir, "audit-valid", {"a.txt": "a"})
     env = ws.env()
@@ -666,7 +669,7 @@ def test_audit_valid_chain(ws: Workspace):
     assert out["versions_checked"] >= 2
 
 
-def test_audit_no_versions(ws: Workspace):
+def case_audit_no_versions(ws: Workspace):
     """Skill with no .skill-meta → valid=true, 0 versions checked."""
     skill = make_skill(ws.skills_dir, "audit-none", {"x.txt": "x"})
     env = ws.env()
@@ -677,7 +680,7 @@ def test_audit_no_versions(ws: Workspace):
     assert out["versions_checked"] == 0
 
 
-def test_audit_tampered_version_file(ws: Workspace):
+def case_audit_tampered_version_file(ws: Workspace):
     """Tamper with a version JSON → valid=false, exit 1."""
     skill = make_skill(ws.skills_dir, "audit-tamper", {"f.txt": "f"})
     env = ws.env()
@@ -703,7 +706,7 @@ def test_audit_tampered_version_file(ws: Workspace):
     assert len(out["errors"]) > 0
 
 
-def test_audit_verify_snapshots(ws: Workspace):
+def case_audit_verify_snapshots(ws: Workspace):
     """--verify-snapshots validates snapshot file hashes match manifest."""
     skill = make_skill(ws.skills_dir, "audit-snap", {"s.txt": "snapshot-test"})
     env = ws.env()
@@ -724,7 +727,7 @@ def test_audit_verify_snapshots(ws: Workspace):
 # ── G8: status command ───────────────────────────────────────────────────
 
 
-def test_status_human_readable_output(ws: Workspace):
+def case_status_human_readable_output(ws: Workspace):
     """status returns ledger-wide overview with keys, config, skills sections."""
     env = ws.env()
 
@@ -735,7 +738,10 @@ def test_status_human_readable_output(ws: Workspace):
 
     config_dir = ws.xdg_config / "agent-sec" / "skill-ledger"
     config_dir.mkdir(parents=True, exist_ok=True)
-    config = {"skillDirs": [str(batch_root / "*")]}
+    config = {
+        "enableDefaultSkillDirs": False,
+        "managedSkillDirs": [str(batch_root / "*")],
+    }
     (config_dir / "config.json").write_text(json.dumps(config))
 
     r = run_skill_ledger(["status"], env_extra=env)
@@ -761,7 +767,7 @@ def test_status_human_readable_output(ws: Workspace):
     assert "results" not in out, f"results should not appear without --verbose: {out}"
 
 
-def test_status_drifted_shows_details(ws: Workspace):
+def case_status_drifted_shows_details(ws: Workspace):
     """status health reflects drifted when a certified skill is modified."""
     env = ws.env()
 
@@ -775,7 +781,10 @@ def test_status_drifted_shows_details(ws: Workspace):
 
     config_dir = ws.xdg_config / "agent-sec" / "skill-ledger"
     config_dir.mkdir(parents=True, exist_ok=True)
-    config = {"skillDirs": [str(batch_root / "*")]}
+    config = {
+        "enableDefaultSkillDirs": False,
+        "managedSkillDirs": [str(batch_root / "*")],
+    }
     (config_dir / "config.json").write_text(json.dumps(config))
 
     findings = write_findings_file(
@@ -801,7 +810,7 @@ def test_status_drifted_shows_details(ws: Workspace):
 # ── G9: stubs & edge cases ───────────────────────────────────────────────
 
 
-def test_set_policy_stub(ws: Workspace):
+def case_set_policy_stub(ws: Workspace):
     """set-policy → exit 0, 'coming soon' in output."""
     skill = make_skill(ws.skills_dir, "stub-policy", {"x.txt": "x"})
     r = run_skill_ledger(
@@ -811,24 +820,26 @@ def test_set_policy_stub(ws: Workspace):
     assert "coming soon" in r.stdout.lower()
 
 
-def test_rotate_keys_stub(ws: Workspace):
+def case_rotate_keys_stub(ws: Workspace):
     """rotate-keys → exit 0, 'coming soon' in output."""
     r = run_skill_ledger(["rotate-keys"], env_extra=ws.env())
     assert r.returncode == 0, f"exit {r.returncode}: {r.stderr}"
     assert "coming soon" in r.stdout.lower()
 
 
-def test_list_scanners(ws: Workspace):
-    """list-scanners → exit 0, JSON with scanners array including skill-vetter."""
+def case_list_scanners(ws: Workspace):
+    """list-scanners → exit 0, JSON with default scanners."""
     r = run_skill_ledger(["list-scanners"], env_extra=ws.env())
     assert r.returncode == 0, f"exit {r.returncode}: {r.stderr}"
     out = parse_json_output(r.stdout)
     assert "scanners" in out, f"Expected 'scanners' key in JSON output: {out}"
     names = [s["name"] for s in out["scanners"]]
     assert "skill-vetter" in names, f"Expected skill-vetter in scanners: {names}"
+    assert "code-scanner" in names, f"Expected code-scanner in scanners: {names}"
+    assert "static-scanner" in names, f"Expected static-scanner in scanners: {names}"
 
 
-def test_certify_empty_skill_dir(ws: Workspace):
+def case_certify_empty_skill_dir(ws: Workspace):
     """Certify a skill dir with no SKILL.md → exit 1."""
     skill = ws.skills_dir / "empty-skill"
     skill.mkdir(parents=True, exist_ok=True)
@@ -840,7 +851,7 @@ def test_certify_empty_skill_dir(ws: Workspace):
 # ── G10: SKILL.md contract assertions ────────────────────────────────────
 
 
-def test_contract_init_keys_empty_passphrase_env(ws: Workspace):
+def case_contract_init_keys_empty_passphrase_env(ws: Workspace):
     """SKILL_LEDGER_PASSPHRASE="" → passphrase-free init."""
     alt_data = ws.root / "contract_keys"
     alt_data.mkdir()
@@ -855,7 +866,7 @@ def test_contract_init_keys_empty_passphrase_env(ws: Workspace):
     assert key_pub.exists(), f"key.pub not at expected path: {key_pub}"
 
 
-def test_contract_check_output_schema(ws: Workspace):
+def case_contract_check_output_schema(ws: Workspace):
     """check output is JSON with ``status`` field for every outcome."""
     env = ws.env()
 
@@ -885,7 +896,7 @@ def test_contract_check_output_schema(ws: Workspace):
         assert diff_key in out, f"drifted output missing '{diff_key}': {out}"
 
 
-def test_contract_certify_explicit_scanner_flags(ws: Workspace):
+def case_contract_certify_explicit_scanner_flags(ws: Workspace):
     """certify with explicit --scanner and --scanner-version flags."""
     skill = make_skill(ws.skills_dir, "contract-flags", {"run.sh": "echo hi"})
     env = ws.env()
@@ -912,7 +923,7 @@ def test_contract_certify_explicit_scanner_flags(ws: Workspace):
     assert out.get("scanStatus") == "pass"
 
 
-def test_contract_certify_output_fields(ws: Workspace):
+def case_contract_certify_output_fields(ws: Workspace):
     """certify output JSON contains versionId and scanStatus."""
     skill = make_skill(ws.skills_dir, "contract-output", {"data.py": "x = 1"})
     env = ws.env()
@@ -940,7 +951,7 @@ def test_contract_certify_output_fields(ws: Workspace):
     ), f"Unexpected scanStatus '{out['scanStatus']}'"
 
 
-def test_contract_manifest_path(ws: Workspace):
+def case_contract_manifest_path(ws: Workspace):
     """After certify, manifest exists at <SKILL_DIR>/.skill-meta/latest.json."""
     skill = make_skill(ws.skills_dir, "contract-path", {"f.txt": "content"})
     env = ws.env()
@@ -955,11 +966,11 @@ def test_contract_manifest_path(ws: Workspace):
     latest = skill / ".skill-meta" / "latest.json"
     assert latest.exists(), f"Manifest not at expected path: {list(skill.rglob('*'))}"
     data = json.loads(latest.read_text())
-    for field in ("versionId", "fileHashes", "scanStatus", "signature"):
-        assert field in data, f"Missing '{field}' in manifest"
+    for manifest_field in ("versionId", "fileHashes", "scanStatus", "signature"):
+        assert manifest_field in data, f"Missing '{manifest_field}' in manifest"
 
 
-def test_contract_check_status_values_complete(ws: Workspace):
+def case_contract_check_status_values_complete(ws: Workspace):
     """All 6 triage statuses are reachable: none, pass, drifted, warn, deny, tampered."""
     env = ws.env()
     observed: set[str] = set()
@@ -1026,7 +1037,7 @@ def test_contract_check_status_values_complete(ws: Workspace):
 # ── G11: Passphrase-protected key lifecycle ──────────────────────────────
 
 
-def test_passphrase_full_lifecycle(ws: Workspace):
+def case_passphrase_full_lifecycle(ws: Workspace):
     """Encrypted key: init → check → certify → check → audit — all work."""
     pp_data = ws.root / "pp_data"
     pp_data.mkdir()
@@ -1069,7 +1080,7 @@ def test_passphrase_full_lifecycle(ws: Workspace):
     assert out["valid"] is True
 
 
-def test_passphrase_missing_env_fails(ws: Workspace):
+def case_passphrase_missing_env_fails(ws: Workspace):
     """Encrypted key without SKILL_LEDGER_PASSPHRASE → certify fails gracefully."""
     pp_data = ws.root / "pp_noenv"
     pp_data.mkdir()
@@ -1164,13 +1175,13 @@ def _make_cosh_event(skill_name: str, cwd: str) -> dict:
     }
 
 
-def test_hook_invalid_json_allows():
+def case_hook_invalid_json_allows():
     """Malformed stdin → fail-open allow."""
     output = _run_hook("not-json")
     assert output == {"decision": "allow"}
 
 
-def test_hook_wrong_tool_allows():
+def case_hook_wrong_tool_allows():
     """Non-skill tool → allow."""
     output = _run_hook(
         {
@@ -1181,14 +1192,14 @@ def test_hook_wrong_tool_allows():
     assert output == {"decision": "allow"}
 
 
-def test_hook_unknown_skill_warns():
+def case_hook_unknown_skill_warns():
     """Skill not found on disk → allow with warning."""
     output = _run_hook(_make_cosh_event("nonexistent-skill-xyz", "/tmp"))
     assert output["decision"] == "allow"
     assert "not found" in output.get("reason", "").lower()
 
 
-def test_hook_pass_status_silent(ws: Workspace):
+def case_hook_pass_status_silent(ws: Workspace):
     """Hook on a pass-status skill → silent allow (no reason)."""
     skill = make_skill(ws.hook_skills_dir, "hook-pass", {"m.txt": "main"})
     env = ws.env()
@@ -1208,8 +1219,8 @@ def test_hook_pass_status_silent(ws: Workspace):
     assert "reason" not in output, f"Expected silent allow, got reason: {output}"
 
 
-def test_hook_drifted_warns(ws: Workspace):
-    """Hook on a drifted skill → allow with warning."""
+def case_hook_drifted_requires_confirmation(ws: Workspace):
+    """Hook on a drifted skill → ask with warning reason."""
     skill = make_skill(ws.hook_skills_dir, "hook-drift", {"f.txt": "original"})
     env = ws.env()
     findings = write_findings_file(
@@ -1225,14 +1236,14 @@ def test_hook_drifted_warns(ws: Workspace):
         _make_cosh_event("hook-drift", str(ws.root)),
         env_extra=env,
     )
-    assert output["decision"] == "allow"
-    assert "reason" in output, f"Expected warning reason for drifted: {output}"
+    assert output["decision"] == "ask"
+    assert "reason" in output, f"Expected confirmation reason for drifted: {output}"
     assert (
         "drifted" in output["reason"].lower() or "changed" in output["reason"].lower()
     )
 
 
-def test_hook_path_traversal_rejected(ws: Workspace):
+def case_hook_path_traversal_rejected(ws: Workspace):
     """Path traversal in skill name → rejected with reason."""
     output = _run_hook(
         _make_cosh_event("../../etc/passwd", "/tmp"),
@@ -1246,7 +1257,7 @@ def test_hook_path_traversal_rejected(ws: Workspace):
 # ── G13: Full pipeline (vetter → ledger → hook) ─────────────────────────
 
 
-def test_full_pipeline_vetter_to_hook(ws: Workspace):
+def case_full_pipeline_vetter_to_hook(ws: Workspace):
     """End-to-end: create → check(none) → certify(pass) → hook(silent allow)."""
     skill = make_skill(ws.hook_skills_dir, "pipeline-full", {"app.py": "print(1)\n"})
     env = ws.env()
@@ -1280,20 +1291,20 @@ def test_full_pipeline_vetter_to_hook(ws: Workspace):
     # Modify file → drifted
     (skill / "app.py").write_text("print(2)\n")
 
-    # hook → allow with warning
+    # hook → ask with warning reason
     if HOOK_SCRIPT:
         output = _run_hook(
             _make_cosh_event("pipeline-full", str(ws.root)),
             env_extra=env,
         )
-        assert output["decision"] == "allow"
-        assert "reason" in output, f"Expected drift warning: {output}"
+        assert output["decision"] == "ask"
+        assert "reason" in output, f"Expected drift confirmation: {output}"
 
 
 # ── G14: Key rotation ────────────────────────────────────────────────────
 
 
-def test_key_rotation_old_sigs_verifiable(ws: Workspace):
+def case_key_rotation_old_sigs_verifiable(ws: Workspace):
     """After init-keys --force, old signatures must still pass ``check``."""
     env = ws.env()
 
@@ -1331,196 +1342,167 @@ def test_key_rotation_old_sigs_verifiable(ws: Workspace):
     ), f"Expected 'pass' for unchanged skill after key rotation, got '{out['status']}'"
 
 
-# ── Main ───────────────────────────────────────────────────────────────────
+def _without_workspace(fn: Callable[[], None]) -> Callable[[Workspace], None]:
+    """Adapt hook-only cases to the shared case registry shape."""
+
+    def wrapped(_ws: Workspace) -> None:
+        fn()
+
+    return wrapped
 
 
-def main():
-    # Pre-flight
-    if not CLI_BIN:
-        print(f"{RED}ERROR: agent-sec-cli not found on PATH{NC}")
-        print(
-            "Install the RPM package or ensure the binary is on PATH.\n"
-            "  rpm -q agent-sec-core  # check installation"
-        )
-        sys.exit(1)
+E2E_CASES = [
+    E2ECase(
+        "G1: --help available",
+        case_help_available,
+        init_default_keys=False,
+    ),
+    E2ECase(
+        "G2: init-keys no passphrase",
+        case_init_keys_no_passphrase,
+        init_default_keys=False,
+    ),
+    E2ECase("G2: init-keys JSON structure", case_init_keys_json_structure),
+    E2ECase("G2: init-keys reject duplicate", case_init_keys_reject_duplicate),
+    E2ECase("G2: init-keys --force overwrite", case_init_keys_force_overwrite),
+    E2ECase("G2: init-keys passphrase env", case_init_keys_with_passphrase_env),
+    E2ECase("G3: full pass lifecycle", case_full_lifecycle_pass),
+    E2ECase("G3: multi-version chain", case_multi_version_lifecycle),
+    E2ECase("G3: warn findings lifecycle", case_lifecycle_with_warn_findings),
+    E2ECase("G4: no manifest → none/read-only", case_check_no_manifest_is_read_only),
+    E2ECase("G4: file added → drifted", case_check_after_file_add_drifted),
+    E2ECase("G4: file modified → drifted", case_check_after_file_modify_drifted),
+    E2ECase("G4: file removed → drifted", case_check_after_file_remove_drifted),
+    E2ECase("G4: tampered → exit 1", case_check_tampered_manifest_hash),
+    E2ECase("G4: deny → exit 1", case_check_deny_exit_code_1),
+    E2ECase("G5: bare array findings", case_certify_external_findings_bare_array),
+    E2ECase("G5: wrapped findings", case_certify_external_findings_wrapped),
+    E2ECase("G5: deny finding", case_certify_deny_finding_produces_deny),
+    E2ECase("G5: missing findings file", case_certify_missing_findings_file),
+    E2ECase("G5: invalid JSON", case_certify_invalid_json_findings),
+    E2ECase("G5: scan auto-invoke mode", case_scan_auto_invoke_default_scanners),
+    E2ECase("G5: no skill_dir no --all", case_certify_no_skill_dir_no_all),
+    E2ECase("G6: --all multiple skills", case_scan_all_multiple_skills),
+    E2ECase("G6: --all no skill dirs", case_scan_all_no_skill_dirs),
+    E2ECase("G7: valid chain", case_audit_valid_chain),
+    E2ECase("G7: no versions", case_audit_no_versions),
+    E2ECase("G7: tampered version file", case_audit_tampered_version_file),
+    E2ECase("G7: --verify-snapshots", case_audit_verify_snapshots),
+    E2ECase("G8: human-readable output", case_status_human_readable_output),
+    E2ECase("G8: drifted details", case_status_drifted_shows_details),
+    E2ECase("G9: set-policy stub", case_set_policy_stub),
+    E2ECase("G9: rotate-keys stub", case_rotate_keys_stub),
+    E2ECase("G9: list-scanners", case_list_scanners),
+    E2ECase("G9: certify empty skill dir", case_certify_empty_skill_dir),
+    E2ECase("G10: empty passphrase env", case_contract_init_keys_empty_passphrase_env),
+    E2ECase("G10: check output schema", case_contract_check_output_schema),
+    E2ECase(
+        "G10: certify --scanner flags", case_contract_certify_explicit_scanner_flags
+    ),
+    E2ECase("G10: certify output fields", case_contract_certify_output_fields),
+    E2ECase("G10: manifest path", case_contract_manifest_path),
+    E2ECase(
+        "G10: all 6 statuses reachable", case_contract_check_status_values_complete
+    ),
+    E2ECase("G11: passphrase full lifecycle", case_passphrase_full_lifecycle),
+    E2ECase("G11: missing passphrase fails", case_passphrase_missing_env_fails),
+    E2ECase(
+        "G12: hook invalid JSON → allow",
+        _without_workspace(case_hook_invalid_json_allows),
+        requires_hook=True,
+        init_default_keys=False,
+    ),
+    E2ECase(
+        "G12: hook wrong tool → allow",
+        _without_workspace(case_hook_wrong_tool_allows),
+        requires_hook=True,
+        init_default_keys=False,
+    ),
+    E2ECase(
+        "G12: hook unknown skill warns",
+        _without_workspace(case_hook_unknown_skill_warns),
+        requires_hook=True,
+        init_default_keys=False,
+    ),
+    E2ECase(
+        "G12: hook pass → silent allow",
+        case_hook_pass_status_silent,
+        requires_hook=True,
+    ),
+    E2ECase(
+        "G12: hook drifted → ask",
+        case_hook_drifted_requires_confirmation,
+        requires_hook=True,
+    ),
+    E2ECase(
+        "G12: hook path traversal",
+        case_hook_path_traversal_rejected,
+        requires_hook=True,
+        init_default_keys=False,
+    ),
+    E2ECase("G13: vetter→ledger→hook pipeline", case_full_pipeline_vetter_to_hook),
+    E2ECase(
+        "G14: old sigs verifiable after rotation", case_key_rotation_old_sigs_verifiable
+    ),
+]
 
-    hook_available = HOOK_SCRIPT is not None
 
-    ws = Workspace()
+def _ensure_default_keys(ws: Workspace) -> None:
+    """Initialize default test keys for isolated pytest case workspaces."""
+    key_path = ws.xdg_data / "agent-sec" / "skill-ledger" / "key.pub"
+    if key_path.exists():
+        return
+    r = run_skill_ledger(["init-keys"], env_extra=ws.env())
+    assert r.returncode == 0, f"init-keys preflight failed: {r.stderr}"
+
+
+# ── Pytest entry points ─────────────────────────────────────────────────────
+
+
+def _case_id(case: E2ECase) -> str:
+    """Build a stable, readable pytest id from the G-case name."""
+    return re.sub(r"[^A-Za-z0-9]+", "_", case.name).strip("_")
+
+
+@pytest.fixture
+def ws():
+    """Provide each pytest case with an isolated skill-ledger workspace."""
+    workspace = Workspace()
     try:
-        print("=" * 60)
-        print(f"{BOLD}skill-ledger CLI E2E Tests (RPM binary){NC}")
-        print(f"  CLI binary : {CLI_BIN}")
-        print(f"  Hook script: {HOOK_SCRIPT or 'NOT FOUND (hook tests skipped)'}")
-        print(f"  workspace  : {ws.root}")
-        print("=" * 60)
-
-        # G1: Pre-flight & help
-        test("G1: --help available", lambda: test_help_available(ws))
-
-        # G2: init-keys (run first — all subsequent tests need keys)
-        test("G2: init-keys no passphrase", lambda: test_init_keys_no_passphrase(ws))
-        test("G2: init-keys JSON structure", lambda: test_init_keys_json_structure(ws))
-        test(
-            "G2: init-keys reject duplicate",
-            lambda: test_init_keys_reject_duplicate(ws),
-        )
-        test(
-            "G2: init-keys --force overwrite",
-            lambda: test_init_keys_force_overwrite(ws),
-        )
-        test(
-            "G2: init-keys passphrase env",
-            lambda: test_init_keys_with_passphrase_env(ws),
-        )
-
-        # G3: Happy-path lifecycle
-        test("G3: full pass lifecycle", lambda: test_full_lifecycle_pass(ws))
-        test("G3: multi-version chain", lambda: test_multi_version_lifecycle(ws))
-        test(
-            "G3: warn findings lifecycle", lambda: test_lifecycle_with_warn_findings(ws)
-        )
-
-        # G4: check state machine
-        test(
-            "G4: no manifest → auto-create",
-            lambda: test_check_no_manifest_auto_creates(ws),
-        )
-        test("G4: file added → drifted", lambda: test_check_after_file_add_drifted(ws))
-        test(
-            "G4: file modified → drifted",
-            lambda: test_check_after_file_modify_drifted(ws),
-        )
-        test(
-            "G4: file removed → drifted",
-            lambda: test_check_after_file_remove_drifted(ws),
-        )
-        test("G4: tampered → exit 1", lambda: test_check_tampered_manifest_hash(ws))
-        test("G4: deny → exit 1", lambda: test_check_deny_exit_code_1(ws))
-
-        # G5: certify command
-        test(
-            "G5: bare array findings",
-            lambda: test_certify_external_findings_bare_array(ws),
-        )
-        test("G5: wrapped findings", lambda: test_certify_external_findings_wrapped(ws))
-        test("G5: deny finding", lambda: test_certify_deny_finding_produces_deny(ws))
-        test(
-            "G5: missing findings file", lambda: test_certify_missing_findings_file(ws)
-        )
-        test("G5: invalid JSON", lambda: test_certify_invalid_json_findings(ws))
-        test("G5: auto-invoke mode", lambda: test_certify_no_findings_auto_invoke(ws))
-        test("G5: no skill_dir no --all", lambda: test_certify_no_skill_dir_no_all(ws))
-
-        # G6: certify --all
-        test("G6: --all multiple skills", lambda: test_certify_all_multiple_skills(ws))
-        test("G6: --all no skill dirs", lambda: test_certify_all_no_skill_dirs(ws))
-
-        # G7: audit
-        test("G7: valid chain", lambda: test_audit_valid_chain(ws))
-        test("G7: no versions", lambda: test_audit_no_versions(ws))
-        test("G7: tampered version file", lambda: test_audit_tampered_version_file(ws))
-        test("G7: --verify-snapshots", lambda: test_audit_verify_snapshots(ws))
-
-        # G8: status
-        test("G8: human-readable output", lambda: test_status_human_readable_output(ws))
-        test("G8: drifted details", lambda: test_status_drifted_shows_details(ws))
-
-        # G9: stubs & edge cases
-        test("G9: set-policy stub", lambda: test_set_policy_stub(ws))
-        test("G9: rotate-keys stub", lambda: test_rotate_keys_stub(ws))
-        test("G9: list-scanners", lambda: test_list_scanners(ws))
-        test("G9: certify empty skill dir", lambda: test_certify_empty_skill_dir(ws))
-
-        # G10: contract assertions
-        test(
-            "G10: empty passphrase env",
-            lambda: test_contract_init_keys_empty_passphrase_env(ws),
-        )
-        test("G10: check output schema", lambda: test_contract_check_output_schema(ws))
-        test(
-            "G10: certify --scanner flags",
-            lambda: test_contract_certify_explicit_scanner_flags(ws),
-        )
-        test(
-            "G10: certify output fields",
-            lambda: test_contract_certify_output_fields(ws),
-        )
-        test("G10: manifest path", lambda: test_contract_manifest_path(ws))
-        test(
-            "G10: all 6 statuses reachable",
-            lambda: test_contract_check_status_values_complete(ws),
-        )
-
-        # G11: passphrase-protected lifecycle
-        test(
-            "G11: passphrase full lifecycle", lambda: test_passphrase_full_lifecycle(ws)
-        )
-        test(
-            "G11: missing passphrase fails",
-            lambda: test_passphrase_missing_env_fails(ws),
-        )
-
-        # G12: cosh hook integration
-        if hook_available:
-            test(
-                "G12: hook invalid JSON → allow",
-                lambda: test_hook_invalid_json_allows(),
-            )
-            test("G12: hook wrong tool → allow", lambda: test_hook_wrong_tool_allows())
-            test(
-                "G12: hook unknown skill warns", lambda: test_hook_unknown_skill_warns()
-            )
-            test(
-                "G12: hook pass → silent allow",
-                lambda: test_hook_pass_status_silent(ws),
-            )
-            test("G12: hook drifted → warning", lambda: test_hook_drifted_warns(ws))
-            test(
-                "G12: hook path traversal",
-                lambda: test_hook_path_traversal_rejected(ws),
-            )
-        else:
-            print(f"\n{YELLOW}SKIP G12: cosh hook script not found{NC}")
-
-        # G13: full pipeline
-        test(
-            "G13: vetter→ledger→hook pipeline",
-            lambda: test_full_pipeline_vetter_to_hook(ws),
-        )
-
-        # G14: key rotation
-        test(
-            "G14: old sigs verifiable after rotation",
-            lambda: test_key_rotation_old_sigs_verifiable(ws),
-        )
-
+        yield workspace
     finally:
-        ws.cleanup()
-
-    # Summary
-    print()
-    print("=" * 60)
-    total = results.passed + results.failed
-    print(f"{BOLD}Results: {results.passed}/{total} passed{NC}")
-    if results.errors:
-        for name, exc in results.errors:
-            print(f"  {RED}FAIL{NC} {name}: {exc}")
-    print("=" * 60)
-
-    if results.failed:
-        print(f"{RED}{results.failed} test(s) failed{NC}")
-        sys.exit(1)
-    else:
-        print(f"{GREEN}All tests passed!{NC}")
-        sys.exit(0)
+        workspace.cleanup()
 
 
-if __name__ == "__main__":
+@pytest.mark.parametrize("case", E2E_CASES, ids=_case_id)
+def test_skill_ledger_e2e_case(case: E2ECase, ws: Workspace):
+    """Run one skill-ledger E2E scenario as its own pytest item."""
+    if not CLI_BIN:
+        pytest.fail(
+            "agent-sec-cli not found on PATH; install the RPM package or ensure "
+            "the binary is on PATH"
+        )
+    if case.requires_hook and HOOK_SCRIPT is None:
+        pytest.skip("cosh hook script not found")
+    if case.init_default_keys:
+        _ensure_default_keys(ws)
+    case.fn(ws)
+
+
+def main(argv: list[str] | None = None) -> int:
+    """CLI entry point for running this pytest module directly."""
+    global VERBOSE
+
     import argparse
 
     parser = argparse.ArgumentParser(description="skill-ledger CLI E2E tests (RPM)")
     parser.add_argument("-v", "--verbose", action="store_true", help="Show CLI output")
-    args = parser.parse_args()
+    args, pytest_args = parser.parse_known_args(argv)
     VERBOSE = args.verbose
-    main()
+    if args.verbose and "-s" not in pytest_args and "--capture=no" not in pytest_args:
+        pytest_args = ["-s", *pytest_args]
+    return pytest.main([__file__, *pytest_args])
+
+
+if __name__ == "__main__":
+    sys.exit(main())

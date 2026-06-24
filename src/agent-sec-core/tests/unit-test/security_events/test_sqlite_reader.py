@@ -13,6 +13,8 @@ from agent_sec_cli.security_events.schema import SecurityEvent
 from agent_sec_cli.security_events.sqlite_reader import SqliteEventReader
 from agent_sec_cli.security_events.sqlite_writer import SqliteEventWriter
 
+CORRELATION_BASE_EPOCH = 1_800_000_000.0
+
 
 def _make_event(
     event_type: str = "test_event", category: str = "test", **kwargs: Any
@@ -22,6 +24,28 @@ def _make_event(
         category=category,
         details=kwargs.get("details", {"key": "value"}),
         trace_id=kwargs.get("trace_id", ""),
+    )
+
+
+def _make_correlated_event(
+    *,
+    event_id: str,
+    category: str,
+    timestamp_epoch: float,
+    session_id: str,
+    run_id: str | None = None,
+    tool_call_id: str | None = None,
+) -> SecurityEvent:
+    return SecurityEvent(
+        event_id=event_id,
+        event_type=f"{category}_event",
+        category=category,
+        timestamp=datetime.fromtimestamp(timestamp_epoch, timezone.utc).isoformat(),
+        trace_id="trace",
+        session_id=session_id,
+        run_id=run_id,
+        tool_call_id=tool_call_id,
+        details={"event_id": event_id},
     )
 
 
@@ -38,7 +62,9 @@ def tilde_db_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> str:
 
 @pytest.fixture()
 def writer(db_path: str) -> SqliteEventWriter:
-    w = SqliteEventWriter(path=db_path)
+    # max_age_days=None disables retention prune so hardcoded-timestamp tests
+    # don't depend on the wall clock at run time.
+    w = SqliteEventWriter(path=db_path, max_age_days=None)
     yield w
     w.close()
 
@@ -65,6 +91,9 @@ class TestSqliteEventReader:
             timestamp="2026-04-20T13:47:00.123456+00:00",
             trace_id="test-trace-456",
             session_id="session-xyz",
+            run_id="run-xyz",
+            call_id="call-xyz",
+            tool_call_id="tool-xyz",
             details={
                 "request": {"config": "default", "dry_run": True},
                 "result": {"violations": ["RULE_001", "RULE_002"]},
@@ -96,6 +125,9 @@ class TestSqliteEventReader:
         assert retrieved_event.pid == original_event.pid
         assert retrieved_event.uid == original_event.uid
         assert retrieved_event.session_id == original_event.session_id
+        assert retrieved_event.run_id == original_event.run_id
+        assert retrieved_event.call_id == original_event.call_id
+        assert retrieved_event.tool_call_id == original_event.tool_call_id
 
         # Verify details JSON round-trip
         assert retrieved_event.details == original_event.details
@@ -254,6 +286,15 @@ class TestSqliteEventReader:
         writer.write(_make_event(category="hardening"))
         assert reader.count(category="sandbox") == 2
 
+    def test_count_filter_by_trace_id(
+        self, writer: SqliteEventWriter, reader: SqliteEventReader
+    ) -> None:
+        writer.write(_make_event(trace_id="trace-abc"))
+        writer.write(_make_event(trace_id="trace-abc"))
+        writer.write(_make_event(trace_id="trace-xyz"))
+
+        assert reader.count(trace_id="trace-abc") == 2
+
     def test_count_by_category(
         self, writer: SqliteEventWriter, reader: SqliteEventReader
     ) -> None:
@@ -273,6 +314,34 @@ class TestSqliteEventReader:
         result = reader.count_by("event_type")
         assert result["alpha"] == 2
         assert result["beta"] == 1
+
+    def test_count_by_filter_by_trace_id(
+        self, writer: SqliteEventWriter, reader: SqliteEventReader
+    ) -> None:
+        writer.write(_make_event(category="sandbox", trace_id="trace-abc"))
+        writer.write(_make_event(category="hardening", trace_id="trace-abc"))
+        writer.write(_make_event(category="sandbox", trace_id="trace-xyz"))
+
+        result = reader.count_by("category", trace_id="trace-abc")
+
+        assert result == {"hardening": 1, "sandbox": 1}
+
+    def test_count_by_filter_by_event_type_and_category(
+        self, writer: SqliteEventWriter, reader: SqliteEventReader
+    ) -> None:
+        writer.write(
+            _make_event(event_type="alpha", category="sandbox", trace_id="trace-1")
+        )
+        writer.write(
+            _make_event(event_type="alpha", category="hardening", trace_id="trace-2")
+        )
+        writer.write(
+            _make_event(event_type="beta", category="sandbox", trace_id="trace-3")
+        )
+
+        result = reader.count_by("trace_id", event_type="alpha", category="sandbox")
+
+        assert result == {"trace-1": 1}
 
     def test_count_by_invalid_field_raises(self, reader: SqliteEventReader) -> None:
         with pytest.raises(ValueError):
@@ -344,6 +413,84 @@ class TestSqliteEventReader:
         assert reader._engine is None
         assert reader._session_factory is None
 
+    def test_round_trips_new_tracing_fields(self, db_path: str) -> None:
+        writer = SqliteEventWriter(path=db_path)
+        writer.write(
+            SecurityEvent(
+                event_type="code_scan",
+                category="code_scan",
+                details={},
+                trace_id="trace-1",
+                session_id="session-1",
+                run_id="run-1",
+                call_id="call-1",
+                tool_call_id="tool-1",
+            )
+        )
+        writer.close()
+
+        events = SqliteEventReader(path=db_path).query(limit=10)
+
+        assert len(events) == 1
+        assert events[0].trace_id == "trace-1"
+        assert events[0].session_id == "session-1"
+        assert events[0].run_id == "run-1"
+        assert events[0].call_id == "call-1"
+        assert events[0].tool_call_id == "tool-1"
+
+    def test_read_only_v1_schema_missing_new_columns_warns_and_returns_empty(
+        self,
+        db_path: str,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        conn = sqlite3.connect(db_path)
+        conn.executescript("""
+            CREATE TABLE security_events (
+                event_id TEXT PRIMARY KEY,
+                event_type TEXT NOT NULL,
+                category TEXT NOT NULL,
+                result TEXT NOT NULL DEFAULT 'succeeded',
+                timestamp TEXT NOT NULL,
+                timestamp_epoch FLOAT NOT NULL,
+                trace_id TEXT NOT NULL DEFAULT '',
+                pid INTEGER NOT NULL,
+                uid INTEGER NOT NULL,
+                session_id TEXT,
+                details TEXT NOT NULL
+            );
+            PRAGMA user_version = 1;
+            """)
+        conn.execute("""
+            INSERT INTO security_events (
+                event_id, event_type, category, result, timestamp, timestamp_epoch,
+                trace_id, pid, uid, session_id, details
+            ) VALUES (
+                'old-event', 'code_scan', 'code_scan', 'succeeded',
+                '2026-05-19T00:00:00+00:00', 1779148800.0,
+                'old-trace', 1, 1, 'old-session', '{}'
+            )
+            """)
+        conn.commit()
+        conn.close()
+
+        assert SqliteEventReader(path=db_path).query(limit=10) == []
+        stderr = capsys.readouterr().err
+        assert "sqlite schema is v1, this binary expects v2" in stderr
+        assert "run any write command" in stderr
+        assert "read-only queries may return empty results until then" in stderr
+
+        conn = sqlite3.connect(db_path)
+        try:
+            user_version = conn.execute("PRAGMA user_version").fetchone()[0]
+            columns = {
+                row[1] for row in conn.execute("PRAGMA table_info(security_events)")
+            }
+        finally:
+            conn.close()
+
+        assert user_version == 1
+        assert "run_id" not in columns
+
     def test_close_disposes_readonly_store(self, db_path: str) -> None:
         writer = SqliteEventWriter(path=db_path)
         writer.write(_make_event(event_type="close"))
@@ -355,3 +502,237 @@ class TestSqliteEventReader:
         reader.close()
         assert reader._engine is None
         assert reader._session_factory is None
+
+
+class TestCorrelationCandidateQuery:
+    def test_candidates_match_session_run_tool_call_and_category(
+        self, writer: SqliteEventWriter, reader: SqliteEventReader
+    ) -> None:
+        writer.write(
+            _make_correlated_event(
+                event_id="match-code",
+                category="code_scan",
+                timestamp_epoch=CORRELATION_BASE_EPOCH,
+                session_id="session-1",
+                run_id="run-1",
+                tool_call_id="tool-1",
+            )
+        )
+        writer.write(
+            _make_correlated_event(
+                event_id="match-skill",
+                category="skill_ledger",
+                timestamp_epoch=CORRELATION_BASE_EPOCH + 1.0,
+                session_id="session-1",
+                run_id="run-1",
+                tool_call_id="tool-1",
+            )
+        )
+        writer.write(
+            _make_correlated_event(
+                event_id="wrong-tool",
+                category="code_scan",
+                timestamp_epoch=CORRELATION_BASE_EPOCH + 2.0,
+                session_id="session-1",
+                run_id="run-1",
+                tool_call_id="tool-2",
+            )
+        )
+        writer.write(
+            _make_correlated_event(
+                event_id="wrong-run",
+                category="code_scan",
+                timestamp_epoch=CORRELATION_BASE_EPOCH + 3.0,
+                session_id="session-1",
+                run_id="run-2",
+                tool_call_id="tool-1",
+            )
+        )
+        writer.write(
+            _make_correlated_event(
+                event_id="wrong-session",
+                category="code_scan",
+                timestamp_epoch=CORRELATION_BASE_EPOCH + 4.0,
+                session_id="session-2",
+                run_id="run-1",
+                tool_call_id="tool-1",
+            )
+        )
+        writer.write(
+            _make_correlated_event(
+                event_id="wrong-category",
+                category="sandbox",
+                timestamp_epoch=CORRELATION_BASE_EPOCH + 5.0,
+                session_id="session-1",
+                run_id="run-1",
+                tool_call_id="tool-1",
+            )
+        )
+        writer.close()
+
+        candidates = reader.query_correlation_candidates(
+            session_id="session-1",
+            categories=("code_scan", "skill_ledger"),
+            run_id="run-1",
+            tool_call_id="tool-1",
+        )
+
+        assert [candidate.event.event_id for candidate in candidates] == [
+            "match-code",
+            "match-skill",
+        ]
+        assert [candidate.timestamp_epoch for candidate in candidates] == [
+            CORRELATION_BASE_EPOCH,
+            CORRELATION_BASE_EPOCH + 1.0,
+        ]
+
+    def test_candidates_filter_inclusive_epoch_window(
+        self, writer: SqliteEventWriter, reader: SqliteEventReader
+    ) -> None:
+        for event_id, timestamp_epoch in (
+            ("too-early", 997.99),
+            ("lower-bound", 998.0),
+            ("center", 1000.0),
+            ("upper-bound", 1002.0),
+            ("too-late", 1002.01),
+        ):
+            writer.write(
+                _make_correlated_event(
+                    event_id=event_id,
+                    category="prompt_scan",
+                    timestamp_epoch=CORRELATION_BASE_EPOCH + timestamp_epoch,
+                    session_id="session-1",
+                    run_id="run-1",
+                )
+            )
+        writer.close()
+
+        candidates = reader.query_correlation_candidates(
+            session_id="session-1",
+            categories=["prompt_scan"],
+            run_id="run-1",
+            since_epoch=CORRELATION_BASE_EPOCH + 998.0,
+            until_epoch=CORRELATION_BASE_EPOCH + 1002.0,
+        )
+
+        assert [candidate.event.event_id for candidate in candidates] == [
+            "lower-bound",
+            "center",
+            "upper-bound",
+        ]
+
+    def test_candidates_filter_multiple_tool_call_ids(
+        self, writer: SqliteEventWriter, reader: SqliteEventReader
+    ) -> None:
+        for event_id, tool_call_id in (
+            ("tool-1-match", "tool-1"),
+            ("tool-2-match", "tool-2"),
+            ("tool-3-skip", "tool-3"),
+        ):
+            writer.write(
+                _make_correlated_event(
+                    event_id=event_id,
+                    category="code_scan",
+                    timestamp_epoch=CORRELATION_BASE_EPOCH,
+                    session_id="session-1",
+                    run_id="run-1",
+                    tool_call_id=tool_call_id,
+                )
+            )
+        writer.close()
+
+        candidates = reader.query_correlation_candidates(
+            session_id="session-1",
+            categories=("code_scan",),
+            run_id="run-1",
+            tool_call_ids=("tool-1", "tool-2"),
+        )
+
+        assert [candidate.event.event_id for candidate in candidates] == [
+            "tool-1-match",
+            "tool-2-match",
+        ]
+
+    def test_candidates_are_limited_to_1000_rows(
+        self, writer: SqliteEventWriter, reader: SqliteEventReader
+    ) -> None:
+        for index in range(1001):
+            writer.write(
+                _make_correlated_event(
+                    event_id=f"candidate-{index:04d}",
+                    category="code_scan",
+                    timestamp_epoch=CORRELATION_BASE_EPOCH + index,
+                    session_id="session-1",
+                    run_id="run-1",
+                    tool_call_id="tool-1",
+                )
+            )
+        writer.close()
+
+        candidates = reader.query_correlation_candidates(
+            session_id="session-1",
+            categories=("code_scan",),
+            run_id="run-1",
+            tool_call_id="tool-1",
+        )
+
+        assert len(candidates) == 1000
+        assert candidates[0].event.event_id == "candidate-0000"
+        assert candidates[-1].event.event_id == "candidate-0999"
+
+    def test_candidates_do_not_filter_run_when_run_id_omitted(
+        self, writer: SqliteEventWriter, reader: SqliteEventReader
+    ) -> None:
+        writer.write(
+            _make_correlated_event(
+                event_id="run-1-match",
+                category="pii_scan",
+                timestamp_epoch=CORRELATION_BASE_EPOCH,
+                session_id="session-1",
+                run_id="run-1",
+            )
+        )
+        writer.write(
+            _make_correlated_event(
+                event_id="run-2-match",
+                category="pii_scan",
+                timestamp_epoch=CORRELATION_BASE_EPOCH + 1.0,
+                session_id="session-1",
+                run_id="run-2",
+            )
+        )
+        writer.write(
+            _make_correlated_event(
+                event_id="wrong-session",
+                category="pii_scan",
+                timestamp_epoch=CORRELATION_BASE_EPOCH + 2.0,
+                session_id="session-2",
+                run_id="run-1",
+            )
+        )
+        writer.close()
+
+        candidates = reader.query_correlation_candidates(
+            session_id="session-1",
+            categories=("pii_scan",),
+            since_epoch=CORRELATION_BASE_EPOCH - 1.0,
+            until_epoch=CORRELATION_BASE_EPOCH + 2.0,
+        )
+
+        assert [candidate.event.event_id for candidate in candidates] == [
+            "run-1-match",
+            "run-2-match",
+        ]
+
+    def test_candidates_return_empty_when_schema_unavailable(
+        self, tmp_path: Path
+    ) -> None:
+        reader = SqliteEventReader(path=str(tmp_path / "missing.db"))
+
+        assert (
+            reader.query_correlation_candidates(
+                session_id="session-1",
+                categories=("code_scan",),
+            )
+            == []
+        )

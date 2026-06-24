@@ -95,6 +95,13 @@ pub struct SavingsSessionSummary {
     pub request_count: i64,
 }
 
+/// Turn info for a tool_call_id, including which session it belongs to.
+#[derive(Debug, Clone)]
+pub struct ToolCallTurnInfo {
+    pub turn_index: usize,
+    pub session_id: String,
+}
+
 /// Summary of a single conversation (user query) within a session
 #[derive(Debug, serde::Serialize)]
 pub struct TraceSummary {
@@ -486,17 +493,8 @@ impl GenAISqliteStore {
                     }
                 };
                 let input_messages: Option<String> = {
-                    let non_sys: Vec<_> = call
-                        .request
-                        .messages
-                        .iter()
-                        .filter(|m| m.role != "system")
-                        .collect();
-                    let latest = if let Some(idx) = non_sys.iter().rposition(|m| m.role == "user") {
-                        &non_sys[idx..]
-                    } else {
-                        &non_sys[..]
-                    };
+                    let latest =
+                        crate::genai::semantic::latest_round_input_messages(&call.request.messages);
                     if latest.is_empty() {
                         None
                     } else {
@@ -623,9 +621,24 @@ impl GenAISqliteStore {
                     );
                     return Ok(());
                 }
-                // No pending row found — fall through to plain insert below
+                // No pending row with status='pending' — check if the row
+                // already exists with a different status (e.g. 'interrupted'
+                // by crash detection).  If so, skip the fallback INSERT to
+                // avoid creating a duplicate row for the same call_id.
+                let exists: bool = conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM genai_events WHERE call_id = ?1)",
+                    params![call.call_id],
+                    |row| row.get(0),
+                )?;
+                if exists {
+                    log::debug!(
+                        "[GenAI] Row already exists for call_id={} (non-pending), skipping insert",
+                        call.call_id
+                    );
+                    return Ok(());
+                }
                 log::debug!(
-                    "[GenAI] No pending row for call_id={}, inserting directly",
+                    "[GenAI] No row for call_id={}, inserting directly",
                     call.call_id
                 );
             }
@@ -665,10 +678,7 @@ impl GenAISqliteStore {
             params![cutoff_ns],
         )?;
         if updated > 0 {
-            log::info!(
-                "[GenAI] Marked {} stale pending call(s) as interrupted",
-                updated
-            );
+            log::info!("[GenAI] Marked {updated} stale pending call(s) as interrupted");
         }
         Ok(updated)
     }
@@ -687,6 +697,70 @@ impl GenAISqliteStore {
             params![itype, call_id],
         )?;
         Ok(())
+    }
+
+    pub fn count_interruption_type_for_conversation(
+        &self,
+        conversation_id: &str,
+        itype: &str,
+    ) -> u32 {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM genai_events WHERE conversation_id = ?1 AND interruption_type = ?2",
+            params![conversation_id, itype],
+            |row| row.get(0),
+        )
+        .unwrap_or(0)
+    }
+
+    /// Fetch the most recent N LLM calls for a conversation (for loop detection).
+    ///
+    /// Returns lightweight summaries ordered oldest-first (ascending timestamp).
+    /// Used by LoopDetector to analyze repetitive patterns across calls.
+    pub fn get_recent_calls_for_conversation(
+        &self,
+        conversation_id: &str,
+        limit: usize,
+    ) -> Vec<crate::interruption::RecentCallSummary> {
+        let conn = self.conn.lock().unwrap();
+        // Subquery fetches latest N rows desc, outer query reverses to asc order
+        let sql = "SELECT call_id, output_messages, COALESCE(input_tokens, 0), COALESCE(output_tokens, 0) \
+                   FROM (SELECT call_id, output_messages, input_tokens, output_tokens, start_timestamp_ns \
+                         FROM genai_events \
+                         WHERE event_type = 'llm_call' \
+                           AND conversation_id = ?1 \
+                           AND status != 'pending' \
+                         ORDER BY start_timestamp_ns DESC \
+                         LIMIT ?2) \
+                   ORDER BY start_timestamp_ns ASC";
+        let mut stmt = match conn.prepare(sql) {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+        let rows = match stmt.query_map(params![conversation_id, limit as i64], |row| {
+            let call_id: String = row.get(0)?;
+            let output_messages_json: Option<String> = row.get(1)?;
+            let input_tokens: i64 = row.get(2)?;
+            let output_tokens: i64 = row.get(3)?;
+            Ok((call_id, output_messages_json, input_tokens, output_tokens))
+        }) {
+            Ok(r) => r,
+            Err(_) => return vec![],
+        };
+
+        rows.filter_map(|r| r.ok())
+            .map(|(call_id, output_json, input_tokens, output_tokens)| {
+                let (tool_call_names, output_text_snippet) =
+                    parse_output_messages_for_loop_detection(output_json.as_deref());
+                crate::interruption::RecentCallSummary {
+                    call_id,
+                    tool_call_names,
+                    output_text_snippet,
+                    input_tokens,
+                    output_tokens,
+                }
+            })
+            .collect()
     }
 
     /// List all pending calls for a specific PID.
@@ -742,11 +816,7 @@ impl GenAISqliteStore {
             params![itype, pid],
         )?;
         if updated > 0 {
-            log::info!(
-                "Marked {} pending call(s) as interrupted for pid={}",
-                updated,
-                pid
-            );
+            log::info!("Marked {updated} pending call(s) as interrupted for pid={pid}");
         }
         Ok(updated)
     }
@@ -774,8 +844,7 @@ impl GenAISqliteStore {
              FROM genai_events
              WHERE event_type = 'llm_call'
                AND status = 'pending'
-               AND pid IN ({})",
-            placeholders
+               AND pid IN ({placeholders})"
         );
         let params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = pids
             .iter()
@@ -799,8 +868,9 @@ impl GenAISqliteStore {
     }
 
     /// Look up the real session_id from completed records for the same PID.
-    /// Used in drain path to reconcile SHA256-hash fallback session_id with the
-    /// real agent UUID from ResponseSessionMapper.
+    /// Used in drain path to reconcile the response_id-based fallback session_id
+    /// (`SHA256("session" + first_response_id)`) with the real agent UUID from
+    /// ResponseSessionMapper.
     pub fn lookup_session_for_pid(
         &self,
         pid: i32,
@@ -1007,16 +1077,17 @@ impl GenAISqliteStore {
         Ok(result)
     }
 
-    /// Build a mapping from `tool_call_id` to the turn index of the LLM call
-    /// that issued it.
+    /// Build a mapping from `tool_call_id` to the turn index and session of
+    /// the LLM call that issued it.
     ///
     /// Reads the `tool_call_ids` JSON array column from `genai_events` and
-    /// expands it so that each individual tool_call_id maps to the turn index
-    /// (1-based) of its parent LLM call.
+    /// expands it so that each individual tool_call_id maps to its parent LLM
+    /// call's turn index (1-based) and session_id.
     pub fn get_tool_call_turn_indices(
         &self,
         session_ids: &[&str],
-    ) -> Result<std::collections::HashMap<String, usize>, Box<dyn std::error::Error>> {
+    ) -> Result<std::collections::HashMap<String, ToolCallTurnInfo>, Box<dyn std::error::Error>>
+    {
         let conn = self.conn.lock().unwrap();
         let mut result = std::collections::HashMap::new();
 
@@ -1034,16 +1105,29 @@ impl GenAISqliteStore {
             for (idx, row) in rows.enumerate() {
                 let (call_id, tool_call_ids_json) = row?;
                 let turn = idx + 1; // 1-based
+                let session_id = sid.to_string();
 
                 // Also map the call_id itself (for backward compat with
                 // stats.db that may still store call_id as tool_use_id)
-                result.insert(call_id.clone(), turn);
+                result.insert(
+                    call_id.clone(),
+                    ToolCallTurnInfo {
+                        turn_index: turn,
+                        session_id: session_id.clone(),
+                    },
+                );
 
                 // Expand each tool_call_id in the JSON array
                 if let Some(json_str) = tool_call_ids_json {
                     if let Ok(ids) = serde_json::from_str::<Vec<String>>(&json_str) {
                         for tc_id in ids {
-                            result.insert(tc_id, turn);
+                            result.insert(
+                                tc_id,
+                                ToolCallTurnInfo {
+                                    turn_index: turn,
+                                    session_id: session_id.clone(),
+                                },
+                            );
                         }
                     }
                 }
@@ -1067,8 +1151,7 @@ impl GenAISqliteStore {
 
         // When both start_ns and end_ns are present, rewrite with BETWEEN
         let sql = if start_ns.is_some() && end_ns.is_some() {
-            format!(
-                "SELECT conversation_id,
+            "SELECT conversation_id,
                         COUNT(*)                        AS call_count,
                         COALESCE(SUM(input_tokens), 0)  AS total_input,
                         COALESCE(SUM(output_tokens), 0) AS total_output,
@@ -1083,10 +1166,9 @@ impl GenAISqliteStore {
                    AND start_timestamp_ns BETWEEN ?2 AND ?3
                  GROUP BY conversation_id
                  ORDER BY start_ns DESC"
-            )
+                .to_string()
         } else if start_ns.is_some() {
-            format!(
-                "SELECT conversation_id,
+            "SELECT conversation_id,
                         COUNT(*)                        AS call_count,
                         COALESCE(SUM(input_tokens), 0)  AS total_input,
                         COALESCE(SUM(output_tokens), 0) AS total_output,
@@ -1101,10 +1183,9 @@ impl GenAISqliteStore {
                    AND start_timestamp_ns >= ?2
                  GROUP BY conversation_id
                  ORDER BY start_ns DESC"
-            )
+                .to_string()
         } else if end_ns.is_some() {
-            format!(
-                "SELECT conversation_id,
+            "SELECT conversation_id,
                         COUNT(*)                        AS call_count,
                         COALESCE(SUM(input_tokens), 0)  AS total_input,
                         COALESCE(SUM(output_tokens), 0) AS total_output,
@@ -1119,7 +1200,7 @@ impl GenAISqliteStore {
                    AND start_timestamp_ns <= ?2
                  GROUP BY conversation_id
                  ORDER BY start_ns DESC"
-            )
+                .to_string()
         } else {
             String::from(
                 "SELECT conversation_id,
@@ -1135,7 +1216,7 @@ impl GenAISqliteStore {
                    AND session_id = ?1
                    AND conversation_id IS NOT NULL
                  GROUP BY conversation_id
-                 ORDER BY start_ns DESC"
+                 ORDER BY start_ns DESC",
             )
         };
 
@@ -1614,8 +1695,6 @@ impl GenAISqliteStore {
         loop {
             match self.try_insert_event(event) {
                 Ok(()) => {
-                    // Success: execute checkpoint to flush WAL to main DB
-                    self.checkpoint()?;
                     return Ok(());
                 }
                 Err(e) => {
@@ -1626,9 +1705,7 @@ impl GenAISqliteStore {
                         if err.extended_code == 13 && retries < MAX_PRUNE_RETRIES {
                             retries += 1;
                             log::warn!(
-                                "Database full (SQLITE_FULL), pruning old records (attempt {}/{})",
-                                retries,
-                                MAX_PRUNE_RETRIES
+                                "Database full (SQLITE_FULL), pruning old records (attempt {retries}/{MAX_PRUNE_RETRIES})"
                             );
                             self.prune_old_records()?;
                             self.checkpoint()?;
@@ -1688,18 +1765,8 @@ impl GenAISqliteStore {
 
                 // Extract input messages (incremental: latest round only)
                 let input_messages: Option<String> = {
-                    let non_system: Vec<_> = call
-                        .request
-                        .messages
-                        .iter()
-                        .filter(|m| m.role != "system")
-                        .collect();
                     let latest =
-                        if let Some(idx) = non_system.iter().rposition(|m| m.role == "user") {
-                            &non_system[idx..]
-                        } else {
-                            &non_system[..]
-                        };
+                        crate::genai::semantic::latest_round_input_messages(&call.request.messages);
                     if latest.is_empty() {
                         None
                     } else {
@@ -1971,7 +2038,7 @@ impl GenAISqliteStore {
             params![delete_count],
         )?;
 
-        log::info!("Deleted {} records", deleted);
+        log::info!("Deleted {deleted} records");
 
         Ok(())
     }
@@ -1997,6 +2064,17 @@ impl GenAISqliteStore {
 
         Ok(())
     }
+
+    /// Flush WAL frames to the main database and truncate the WAL file.
+    ///
+    /// Call during graceful shutdown to clean up `-wal` / `-shm` files —
+    /// mirrors the sibling stores (token, http, audit) which do this via
+    /// `connection::wal_checkpoint` in their own `checkpoint()` methods.
+    pub fn wal_checkpoint(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+        Ok(())
+    }
 }
 
 impl GenAIExporter for GenAISqliteStore {
@@ -2007,8 +2085,226 @@ impl GenAIExporter for GenAISqliteStore {
     fn export(&self, events: &[GenAISemanticEvent]) {
         for event in events {
             if let Err(e) = self.store_event(event) {
-                log::warn!("Failed to store GenAI event to SQLite: {}", e);
+                log::warn!("Failed to store GenAI event to SQLite: {e}");
             }
         }
+    }
+}
+
+// ─── Helper for loop detection ───────────────────────────────────────────────
+
+/// Parse the `output_messages` JSON column to extract tool call names and text snippets.
+///
+/// The JSON structure follows the OTel GenAI parts format stored by `store_event()`:
+/// ```json
+/// [{"role":"assistant","parts":[{"type":"tool_call","name":"read_file",...},{"type":"text","content":"..."}]}]
+/// ```
+fn parse_output_messages_for_loop_detection(json_str: Option<&str>) -> (Vec<String>, String) {
+    let Some(json_str) = json_str else {
+        return (vec![], String::new());
+    };
+
+    let messages: Vec<serde_json::Value> = match serde_json::from_str(json_str) {
+        Ok(v) => v,
+        Err(_) => return (vec![], String::new()),
+    };
+
+    let mut tool_names = Vec::new();
+    let mut text_parts = Vec::new();
+
+    for msg in &messages {
+        if let Some(parts) = msg.get("parts").and_then(|p| p.as_array()) {
+            for part in parts {
+                match part.get("type").and_then(|t| t.as_str()) {
+                    Some("tool_call") => {
+                        if let Some(name) = part.get("name").and_then(|n| n.as_str()) {
+                            tool_names.push(name.to_string());
+                        }
+                    }
+                    Some("text") => {
+                        if let Some(content) = part.get("content").and_then(|c| c.as_str()) {
+                            text_parts.push(content);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    // Build a snippet from text parts (max 200 chars)
+    let full_text = text_parts.join(" ");
+    let snippet = if full_text.len() > 200 {
+        full_text.chars().take(200).collect()
+    } else {
+        full_text
+    };
+
+    (tool_names, snippet)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::genai::semantic::{GenAISemanticEvent, LLMCall, LLMRequest};
+
+    /// Integration test: store_event (post-fix, no per-insert VACUUM) still
+    /// persists data correctly and the row is immediately readable.
+    /// Reverting the VACUUM removal does NOT make this test fail (it would just
+    /// be slower), but this proves the write path is functional — the
+    /// discriminating signal for the per-insert VACUUM removal is the latency
+    /// benchmark, not a correctness test.
+    #[test]
+    fn store_event_persists_without_per_insert_vacuum() {
+        let path = std::env::temp_dir().join(format!(
+            "test_genai_store_{}.db",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let store = GenAISqliteStore::new_with_path(&path).unwrap();
+
+        let call = LLMCall::new(
+            "test-call-001".to_string(),
+            1_700_000_000_000_000_000,
+            "openai".to_string(),
+            "gpt-4".to_string(),
+            LLMRequest {
+                messages: vec![],
+                temperature: None,
+                max_tokens: None,
+                frequency_penalty: None,
+                presence_penalty: None,
+                top_p: None,
+                top_k: None,
+                seed: None,
+                stop_sequences: None,
+                stream: false,
+                tools: None,
+                raw_body: None,
+            },
+            1234,
+            "test-agent".to_string(),
+        );
+        let event = GenAISemanticEvent::LLMCall(call);
+
+        // Write via the exact code path that was modified (store_event).
+        store.store_event(&event).unwrap();
+
+        // The event has no session_id set, so list_sessions (which filters
+        // session_id IS NOT NULL) won't find it — use a raw count instead.
+        let conn = store.conn.lock().unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM genai_events WHERE call_id = 'test-call-001'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "store_event must persist the row");
+
+        drop(conn);
+        // Verify wal_checkpoint doesn't panic
+        store.wal_checkpoint().unwrap();
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    /// Verify busy_timeout is set on connections (create_connection is used by
+    /// GenAISqliteStore::new_with_path internally).
+    #[test]
+    fn connection_has_busy_timeout() {
+        let path = std::env::temp_dir().join(format!(
+            "test_bt_{}.db",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let store = GenAISqliteStore::new_with_path(&path).unwrap();
+        let conn = store.conn.lock().unwrap();
+        // PRAGMA busy_timeout returns the current value in ms
+        let timeout: i64 = conn
+            .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(timeout, 500, "busy_timeout must be 500ms");
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    use super::parse_output_messages_for_loop_detection;
+
+    #[test]
+    fn test_parse_output_none() {
+        let (tools, text) = parse_output_messages_for_loop_detection(None);
+        assert!(tools.is_empty());
+        assert!(text.is_empty());
+    }
+
+    #[test]
+    fn test_parse_output_invalid_json() {
+        let (tools, text) = parse_output_messages_for_loop_detection(Some("not json"));
+        assert!(tools.is_empty());
+        assert!(text.is_empty());
+    }
+
+    #[test]
+    fn test_parse_output_tool_calls_only() {
+        let json = r#"[{"role":"assistant","parts":[{"type":"tool_call","name":"read_file"},{"type":"tool_call","name":"write_file"}]}]"#;
+        let (tools, text) = parse_output_messages_for_loop_detection(Some(json));
+        assert_eq!(tools, vec!["read_file", "write_file"]);
+        assert!(text.is_empty());
+    }
+
+    #[test]
+    fn test_parse_output_text_only() {
+        let json = r#"[{"role":"assistant","parts":[{"type":"text","content":"Hello world"}]}]"#;
+        let (tools, text) = parse_output_messages_for_loop_detection(Some(json));
+        assert!(tools.is_empty());
+        assert_eq!(text, "Hello world");
+    }
+
+    #[test]
+    fn test_parse_output_mixed() {
+        let json = r#"[{"role":"assistant","parts":[{"type":"tool_call","name":"search"},{"type":"text","content":"Found results"}]}]"#;
+        let (tools, text) = parse_output_messages_for_loop_detection(Some(json));
+        assert_eq!(tools, vec!["search"]);
+        assert_eq!(text, "Found results");
+    }
+
+    #[test]
+    fn test_parse_output_multiple_text_parts() {
+        let json = r#"[{"role":"assistant","parts":[{"type":"text","content":"Part 1"},{"type":"text","content":"Part 2"}]}]"#;
+        let (_tools, text) = parse_output_messages_for_loop_detection(Some(json));
+        assert_eq!(text, "Part 1 Part 2");
+    }
+
+    #[test]
+    fn test_parse_output_text_truncated_at_200_chars() {
+        let long_content = "a".repeat(300);
+        let json = format!(
+            r#"[{{"role":"assistant","parts":[{{"type":"text","content":"{long_content}"}}]}}]"#
+        );
+        let (_, text) = parse_output_messages_for_loop_detection(Some(&json));
+        assert_eq!(text.len(), 200);
+    }
+
+    #[test]
+    fn test_parse_output_empty_parts_array() {
+        let json = r#"[{"role":"assistant","parts":[]}]"#;
+        let (tools, text) = parse_output_messages_for_loop_detection(Some(json));
+        assert!(tools.is_empty());
+        assert!(text.is_empty());
+    }
+
+    #[test]
+    fn test_parse_output_no_parts_field() {
+        let json = r#"[{"role":"assistant"}]"#;
+        let (tools, text) = parse_output_messages_for_loop_detection(Some(json));
+        assert!(tools.is_empty());
+        assert!(text.is_empty());
     }
 }

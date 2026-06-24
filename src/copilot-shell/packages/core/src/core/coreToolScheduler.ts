@@ -31,6 +31,7 @@ import {
   InputFormat,
   SkillTool,
 } from '../index.js';
+import { uiTelemetryService } from '../telemetry/uiTelemetry.js';
 import type { SandboxBypassApprovalRequest } from '../index.js';
 import type { HookDecision } from '../hooks/types.js';
 import type {
@@ -132,6 +133,12 @@ export type WaitingToolCall = {
    */
   hookForceAsk?: boolean;
   startTime?: number;
+  /**
+   * Timestamp when the tool call entered awaiting_approval state.
+   * Used to accurately measure user approval wait duration (excludes
+   * validation and hook execution time).
+   */
+  awaitStartTime?: number;
   outcome?: ToolConfirmationOutcome;
 };
 
@@ -492,6 +499,8 @@ export class CoreToolScheduler {
             confirmationDetails: auxiliaryData as ToolCallConfirmationDetails,
             hookForceAsk,
             startTime: existingStartTime,
+            awaitStartTime:
+              (currentCall as WaitingToolCall).awaitStartTime ?? Date.now(),
             outcome,
             invocation,
           } as WaitingToolCall;
@@ -861,6 +870,7 @@ export class CoreToolScheduler {
                 reqInfo.name,
                 reqInfo.args,
                 skillContext,
+                reqInfo.callId,
               );
 
               if (hookOutput) {
@@ -1197,6 +1207,17 @@ export class CoreToolScheduler {
       (c) => c.request.callId === callId && c.status === 'awaiting_approval',
     );
 
+    // Record await duration for SLS telemetry (use awaitStartTime for accuracy)
+    if (toolCall) {
+      const awaitStart =
+        ('awaitStartTime' in toolCall && toolCall.awaitStartTime) ||
+        ('startTime' in toolCall && toolCall.startTime);
+      if (awaitStart) {
+        const awaitDuration = Date.now() - awaitStart;
+        uiTelemetryService.recordAwaitDuration(awaitDuration);
+      }
+    }
+
     await originalOnConfirm(outcome, payload);
 
     if (outcome === ToolConfirmationOutcome.ProceedAlways) {
@@ -1512,6 +1533,42 @@ export class CoreToolScheduler {
                   );
 
                   if (postToolOutput) {
+                    // Compute mergedDecision once so every notification shares
+                    // the same context. Mirrors the PreToolUse path: blocking
+                    // (block/deny or continue=false) wins over ask, which
+                    // wins over the per-hook decision used for individual
+                    // notification dimming.
+                    const isBlockingPost =
+                      postToolOutput.isBlockingDecision() ||
+                      postToolOutput.shouldStopExecution();
+                    const isAskPost = postToolOutput.isAskDecision();
+                    const mergedDecisionPost: HookDecision | undefined =
+                      isBlockingPost
+                        ? postToolOutput.decision === 'deny'
+                          ? 'deny'
+                          : 'block'
+                        : isAskPost
+                          ? 'ask'
+                          : postToolOutput.decision;
+
+                    // Emit per-hook notifications BEFORE applying the merged
+                    // decision so every hook's reason/systemMessage surfaces
+                    // in the UI even when the overall outcome later replaces
+                    // the tool response.
+                    if (
+                      this.outputUpdateHandler &&
+                      postToolOutput.notifications?.length
+                    ) {
+                      for (const n of postToolOutput.notifications) {
+                        this.outputUpdateHandler(callId, {
+                          hookName: n.hookName,
+                          hookMessage: n.message,
+                          decision: n.decision,
+                          mergedDecision: mergedDecisionPost,
+                        });
+                      }
+                    }
+
                     // If hook denies, replace tool result with reason
                     if (postToolOutput.isBlockingDecision()) {
                       const reason = postToolOutput.getEffectiveReason();

@@ -34,6 +34,12 @@
 - Time-range based event aggregation
 - Multiple output formats (text, JSON)
 
+### 📈 Observability Record Ingestion
+- Typed agent hook record validation
+- Independent `observability.jsonl` stream
+- Forward-compatible unknown field and metric filtering
+- JSON Schema output for producers
+
 ---
 
 ## Installation
@@ -95,7 +101,46 @@ agent-sec-cli verify --skill /path/to/skill
 # Security event summary
 agent-sec-cli summary --hours 24 --format text
 agent-sec-cli summary --hours 72 --format json
+
+# Observability record ingestion
+agent-sec-cli observability record --format json --stdin < record.json
+agent-sec-cli observability schema
 ```
+
+### Observability Records
+
+`agent-sec-cli observability record` accepts one JSON object from stdin and writes
+validated hook telemetry to the independent `observability.jsonl` stream plus an
+internal `observability.db` SQLite index. The SQLite index is an implementation
+detail for retention and future local reads; this command does not expose a
+public query API.
+
+Required wire fields:
+
+- `hook`
+- `observedAt` as a timezone-aware timestamp
+- `metadata.sessionId`
+- `metadata.runId`
+- `metrics`
+
+Hook-specific metadata:
+
+- `metadata.callId` is optional on model and tool call records.
+- `metadata.toolCallId` is required on `before_tool_call` and `after_tool_call`.
+
+Unknown top-level fields, metadata fields, and metric keys are ignored for
+forward compatibility. A record is rejected when no supported metric remains
+after filtering. The command is silent on success and exits non-zero if parsing,
+validation, or persistence fails.
+
+Current supported hooks:
+
+- `before_agent_run`
+- `before_llm_call`
+- `after_llm_call`
+- `before_tool_call`
+- `after_tool_call`
+- `after_agent_run`
 
 ### Python API
 
@@ -218,6 +263,21 @@ LOG_FILE = "/var/log/agent-sec/security-events.jsonl"
 MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 MB
 ROTATION_COUNT = 5
 ```
+
+### Observability
+
+Observability records use the same data directory resolver as security events,
+but write to separate files:
+
+- default system path: `/var/log/agent-sec/observability.jsonl`
+- default SQLite index: `/var/log/agent-sec/observability.db`
+- user fallback: `~/.agent-sec-core/observability.jsonl`
+- user SQLite fallback: `~/.agent-sec-core/observability.db`
+- test/dev override: `AGENT_SEC_DATA_DIR=/path/to/dir`
+
+The observability stream uses its own JSONL file, lock file, SQLite database,
+rotation limit, backup count, and 7-day SQLite retention policy; it does not
+write to `security-events.jsonl` or `security-events.db`.
 
 ---
 

@@ -53,6 +53,7 @@ import { TaskTool } from '../tools/task.js';
 import {
   NextSpeakerCheckEvent,
   logNextSpeakerCheck,
+  logSessionSummary,
 } from '../telemetry/index.js';
 import { uiTelemetryService } from '../telemetry/uiTelemetry.js';
 
@@ -188,6 +189,7 @@ export class GeminiClient {
   async shutdown(): Promise<void> {
     if (this.hasShutdown) return;
     this.hasShutdown = true;
+    logSessionSummary(this.config);
     await this.fireSessionEndHook(SessionEndReason.PromptInputExit);
   }
 
@@ -528,10 +530,23 @@ export class GeminiClient {
     options?: { isContinuation: boolean },
     turns: number = MAX_TURNS,
   ): AsyncGenerator<ServerGeminiStreamEvent, Turn> {
+    // A continuation is any internal re-entry into this method for the same
+    // user prompt: tool-response follow-ups, Stop-hook continuation, and the
+    // next-speaker auto-continue path. UserPromptSubmit semantics ("when the
+    // user submits a prompt") only apply to the first, non-continuation call.
+    const isContinuation = options?.isContinuation === true;
+
+    // Promote prompt_id to the current run id BEFORE firing UserPromptSubmit
+    // so hookEventHandler.createBaseInput() can populate run_id correctly.
+    // Continuations keep the run id from the original prompt — don't overwrite.
+    if (!isContinuation) {
+      this.config.setCurrentRunId(prompt_id);
+    }
+
     // Fire UserPromptSubmit hook through MessageBus (only if hooks are enabled)
     const hooksEnabled = this.config.getEnableHooks();
     const messageBus = this.config.getMessageBus();
-    if (hooksEnabled && messageBus) {
+    if (hooksEnabled && messageBus && !isContinuation) {
       const promptText = partToString(request);
       const response = await messageBus.request<
         HookExecutionRequest,
@@ -606,6 +621,25 @@ export class GeminiClient {
         }
       }
 
+      // Non-blocking allow/approve path: surface systemMessage (or reason as
+      // fallback) to the terminal UI. Block uses Error event above; ask uses
+      // UserPromptConfirmation, both of which already render the message — so
+      // this branch only runs when no other UI path was taken.
+      if (
+        hookOutput &&
+        !hookOutput.isBlockingDecision() &&
+        !hookOutput.shouldStopExecution() &&
+        !hookOutput.isAskDecision()
+      ) {
+        const message = hookOutput.systemMessage ?? hookOutput.reason;
+        if (message) {
+          yield {
+            type: GeminiEventType.HookSystemMessage,
+            value: message,
+          };
+        }
+      }
+
       // Add additional context from hooks to the request
       const additionalContext = hookOutput?.getAdditionalContext();
       if (additionalContext) {
@@ -614,7 +648,7 @@ export class GeminiClient {
       }
     }
 
-    if (!options?.isContinuation) {
+    if (!isContinuation) {
       this.loopDetector.reset(prompt_id);
       this.lastPromptId = prompt_id;
 
@@ -703,7 +737,7 @@ export class GeminiClient {
 
     // append system reminders to the request
     let requestToSent = await flatMapTextParts(request, async (text) => [text]);
-    if (!options?.isContinuation) {
+    if (!isContinuation) {
       const systemReminders = [];
 
       // add subagent system reminder if there are subagents
@@ -828,12 +862,14 @@ export class GeminiClient {
       if (nextSpeakerCheck?.next_speaker === 'model') {
         const nextRequest = [{ text: 'Please continue.' }];
         // This recursive call's events will be yielded out, and the final
-        // turn object from the recursive call will be returned.
+        // turn object from the recursive call will be returned. Mark it as a
+        // continuation so UserPromptSubmit (and other once-per-prompt setup)
+        // does not fire for the synthesized "Please continue." message.
         return yield* this.sendMessageStream(
           nextRequest,
           signal,
           prompt_id,
-          options,
+          { ...options, isContinuation: true },
           boundedTurns - 1,
         );
       }

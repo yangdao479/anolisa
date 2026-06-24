@@ -20,9 +20,12 @@ import pathlib
 import shutil
 import subprocess
 import sys
+import uuid
 from typing import List, Tuple
 
 import pytest
+
+TELEMETRY_LOG_PATH_ENV = "AGENT_SEC_TELEMETRY_LOG_PATH"
 
 # Ensure the testdata package under unit-test/code_scanner is importable.
 _TESTDATA_DIR = (
@@ -31,7 +34,12 @@ _TESTDATA_DIR = (
 if str(_TESTDATA_DIR) not in sys.path:
     sys.path.insert(0, str(_TESTDATA_DIR))
 
-from testdata.scan_test_data import SCAN_TEST_CASES
+_HELPERS_DIR = pathlib.Path(__file__).resolve().parents[1] / "_helpers"
+if str(_HELPERS_DIR) not in sys.path:
+    sys.path.insert(0, str(_HELPERS_DIR))
+
+from telemetry_jsonl import wait_for_telemetry_record  # noqa: E402
+from testdata.scan_test_data import SCAN_TEST_CASES  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # CLI resolution — supports both installed and dev-mode environments
@@ -41,15 +49,31 @@ _CLI_BIN = shutil.which("agent-sec-cli")
 _CLI_MODE = "binary" if _CLI_BIN else "python -m"
 
 
-def _run_scan(code: str, language: str = "bash") -> subprocess.CompletedProcess:
+def _run_scan(
+    code: str,
+    language: str = "bash",
+    *,
+    top_level_args: list[str] | None = None,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess:
     """Run ``agent-sec-cli scan-code`` and return CompletedProcess."""
+    top_level = [] if top_level_args is None else top_level_args
     if _CLI_BIN:
-        cmd = [_CLI_BIN, "scan-code", "--code", code, "--language", language]
+        cmd = [
+            _CLI_BIN,
+            *top_level,
+            "scan-code",
+            "--code",
+            code,
+            "--language",
+            language,
+        ]
     else:
         cmd = [
             sys.executable,
             "-m",
             "agent_sec_cli.cli",
+            *top_level,
             "scan-code",
             "--code",
             code,
@@ -61,7 +85,7 @@ def _run_scan(code: str, language: str = "bash") -> subprocess.CompletedProcess:
         capture_output=True,
         text=True,
         timeout=30,
-        env=os.environ.copy(),
+        env=os.environ.copy() if env is None else env,
     )
     print(f"\n[CLI mode={_CLI_MODE}] cmd={' '.join(cmd)}")
     print(f"[exit={proc.returncode}] stdout={proc.stdout[:200]}")
@@ -113,6 +137,39 @@ class TestBasicScan:
         result = _parse_result(_run_scan("rm -rf /tmp/test"))
         assert result["verdict"] in ("warn", "deny")
         assert len(result["findings"]) > 0
+
+    def test_scan_code_cli_writes_telemetry(self, tmp_path: pathlib.Path) -> None:
+        telemetry_path = tmp_path / "agent-sec-core.jsonl"
+        telemetry_path.write_text("", encoding="utf-8")
+        trace_id = f"e2e-code-telemetry-{uuid.uuid4()}"
+        trace_context = {
+            "trace_id": trace_id,
+            "agent_name": "cosh",
+        }
+        env = os.environ.copy()
+        env[TELEMETRY_LOG_PATH_ENV] = str(telemetry_path)
+
+        result = _parse_result(
+            _run_scan(
+                "echo telemetry",
+                top_level_args=["--trace-context", json.dumps(trace_context)],
+                env=env,
+            )
+        )
+
+        assert result["verdict"] == "pass"
+        telemetry = wait_for_telemetry_record(
+            telemetry_path,
+            trace_id=trace_id,
+            event_type="code_scan",
+        )
+        assert telemetry["component.name"] == "agent-sec-core"
+        assert telemetry["component.agent_name"] == "cosh"
+        assert telemetry["seccore.category"] == "code_scan"
+        assert telemetry["seccore.request"] == {
+            "code": "echo telemetry",
+            "language": "bash",
+        }
 
 
 # ---------------------------------------------------------------------------
