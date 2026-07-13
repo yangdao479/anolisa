@@ -1,0 +1,7 @@
+tier: 2
+code_scope:
+  - agent-sec-cli/src/agent_sec_cli/telemetry/
+related_designs:
+  - security_events
+  - observability
+consumed_by: []

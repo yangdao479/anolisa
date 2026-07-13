@@ -1,0 +1,16 @@
+tier: 1
+code_scope:
+  - agent-sec-cli/src/agent_sec_cli/code_scanner/
+  - agent-sec-cli/src/agent_sec_cli/security_middleware/backends/code_scan.py
+related_designs:
+  - security_middleware
+  - hermes_plugin
+  - openclaw_plugin
+  - codex_plugin
+  - cosh_extension
+consumed_by:
+  - guide/code_scanner.md
+  - guide/hermes_plugin.md
+  - guide/openclaw_plugin.md
+  - guide/codex_plugin.md
+  - guide/cosh_extension.md

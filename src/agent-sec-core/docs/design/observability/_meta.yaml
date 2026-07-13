@@ -1,0 +1,13 @@
+tier: 1
+code_scope:
+  - agent-sec-cli/src/agent_sec_cli/observability/
+related_designs:
+  - security_events
+  - hermes_plugin
+  - openclaw_plugin
+  - cosh_extension
+consumed_by:
+  - guide/observability.md
+  - guide/hermes_plugin.md
+  - guide/openclaw_plugin.md
+  - guide/cosh_extension.md

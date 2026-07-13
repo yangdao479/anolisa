@@ -1,0 +1,15 @@
+tier: 1
+code_scope:
+  - agent-sec-cli/src/agent_sec_cli/sandbox/
+  - agent-sec-cli/src/agent_sec_cli/security_middleware/backends/sandbox.py
+  - linux-sandbox/
+related_designs:
+  - security_middleware
+  - hermes_plugin
+  - openclaw_plugin
+  - cosh_extension
+consumed_by:
+  - guide/sandbox.md
+  - guide/hermes_plugin.md
+  - guide/openclaw_plugin.md
+  - guide/cosh_extension.md

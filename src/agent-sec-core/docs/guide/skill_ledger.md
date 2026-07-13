@@ -1,3 +1,8 @@
+---
+sources:
+  - design/skill_ledger
+---
+
 # Skill Ledger 用户使用手册
 
 Skill Ledger 是 agent-sec-core 的安全子系统，为 AI Agent Skill 提供文件哈希、扫描结果和密码学签名的版本链，帮助发现 Skill 被篡改或注入恶意内容。默认快速扫描由内置静态扫描器自动执行；可选深度扫描由 Agent 按 `skill-vetter` 协议驱动执行。

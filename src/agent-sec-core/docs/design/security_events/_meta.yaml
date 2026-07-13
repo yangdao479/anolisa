@@ -1,0 +1,8 @@
+tier: 2
+code_scope:
+  - agent-sec-cli/src/agent_sec_cli/security_events/
+related_designs:
+  - security_middleware
+  - observability
+  - telemetry
+consumed_by: []

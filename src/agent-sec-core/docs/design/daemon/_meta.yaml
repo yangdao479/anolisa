@@ -1,0 +1,6 @@
+tier: 2
+code_scope:
+  - agent-sec-cli/src/agent_sec_cli/daemon/
+related_designs:
+  - security_middleware
+consumed_by: []

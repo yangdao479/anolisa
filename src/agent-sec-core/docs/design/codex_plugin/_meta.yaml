@@ -1,0 +1,11 @@
+tier: 1
+code_scope:
+  - codex-plugin/
+related_designs:
+  - code_scanner
+  - prompt_scanner
+  - pii_checker
+  - skill_ledger
+  - security_middleware
+consumed_by:
+  - guide/codex_plugin.md

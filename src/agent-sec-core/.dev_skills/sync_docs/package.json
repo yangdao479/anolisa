@@ -1,0 +1,5 @@
+{
+  "name": "sync_docs",
+  "version": "0.1.0",
+  "description": "基于 def-use 元数据映射，在 design 文档或代码变更后自动同步 guide 和 user_guide.md。正确性优先。"
+}

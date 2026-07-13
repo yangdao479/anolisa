@@ -1,0 +1,13 @@
+tier: 1
+code_scope:
+  - cosh-extension/
+related_designs:
+  - code_scanner
+  - prompt_scanner
+  - pii_checker
+  - sandbox
+  - skill_ledger
+  - observability
+  - security_middleware
+consumed_by:
+  - guide/cosh_extension.md
