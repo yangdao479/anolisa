@@ -7,6 +7,10 @@ from agent_sec_cli.daemon.jobs.prompt_preload import (
     PromptModelPreloadJob,
     prompt_preload_enabled,
 )
+from agent_sec_cli.daemon.jobs.secret_gateway import (
+    SecretGatewayJob,
+    secret_gateway_enabled,
+)
 from agent_sec_cli.daemon.jobs.skill_ledger import (
     SkillLedgerActivationJob,
 )
@@ -24,3 +28,5 @@ def register_default_jobs(
     job_manager.register(SkillLedgerActivationJob())
     if prompt_scan_state is not None and prompt_preload_enabled():
         job_manager.register(PromptModelPreloadJob(prompt_scan_state))
+    if secret_gateway_enabled():
+        job_manager.register(SecretGatewayJob())

@@ -21,6 +21,11 @@ _ACTION_CATEGORY: dict[str, str] = {
     "prompt_scan": "prompt_scan",
     "pii_scan": "pii_scan",
     "skill_ledger": "skill_ledger",
+    # Secret gateway credential injection. Registered here because `cli.py`
+    # derives the allowed --event-type and --category values from this mapping,
+    # so an unregistered category makes the events unqueryable even though they
+    # persist correctly.
+    "secret_gateway_inject": "secret_gateway",
 }
 
 

@@ -281,6 +281,88 @@ include = [
 
 ---
 
+## secret gateway（外发类凭据出站注入）
+
+设计文档：`docs/design/SECRET_GATEWAY_zh.md`；**配置说明（手写配置）：`docs/design/SECRET_GATEWAY_CONFIG_zh.md`**。Agent 只持 fake token，真凭据由 daemon 托管的 mitmdump 子进程在出站一刻注入。
+
+### 0. 部署侧资产的存放位置
+
+本组件有**两条打包出口**：anolisa CLI 的预构建+打包（`packaging/`）与 RPM（`agent-sec-core.spec.in`）。因此：
+
+- **部署脚本与配置模板放 `scripts/secret-gateway/`**，不放 `packaging/` 下——`packaging/` 只服务其中一条出口，而这些资产对两条都适用，也允许运维直接在主机执行。
+- 当前内容：`prepare-mitmproxy.sh`（装 mitmdump 二进制）、`mitmproxy-provenance.toml`（版本+URL+SHA256）、`config.json.example`（手写配置模板）。
+- 两条出口各自如何安装这些文件（raw `package.sh` 与 spec 的 `%files`）**尚未接入**，待完成。
+
+### 0b. 生产代码与测试工具必须分开
+
+
+测试专用工具放 `tests/e2e/secret-gateway/`，**不得放进生产包**：
+
+| 文件 | 为何不能进生产包 |
+|---|---|
+| `bootstrap.py` | 以 root 运行并**整体覆盖** `/etc/agent-sec/gateway/config.json` |
+| `mock_echo_upstream.py` | 是一个**会回显收到的凭据**的 HTTP 服务器 |
+
+单测在 `tests/unit-test/gateway/`（`make test` 会跑）：用桩模拟 mitmproxy 的 `Request.headers` / `Request.query` / `Flow.metadata`，因此**不装 mitmproxy 也能验证注入与脱敏逻辑**。
+
+### 1. mitmproxy 二进制引入
+
+- mitmproxy **不是 pip 依赖**，而是固定版本的上游 PyInstaller 独立二进制（自带解释器）。原因：mitmproxy ≥ 11.1.0 要求 Python ≥ 3.12，而本项目锁定 3.11.6；固定二进制同时让它从 `uv.lock` / `requirements.txt` 中消失，消除 `mitmproxy_rs` 的 cp311 wheel 兼容风险。
+- 版本、URL 与 SHA256 固定在 `scripts/secret-gateway/mitmproxy-provenance.toml`，由 `scripts/secret-gateway/prepare-mitmproxy.sh` 下载校验并安装 `mitmdump`。改版本时**必须同时改这两处**，脚本启动即交叉校验，不一致直接 `die`。
+- **不要**把 mitmproxy 加进 `pyproject.toml`。
+
+### 2. 配置消费方式
+
+- 部署期**手写** `/etc/agent-sec/gateway/config.json`（模板：`scripts/secret-gateway/config.json.example`），网关**启动时一次性消费**，无热加载，改完须重启。
+- **真凭据内联在配置里（`real_token` 字段），因此配置文件就是密钥文件**：必须 root 所有、无任何 group/other 位，启动时强制校验，不满足直接拒绝启动。两层理由：可读 → agent 直接拿到凭据；可写 → agent 能往 `hosts` 加一个自己控制的 host 让网关把真 token 注入并发出去。注意单看 `0600` 不够——属主若是 agent 的 uid，`0600` 对它照样可读。
+- 配置文件不得贴入工单/聊天、不得提交进 git（里面有真凭据）。
+- `tests/e2e/secret-gateway/bootstrap.py` 仅供测试环境；它的 `--real-token` 会让真凭据进 shell history 与 `ps` 输出，不可用于生产。
+
+### 3. 四条硬契约（改代码前必读）
+
+- **注入机制必须保持 provider-agnostic。** `credential_inject_addon.py` 不认识任何具体厂商：发往哪些 host、凭据携带在哪里（`location` = `header` / `query`）、换哪一对值，全部来自配置。**新增一把 API key 是改配置，不得往 addon 里加 per-provider 分支。** 若某厂商需要新的**携带机制**（如凭据在请求体），应扩展 `location` 枚举并保持匹配通用。per-provider 知识只允许存在于 `fake_token.py` 的「凭据形状」推导里。
+- **query 形式凭据必须防日志泄漏。** `location=query` 时注入后的真凭据会进入 URL，而 URL 会被记日志。两层防护不得去掉：addon 写日志/上报审计前对 `path` 与 `error` 做 `_scrub()`；job 拉起 mitmdump 带 `--set flow_detail=0`（否则内置 dumper 会把含真凭据的完整 URL 打进 `proxy.log`）。
+- **`gateway/credential_inject_addon.py` 必须保持 stdlib-only。** 它由 mitmproxy 自带的解释器加载，`import agent_sec_cli` 会直接失败。需要项目逻辑就经 Unix socket 交给 daemon，不要往 addon 里加项目内导入或第三方依赖（`mitmproxy` 包本身除外）。
+- **新增审计 category 必须注册进 `security_middleware/lifecycle.py` 的 `_ACTION_CATEGORY`。** `cli.py` 从该映射派生 `--event-type` / `--category` 的合法取值（`_VALID_EVENT_TYPES` / `_VALID_CATEGORIES`），未注册时事件能落库但 `agent-sec-cli events` 会拒绝查询。secret gateway 已注册 `secret_gateway_inject → secret_gateway`。
+
+### 4. 环境变量
+
+| 变量 | 默认值 | 作用 |
+|------|--------|------|
+| `AGENT_SEC_GATEWAY_ENABLED` | 关闭 | 是否注册 proxy 托管 job。**默认关闭**，不改变既有 daemon 行为 |
+| `AGENT_SEC_GATEWAY_MITMDUMP` | `/opt/agent-sec/bin/mitmdump` | mitmdump 二进制路径 |
+| `AGENT_SEC_GATEWAY_ADDON` | 包内 `gateway/credential_inject_addon.py` | addon 脚本路径 |
+| `AGENT_SEC_GATEWAY_LISTEN_PORT` | `18080` | proxy 监听端口 |
+| `AGENT_SEC_GATEWAY_MODE` | `transparent` | mitmproxy 模式（调试可用 `reverse:...`） |
+| `AGENT_SEC_GATEWAY_CONFDIR` | `/etc/agent-sec/gateway/mitm-ca` | mitmproxy CA 目录 |
+| `AGENT_SEC_GATEWAY_LOG` | `/var/log/agent-sec/gateway.log` | proxy 与 addon 日志 |
+| `AGENT_SEC_GATEWAY_TMPDIR` | `/var/lib/agent-sec/tmp` | 子进程 `TMPDIR`。PyInstaller 单文件启动时自解包，`/tmp` 若 `noexec` 会启动失败 |
+| `AGENT_SEC_GATEWAY_SSL_INSECURE` | 关闭 | 上游跳过证书校验，**仅供自签上游的测试** |
+| `AGENT_SEC_GATEWAY_CONFIG` | `/etc/agent-sec/gateway/config.json` | addon 读的凭据配置（addon 侧变量） |
+
+
+### 5. daemon 方法
+
+| 方法 | 用途 | 备注 |
+|------|------|------|
+| `gateway.status` | 只读状态：pid / alive / 端口 / mode / 重启次数 | **不得返回任何 token 值**；job 未启用时返回 `enabled=false` 而非报错 |
+| `gateway.audit` | 接收 addon 上报，由 daemon 侧写 `security_events` | 字段走 `_AUDIT_FIELDS` 白名单 + 长度截断；addon 与 daemon 是独立发布节奏，不接受白名单外字段 |
+
+注册在 `daemon/secret_gateway_methods.py`，挂进 `daemon/server.py` 的 `create_default_registry()`。
+
+### 6. 凭据与权限约束
+
+- 真凭据内联在 `/etc/agent-sec/gateway/config.json` 的 `real_token` 字段，没有单独的 token 文件。`tests/e2e/secret-gateway/bootstrap.py` 强制 root 运行、以 `0600` 创建（不给中间态留可读窗口）并在写完后校验 `st_uid == 0`。
+- fake token 由 `gateway/fake_token.py` 生成，**形状从真凭据推导**（`generate_fake_token_like`）：同长度、同前缀、同字符类，尾部带 `AGENTSEC` 标记。不维护 per-provider 格式表——推导对任意厂商自动正确。例外：前缀无分隔符的厂商（Google `AIza…`）需传 `keep_prefix`。同构是必要的：Agent 只有在「认为自己持有可用凭据」时才会发起那次请求。
+- 日志与审计中真 token 只能以掩码 + sha256 前缀出现，禁止打印明文。
+
+### 7. 强制出网
+
+- 重定向按 `-m owner --uid-owner <agent uid>` 限定，顺带避免 proxy 自身出站被重定向成环路。
+- **只用低版本内核即有的机制**：iptables nat REDIRECT + owner match（2.6.28+）。**禁止**引入 TPROXY、eBPF、cgroup v2 connect hook 等需要新内核的方案——真实部署环境内核偏老，基线对齐 `component.toml` 的 `min_kernel`。
+
+---
+
 ## hermes-plugin
 
 ### 1. 项目概述

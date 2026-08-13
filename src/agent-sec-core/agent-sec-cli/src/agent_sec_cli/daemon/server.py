@@ -58,6 +58,7 @@ from agent_sec_cli.daemon.runtime import (
     lock_path_for_socket,
     resolve_socket_path,
 )
+from agent_sec_cli.daemon.secret_gateway_methods import register_gateway_methods
 
 LOGGER = logging.getLogger("agent-sec-core.daemon")
 DEFAULT_MAX_CONNECTIONS = 64
@@ -73,6 +74,7 @@ def create_default_registry() -> MethodRegistry:
     register_prompt_scan_methods(registry)
     register_skill_ledger_methods(registry)
     register_security_query_methods(registry)
+    register_gateway_methods(registry)
     return registry
 
 

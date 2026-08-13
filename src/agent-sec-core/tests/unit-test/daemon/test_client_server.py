@@ -966,6 +966,8 @@ def test_health_does_not_import_heavy_modules(tmp_path: Path):
     assert snapshot["prompt_scan"]["status"] == "pending"
     assert registry.methods() == (
         "daemon.health",
+        "gateway.audit",
+        "gateway.status",
         "obs.runs.list",
         "obs.sessions.list",
         "obs.timeline.get",

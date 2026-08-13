@@ -1,0 +1,17 @@
+schema_version = 1
+provider = "mitmproxy/mitmproxy"
+mitmproxy_version = "12.2.3"
+target = "linux-x86_64"
+archive_flavor = "standalone"
+archive_filename = "mitmproxy-12.2.3-linux-x86_64.tar.gz"
+source_url = "https://downloads.mitmproxy.org/12.2.3/mitmproxy-12.2.3-linux-x86_64.tar.gz"
+archive_sha256 = "2e95286b618fa6fd33e5e62a78c2e5112571d85f42ec2bac29b97ee242bdb5c5"
+# Upstream ships three self-contained PyInstaller executables at the archive
+# root: mitmproxy, mitmdump, mitmweb. Only mitmdump is installed -- the secret
+# gateway runs headless.
+extracted_binary = "mitmdump"
+# The bundled interpreter is why this is a pinned binary rather than a pip
+# dependency: mitmproxy >= 11.1.0 requires Python >= 3.12, while agent-sec-cli
+# is pinned to 3.11.6. Shipping the standalone build keeps mitmproxy out of the
+# Python dependency tree entirely.
+bundled_python = true
