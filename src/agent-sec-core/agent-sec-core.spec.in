@@ -84,6 +84,10 @@ Built with maturin as a Rust native Python extension.
 %defattr(0644,root,root,0755)
 %attr(0755,root,root) /usr/bin/agent-sec-cli
 %attr(0755,root,root) /usr/bin/agent-sec-daemon
+%attr(0755,root,root) /opt/agent-sec/bin/mitmdump
+%dir /opt/agent-sec/share/secret-gateway
+/opt/agent-sec/share/secret-gateway/mitmproxy-provenance.toml
+/opt/agent-sec/share/secret-gateway/config.json.example
 %{_userunitdir}/agent-sec-core.service
 /opt/agent-sec/lib/python3.11/site-packages/*
 %dir %{_datadir}/anolisa
@@ -250,6 +254,7 @@ Qoder CLI security hooks providing agent-sec-core protection for Qoder agents.
 %build
 make build-all
 make download-deps
+make download-mitmdump
 make stage-cli
 
 %install

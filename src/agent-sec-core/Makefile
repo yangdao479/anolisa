@@ -216,6 +216,14 @@ download-deps: ## Download ALL Python deps for agent-sec-cli (requires network)
 		--extra-index-url https://download.pytorch.org/whl/cpu \
 		-r agent-sec-cli/requirements.txt
 
+.PHONY: download-mitmdump
+download-mitmdump: $(MITMDUMP_STAGED) ## Fetch pinned mitmdump binary for secret gateway (requires network)
+
+$(MITMDUMP_STAGED): scripts/secret-gateway/prepare-mitmproxy.sh scripts/secret-gateway/mitmproxy-provenance.toml
+	install -d -m 0755 $(BUILD_DIR) $(dir $(MITMDUMP_ARCHIVE))
+	./scripts/secret-gateway/prepare-mitmproxy.sh $(BUILD_DIR) $(MITMDUMP_ARCHIVE)
+	test -x $(MITMDUMP_STAGED) || { echo 'ERROR: mitmdump not staged at $(MITMDUMP_STAGED)' >&2; exit 1; }
+
 .PHONY: stage-cli
 stage-cli: ## Install all wheels to local staging dir (requires uv)
 	install -d -m 0755 $(CLI_STAGED_SITE)
@@ -237,7 +245,7 @@ RAW_PYTHON_RUNTIME ?= $(BUILD_DIR)/python-runtime
 RAW_PYTHON_ARCHIVE ?= $(BUILD_DIR)/downloads/cpython-3.11.6+20231002-x86_64-unknown-linux-gnu-install_only.tar.gz
 
 .PHONY: prepare-raw-python
-prepare-raw-python: build-all ## Stage pinned Python and locked production dependencies for raw packaging
+prepare-raw-python: build-all download-mitmdump ## Stage pinned Python and locked production dependencies for raw packaging
 	rm -rf $(CLI_STAGED_SITE) $(RAW_PYTHON_ENV)
 	./packaging/raw/prepare_python_runtime.sh \
 		"$(abspath $(RAW_PYTHON_RUNTIME))" "$(abspath $(RAW_PYTHON_ARCHIVE))"
@@ -317,6 +325,12 @@ VENV_DIR            ?= $(LIBDIR)/venv
 SYSTEM_SEC_CORE_UV_PYTHON_INSTALL_DIR ?= $(LIBDIR)/uv-python
 WHEEL_DIR           ?= $(LIBDIR)/wheels
 CLI_STAGED_SITE     ?= $(BUILD_DIR)/site-packages
+# Pinned mitmproxy standalone binary staged during build so sec-core ships it.
+# Keeping mitmproxy out of uv.lock/pip is deliberate (release >= 11.1.0 requires
+# Python >= 3.12 while agent-sec-cli is pinned to 3.11.6); the standalone build
+# bundles its own interpreter.
+MITMDUMP_STAGED     ?= $(BUILD_DIR)/mitmdump
+MITMDUMP_ARCHIVE    ?= $(BUILD_DIR)/downloads/mitmproxy-linux-x86_64.tar.gz
 CLI_PRIVATE_SITE    ?= /opt/agent-sec/lib/python3.11/site-packages
 RPM_OPENCLAW_PLUGIN_DIR ?= /opt/agent-sec/openclaw-plugin
 RPM_CODEX_PLUGIN_DIR  ?= /opt/agent-sec/codex-plugin
@@ -358,6 +372,15 @@ install-cli-site: ## RPM: Copy staged site-packages to private dir + wrappers
 	install -d -m 0755 $(DESTDIR)/usr/bin
 	install -p -m 0755 scripts/agent-sec-cli-wrapper.sh $(DESTDIR)/usr/bin/agent-sec-cli
 	install -p -m 0755 scripts/agent-sec-daemon-wrapper.sh $(DESTDIR)/usr/bin/agent-sec-daemon
+	# 3. Install pinned mitmdump binary + provenance for the secret gateway.
+	# Runs alongside daemon (root); agent-sec-cli manifest lists both paths.
+	install -d -m 0755 $(DESTDIR)/opt/agent-sec/bin
+	install -p -m 0755 $(MITMDUMP_STAGED) $(DESTDIR)/opt/agent-sec/bin/mitmdump
+	install -d -m 0755 $(DESTDIR)/opt/agent-sec/share/secret-gateway
+	install -p -m 0644 scripts/secret-gateway/mitmproxy-provenance.toml \
+		$(DESTDIR)/opt/agent-sec/share/secret-gateway/mitmproxy-provenance.toml
+	install -p -m 0644 scripts/secret-gateway/config.json.example \
+		$(DESTDIR)/opt/agent-sec/share/secret-gateway/config.json.example
 
 .PHONY: install-cli-venv
 install-cli-venv: ## Create venv, install deps from uv.lock, install wheel, symlink

@@ -134,12 +134,52 @@ stat -c '%a %U %n' /etc/agent-sec/gateway/config.json   # 期望 600 root
 | `listen_port` | 否 | `18080` | mitmdump 监听端口 |
 | `ports` | 否 | `[80, 443]` | 要劫持的出站端口列表 |
 | `manage_rules` | 否 | `true` | daemon 是否代管 iptables 规则。设 `false` 时只拉 proxy，规则交运维 |
+| `install_system_trust` | 否 | `true` | daemon 是否把网关 CA 装进系统信任库（自动适配 RPM / Deb） |
+| `ca_readable_copy` | 否 | `true` | daemon 是否把 CA 公钥复制到 agent 可读位置 |
 
 **`agent_uid=0` 会被拒绝**：agent 不能是 root，否则它与网关共信任域——能读这份配置、能改 iptables 规则。
 
 **`listen_port` 不能出现在 `ports` 里**：否则网关自己的出站也被重定向回自己（死循环）。
 
-#### mode 的区别
+#### `manage_rules` 为什么需要能关
+
+有些环境的 iptables 由外部系统统一管理（k8s、防火墙管理器），daemon 去插规则可能打架。关掉时 daemon 只拉 proxy，规则由运维手动装。
+
+#### CA 信任注入（`install_system_trust` / `ca_readable_copy`）
+
+网关终结 TLS，就必须让客户端信任它的自签 CA。daemon 启动 gateway job 时自动做两件事。
+
+**1. 装进系统信任库**（`install_system_trust: true`）——自动探测发行版：
+
+| 发行版 | anchor 目录 | 刷新命令 |
+|---|---|---|
+| RPM 系（RHEL / Alibaba Linux） | `/etc/pki/ca-trust/source/anchors/agent-sec-gateway.pem` | `update-ca-trust` |
+| Deb 系（Debian / Ubuntu） | `/usr/local/share/ca-certificates/agent-sec-gateway.crt` | `update-ca-certificates` |
+
+探测按「目录存在 + 刷新命令存在」判定，不读 `/etc/os-release`。**两种都不匹配时跳过并记 warning，daemon 仍正常启动**（比如 Alpine）。
+
+**2. 把 CA 公钥复制到 agent 可读位置**（`ca_readable_copy: true`）：`/opt/agent-sec/gateway/ca-cert.pem`（`0644 root`）。
+
+为什么需要单独一份：mitmproxy 的 confdir（`/etc/agent-sec/gateway/mitm-ca/`）**同时存着 CA 私钥**，必须保持 root-only。把公钥单独拷出来，才能让 agent 用 `SSL_CERT_FILE` 之类的方式引用它，而不用放开 confdir 权限。
+
+**重要边界**：装进系统信任库**只对读系统信任库的客户端生效**（curl / wget / Go net/http / 部分 Rust 库）。自带 CA bundle 的运行时仍需运维显式配置：
+
+| 运行时 | 需要做的 |
+|---|---|
+| Python `requests` / `httpx`（certifi） | `export SSL_CERT_FILE=/opt/agent-sec/gateway/ca-cert.pem` |
+| Node.js | `export NODE_EXTRA_CA_CERTS=/opt/agent-sec/gateway/ca-cert.pem` |
+| Java | 改 keystore 或 `-Djavax.net.ssl.trustStore=...` |
+| 证书 pinning 的 SDK | **无解**，pinning 就是要拒绝网关证书 |
+
+daemon 不会去改这些环境变量——它无法从外部往一个尚未启动、可能以任意方式拉起的 agent 进程里注入 env。
+
+**查看当前状态**：`gateway.status` 返回的 `forwarding` 里有：
+
+- `ca_install_status`：`installed` / `disabled` / `skipped:<原因>` / `failed:<原因>` / `pending`
+- `ca_trust_installed`：anchor 文件是否**真的**在盘上（而非“我以为装了”）
+- `ca_readable_path`：已发布的公钥路径
+
+**daemon 停止时会自动撕掉 anchor 并刷新信任库**。这不是可选的清理：留下一个已无人管的 CA，意味着任何拿到那把私钥的人都能冒充任意域名。
 
 ### 凭据在 query 参数里的写法
 

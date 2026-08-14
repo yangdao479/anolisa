@@ -92,6 +92,17 @@ stage_payload() {
         "$stage/bin/agent-sec-daemon"
     install -p -m 0755 "$ROOT/packaging/raw/assets/bin/agent-sec-python" \
         "$stage/bin/agent-sec-python"
+    # Pinned mitmdump ships with sec-core so the secret gateway daemon job can
+    # find it at a stable path without a separate installer step.
+    [ -x "$BUILD_DIR/mitmdump" ] || die "missing build output $BUILD_DIR/mitmdump (run: make download-mitmdump)"
+    install -p -m 0755 "$BUILD_DIR/mitmdump" "$stage/bin/mitmdump"
+    install -d -m 0755 "$stage/share/secret-gateway"
+    install -p -m 0644 \
+        "$ROOT/scripts/secret-gateway/mitmproxy-provenance.toml" \
+        "$stage/share/secret-gateway/mitmproxy-provenance.toml"
+    install -p -m 0644 \
+        "$ROOT/scripts/secret-gateway/config.json.example" \
+        "$stage/share/secret-gateway/config.json.example"
     install -p -m 0644 \
         "$ROOT/packaging/systemd/agent-sec-core.service.in" \
         "$stage/share/anolisa/sec-core/agent-sec-core.service.in"

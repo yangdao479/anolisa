@@ -287,11 +287,16 @@ include = [
 
 ### 0. 部署侧资产的存放位置
 
-本组件有**两条打包出口**：anolisa CLI 的预构建+打包（`packaging/`）与 RPM（`agent-sec-core.spec.in`）。因此：
+本组件有**两条打包出口**：anolisa CLI 的预构建+打包（`packaging/`）与 RPM（`agent-sec-core.spec.in`）。
 
-- **部署脚本与配置模板放 `scripts/secret-gateway/`**，不放 `packaging/` 下——`packaging/` 只服务其中一条出口，而这些资产对两条都适用，也允许运维直接在主机执行。
-- 当前内容：`prepare-mitmproxy.sh`（装 mitmdump 二进制）、`mitmproxy-provenance.toml`（版本+URL+SHA256）、`config.json.example`（手写配置模板）。
-- 两条出口各自如何安装这些文件（raw `package.sh` 与 spec 的 `%files`）**尚未接入**，待完成。
+**mitmdump 二进制随 sec-core 同包交付**：
+
+- 构建期（`make download-mitmdump`）下载并校验固定版本（URL/SHA256/版本存 `scripts/secret-gateway/mitmproxy-provenance.toml`）。
+- **RPM**：`install-cli-site` 把 `$(BUILD_DIR)/mitmdump` 装到 `/opt/agent-sec/bin/mitmdump`（归 `agent-sec-cli` 子包、`%attr(0755,root,root)`）。
+- **raw**：`packaging/raw/package.sh` 把 mitmdump 装到 `stage/bin/mitmdump`；raw 的 `agent-sec-daemon` wrapper 在它旁边，已会设 `AGENT_SEC_GATEWAY_MITMDUMP=$BINDIR/mitmdump`。
+- 两条出口都会把 `mitmproxy-provenance.toml` 与 `config.json.example` 装到 `share/secret-gateway/`，供运维参考。
+
+`scripts/secret-gateway/prepare-mitmproxy.sh` **仅供构建时 Makefile 调用**，不再需要部署到测试主机后手工跑。
 
 ### 0b. 生产代码与测试工具必须分开
 
@@ -308,7 +313,8 @@ include = [
 ### 1. mitmproxy 二进制引入
 
 - mitmproxy **不是 pip 依赖**，而是固定版本的上游 PyInstaller 独立二进制（自带解释器）。原因：mitmproxy ≥ 11.1.0 要求 Python ≥ 3.12，而本项目锁定 3.11.6；固定二进制同时让它从 `uv.lock` / `requirements.txt` 中消失，消除 `mitmproxy_rs` 的 cp311 wheel 兼容风险。
-- 版本、URL 与 SHA256 固定在 `scripts/secret-gateway/mitmproxy-provenance.toml`，由 `scripts/secret-gateway/prepare-mitmproxy.sh` 下载校验并安装 `mitmdump`。改版本时**必须同时改这两处**，脚本启动即交叉校验，不一致直接 `die`。
+- 版本、URL 与 SHA256 固定在 `scripts/secret-gateway/mitmproxy-provenance.toml`，由 `make download-mitmdump`（内部调 `scripts/secret-gateway/prepare-mitmproxy.sh`）在构建期下载校验。改版本时**必须同时改 provenance 与脚本里的常量**，两处启动即交叉校验，不一致直接 `die`。
+- RPM `%build` 段方会拉 `download-mitmdump`；raw `prepare-raw-python` 同样依赖它。**部署机无需联网**。
 - **不要**把 mitmproxy 加进 `pyproject.toml`。
 
 ### 2. 配置消费方式
@@ -339,13 +345,24 @@ include = [
 | `AGENT_SEC_GATEWAY_TMPDIR` | `/var/lib/agent-sec/tmp` | 子进程 `TMPDIR`。PyInstaller 单文件启动时自解包，`/tmp` 若 `noexec` 会启动失败 |
 | `AGENT_SEC_GATEWAY_SSL_INSECURE` | 关闭 | 上游跳过证书校验，**仅供自签上游的测试** |
 | `AGENT_SEC_GATEWAY_CONFIG` | `/etc/agent-sec/gateway/config.json` | addon 读的凭据配置（addon 侧变量） |
+| `AGENT_SEC_GATEWAY_CA_READABLE_PATH` | `/opt/agent-sec/gateway/ca-cert.pem` | CA 公钥对 agent 可读的发布位置 |
+
+### 4b. CA 信任注入是 daemon 的职责
+
+- 网关终结 TLS，客户端必须信任它的自签 CA。**不要把这一步丢给运维手工做**：`gateway/ca_trust.py` 在 daemon 启动时自动完成，停止时自动移除。
+- **发行版探测按「目录 + 刷新命令存在」判定，不读 `/etc/os-release`**：RPM 系走 `/etc/pki/ca-trust/source/anchors/` + `update-ca-trust`，Deb 系走 `/usr/local/share/ca-certificates/` + `update-ca-certificates`。两者都不匹配时**跳过并记 warning，daemon 仍正常启动**（未知发行版降级而不拒绝）。
+- **anchor 文件名就是 marker**：`agent-sec-gateway.pem`（RPM）/ `agent-sec-gateway.crt`（Deb）。改名需迁移——升级后的 daemon 必须仍能识别旧版本的文件并清理它。Deb 系必须用 `.crt`：`update-ca-certificates` 只收 `.crt`。
+- **CA 生成时机决定了调用位置**：mitmdump 首次启动才生成 CA，所以注入必须在 `_run_once()` 拉起 proxy **之后**（带超时轮询），不能放在 `start()` 里。
+- **公钥另存一份给 agent**：mitmproxy confdir 同时存着私钥，必须保持 root-only；只把公钥拷到 `/opt/agent-sec/gateway/ca-cert.pem`（`0644 root`）。**禁止**为了让 agent 能读而放开 confdir 权限。
+- **不要尝试自动注入环境变量**（`SSL_CERT_FILE` / `NODE_EXTRA_CA_CERTS`）：daemon 无法往尚未启动、可能以任意方式拉起的进程注入 env。也**禁止**去改用户的 systemd unit / dotfile / certifi bundle。这部分由文档指引运维。
+- 失败一律**记录而不抛**：信任库问题不得拖垮数据面（流量仍能跑，只是客户端得自己信任 CA）。状态经 `gateway.status` 的 `ca_install_status` / `ca_trust_installed` 透出。
 
 
 ### 5. daemon 方法
 
 | 方法 | 用途 | 备注 |
 |------|------|------|
-| `gateway.status` | 只读状态：pid / alive / 端口 / mode / 重启次数 | **不得返回任何 token 值**；job 未启用时返回 `enabled=false` 而非报错 |
+| `gateway.status` | 只读状态：pid / alive / 端口 / mode / 重启次数 / CA 注入状态 | **不得返回任何 token 值**；job 未启用时返回 `enabled=false` 而非报错 |
 | `gateway.audit` | 接收 addon 上报，由 daemon 侧写 `security_events` | 字段走 `_AUDIT_FIELDS` 白名单 + 长度截断；addon 与 daemon 是独立发布节奏，不接受白名单外字段 |
 
 注册在 `daemon/secret_gateway_methods.py`，挂进 `daemon/server.py` 的 `create_default_registry()`。

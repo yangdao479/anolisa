@@ -3,6 +3,12 @@
 set -eu
 
 BINDIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
+# Point the secret gateway job at the mitmdump bundled inside the raw payload
+# unless the operator overrode it. The RPM output installs mitmdump at
+# /opt/agent-sec/bin/mitmdump (the daemon's built-in default), so this only
+# matters for the raw layout where the binary lives next to this wrapper.
+: "${AGENT_SEC_GATEWAY_MITMDUMP:=$BINDIR/mitmdump}"
+export AGENT_SEC_GATEWAY_MITMDUMP
 exec "$BINDIR/agent-sec-python" \
     -c 'import sys; sys.argv[0] = "agent-sec-daemon"; from agent_sec_cli.daemon.server import main; sys.exit(main())' \
     "$@"

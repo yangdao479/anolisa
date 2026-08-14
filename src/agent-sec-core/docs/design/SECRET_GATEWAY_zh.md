@@ -1,5 +1,7 @@
 # Secret Gateway：外发类凭据的出站注入
 
+> 相关文档：配置手册 `SECRET_GATEWAY_CONFIG_zh.md`；引入前后的部署差异 `SECRET_GATEWAY_USAGE_zh.md`。
+
 ## 1. 背景与目标
 
 Agent 要调用外部服务就必须持有凭据，而 Agent 是不可信实体——模型输出不确定，且持续暴露在直接与间接提示注入之下。只要凭据落在 Agent 可读范围内，它就可能随上下文发给模型提供商、被 Agent 滥用，或在注入操纵下被直接发给攻击者。
@@ -41,7 +43,9 @@ Agent 要调用外部服务就必须持有凭据，而 Agent 是不可信实体�
 
 **mitmproxy 以固定版本的独立二进制引入，不作为 pip 依赖**：mitmproxy ≥ 11.1.0 要求 Python ≥ 3.12，而 agent-sec-cli 锁定 3.11.6；上游 PyInstaller standalone 构建自带解释器，因此固定二进制既解开了版本冲突，也让 mitmproxy 从 `uv.lock` / `requirements.txt` 中彻底消失（连带消掉 `mitmproxy_rs` 的 cp311 wheel 兼容风险）。
 
-版本、URL 与 SHA256 固定在 `scripts/secret-gateway/mitmproxy-provenance.toml`，由 `scripts/secret-gateway/prepare-mitmproxy.sh` 下载、校验并安装 `mitmdump`（两处常量在脚本启动时互相交叉校验，不一致直接 `die`）。它放在 `scripts/` 而不在 `packaging/` 下，是因为它属于**部署侧**行为：本组件有两条打包出口（anolisa CLI 预构建打包、RPM），而这个脚本对两者都适用，也允许运维在主机上直接执行，因此不归属于任何单一出口。
+版本、URL 与 SHA256 固定在 `scripts/secret-gateway/mitmproxy-provenance.toml`，**由 sec-core 的构建流程在打包时下载、校验并随 sec-core 同包交付**（RPM `%build` 与 raw `prepare-raw-python` 都依赖 `make download-mitmdump`）。RPM 安装后 `mitmdump` 位于 `/opt/agent-sec/bin/mitmdump`（归 `agent-sec-cli` 子包）；raw 安装后位于 sec-core 组件目录的 `bin/mitmdump`。
+
+部署机无需联网、无需手工跑安装脚本。`scripts/secret-gateway/prepare-mitmproxy.sh` 仅供构建时 Makefile 调用。
 
 由此产生一条必须遵守的连带约束：**addon 由 mitmproxy 自带解释器加载，不能 import `agent_sec_cli`**，只能用 stdlib + mitmproxy API。需要项目逻辑的部分经 Unix socket 交给 daemon。这正好是想要的形态——addon 极薄，数据面将来可替换成 Rust/Go 而策略面原样复用。
 
@@ -53,7 +57,7 @@ Agent 要调用外部服务就必须持有凭据，而 Agent 是不可信实体�
 | proxy 托管 job | `agent_sec_cli/daemon/jobs/secret_gateway.py` | 拉起并监管 mitmdump 子进程（退避重启、随 daemon 优雅退出） |
 | daemon 方法 | `agent_sec_cli/daemon/secret_gateway_methods.py` | `gateway.status` 只读状态；`gateway.audit` 接收 addon 上报并落审计 |
 | fake token | `agent_sec_cli/gateway/fake_token.py` | 从真凭据推导同构的占位凭据 |
-| 二进制安装 | `scripts/secret-gateway/prepare-mitmproxy.sh` | 下载、校验 SHA256、安装 `mitmdump` |
+| 二进制同包 | `/opt/agent-sec/bin/mitmdump`（RPM）/ `bin/mitmdump`（raw） | sec-core 构建时随包交付，部署机无需单独安装 |
 | 配置模板 | `scripts/secret-gateway/config.json.example` | 供运维抄一份手写 |
 
 以下两个是**测试专用**，住在 `tests/e2e/secret-gateway/`、不随包部署（一个会覆盖 `/etc` 配置，一个会回显凭据，都不应出现在生产主机上）：
@@ -164,7 +168,7 @@ daemon 被 kill -9 时 iptables 规则会残留：流量被重定向到一个已
 
 ## 10. 边界与开放问题
 
-- **CA 信任分发**：TLS 终结要求 Agent 信任 proxy 的自签 CA，这张 CA 的信任范围限定与生命周期管理需专门设计。
+- **CA 信任分发**（部分已完成）：daemon 启动 gateway job 时自动把 CA 装进系统信任库（探测 RPM / Deb 布局）并把公钥发布到 `/opt/agent-sec/gateway/ca-cert.pem`，停止时自动移除——详见 `SECRET_GATEWAY_CONFIG_zh.md` 的「CA 信任注入」。**尚未解决**：自带 CA bundle 的运行时（Python certifi、Node、Java keystore）仍需运维显式设 env 或改 keystore，daemon 无法往未启动进程注入环境变量；CA 轮换与有效期管理也尚未设计。
 - **证书 pinning 客户端**：做 pinning 或强制校验证书链的 SDK 会拒绝网关签发的证书，需评估影响面与兼容策略。
 - **非 HTTP 协议**：不走 HTTP 的协议不适用「解析请求、替换头」模型。
 - **响应侧脱敏**：本期无入站回替，若上游在响应体或错误信息里回显凭据，真 token 会绕一圈回到上下文。

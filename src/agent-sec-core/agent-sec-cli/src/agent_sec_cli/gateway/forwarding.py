@@ -52,6 +52,8 @@ class ForwardingPolicy:
     listen_port: int = DEFAULT_LISTEN_PORT
     ports: tuple[int, ...] = DEFAULT_PORTS
     manage_rules: bool = True
+    install_system_trust: bool = True
+    ca_readable_copy: bool = True
     source: str = field(default="", compare=False)
 
     def describe(self) -> str:
@@ -61,7 +63,9 @@ class ForwardingPolicy:
         return (
             f"mode={self.mode} agent={who}({self.agent_uid}) "
             f"redirect={ports}->{self.listen_port} "
-            f"manage_rules={self.manage_rules}"
+            f"manage_rules={self.manage_rules} "
+            f"install_system_trust={self.install_system_trust} "
+            f"ca_readable_copy={self.ca_readable_copy}"
         )
 
 
@@ -183,6 +187,18 @@ def load_forwarding_policy(path: str | None = None) -> ForwardingPolicy:
     if not isinstance(manage_rules, bool):
         raise ForwardingConfigError('"forwarding.manage_rules" must be true or false')
 
+    install_system_trust = section.get("install_system_trust", True)
+    if not isinstance(install_system_trust, bool):
+        raise ForwardingConfigError(
+            '"forwarding.install_system_trust" must be true or false'
+        )
+
+    ca_readable_copy = section.get("ca_readable_copy", True)
+    if not isinstance(ca_readable_copy, bool):
+        raise ForwardingConfigError(
+            '"forwarding.ca_readable_copy" must be true or false'
+        )
+
     return ForwardingPolicy(
         mode=mode,
         agent_uid=agent_uid,
@@ -190,6 +206,8 @@ def load_forwarding_policy(path: str | None = None) -> ForwardingPolicy:
         listen_port=listen_port,
         ports=ports,
         manage_rules=manage_rules,
+        install_system_trust=install_system_trust,
+        ca_readable_copy=ca_readable_copy,
         source=config_path,
     )
 

@@ -8,7 +8,6 @@ rule shape, marker handling and the reconcile/teardown bookkeeping.
 
 import json
 import os
-import stat
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -69,6 +68,27 @@ def test_uid_mode_is_the_default(tmp_path: Path) -> None:
     assert policy.ports == (80, 443)
     assert policy.listen_port == 18080
     assert policy.manage_rules is True
+    # CA trust injection is on by default: the operator writing only the config
+    # file should get clients that trust the gateway without extra steps.
+    assert policy.install_system_trust is True
+    assert policy.ca_readable_copy is True
+
+
+@_ROOT_OWNED
+def test_ca_trust_can_be_disabled(tmp_path: Path) -> None:
+    """Hosts whose trust store is managed externally must be able to opt out."""
+    path = _write_config(
+        tmp_path,
+        {
+            "agent_uid": 1001,
+            "install_system_trust": False,
+            "ca_readable_copy": False,
+        },
+    )
+    policy = load_forwarding_policy(path)
+
+    assert policy.install_system_trust is False
+    assert policy.ca_readable_copy is False
 
 
 def test_group_readable_config_is_rejected(tmp_path: Path) -> None:
@@ -111,6 +131,8 @@ def test_missing_config_names_the_template(tmp_path: Path) -> None:
         ({"agent_uid": 1001, "ports": [0]}, "between 1 and 65535"),
         ({"agent_uid": 1001, "listen_port": 70000}, "between 1 and 65535"),
         ({"agent_uid": 1001, "manage_rules": "yes"}, "true or false"),
+        ({"agent_uid": 1001, "install_system_trust": "yes"}, "true or false"),
+        ({"agent_uid": 1001, "ca_readable_copy": 1}, "true or false"),
         ({"agent_uid": 1001, "agent_user": None, "ports": [443, 18080]}, "onto itself"),
     ],
 )

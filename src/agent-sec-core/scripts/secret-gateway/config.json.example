@@ -8,7 +8,9 @@
     "agent_user": "REPLACE_WITH_THE_AGENT_USER",
     "listen_port": 18080,
     "ports": [80, 443],
-    "manage_rules": true
+    "manage_rules": true,
+    "install_system_trust": true,
+    "ca_readable_copy": true
   },
   "credentials": [
     {

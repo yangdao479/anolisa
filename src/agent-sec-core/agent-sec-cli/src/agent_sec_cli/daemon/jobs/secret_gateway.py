@@ -21,6 +21,11 @@ from agent_sec_cli.daemon.jobs.base import (
     utc_now,
 )
 from agent_sec_cli.daemon.logging import log_daemon_event
+from agent_sec_cli.gateway.ca_trust import (
+    CaTrustError,
+    SystemTrustStore,
+    publish_readable_copy,
+)
 from agent_sec_cli.gateway.forwarding import (
     ForwardingConfigError,
     ForwardingPolicy,
@@ -45,6 +50,17 @@ DEFAULT_LOG_PATH = "/var/log/agent-sec/gateway.log"
 TMPDIR_ENV = "AGENT_SEC_GATEWAY_TMPDIR"
 DEFAULT_TMPDIR = "/var/lib/agent-sec/tmp"
 SSL_INSECURE_ENV = "AGENT_SEC_GATEWAY_SSL_INSECURE"
+
+#: mitmdump writes its generated CA here inside the confdir. Only the public
+#: certificate; the private key lives in a sibling file we never expose.
+MITM_CA_CERT_BASENAME = "mitmproxy-ca-cert.pem"
+#: Agent-readable copy of the CA public certificate. The confdir itself stays
+#: root-only because it also holds the private key.
+DEFAULT_CA_READABLE_PATH = "/opt/agent-sec/gateway/ca-cert.pem"
+CA_READABLE_PATH_ENV = "AGENT_SEC_GATEWAY_CA_READABLE_PATH"
+#: mitmdump generates the CA a moment after start; poll rather than assume.
+CA_WAIT_TIMEOUT_SECONDS = 15.0
+CA_WAIT_INTERVAL_SECONDS = 0.25
 
 RESTART_BACKOFF_SECONDS = (1.0, 2.0, 5.0, 10.0, 30.0)
 TERMINATE_TIMEOUT_SECONDS = 5.0
@@ -100,6 +116,9 @@ class SecretGatewayJob(BackgroundJob):
         self._policy: ForwardingPolicy | None = None
         self._rules: NatRuleManager | None = None
         self._forwarding_error: str | None = None
+        self._trust_store: SystemTrustStore | None = None
+        self._ca_status: str = "pending"
+        self._ca_published_path: str | None = None
 
         self.mitmdump_path = os.environ.get(MITMDUMP_PATH_ENV) or DEFAULT_MITMDUMP_PATH
         self.addon_path = os.environ.get(ADDON_PATH_ENV) or _default_addon_path()
@@ -108,6 +127,9 @@ class SecretGatewayJob(BackgroundJob):
         self.confdir = os.environ.get(CONFDIR_ENV) or DEFAULT_CONFDIR
         self.log_path = os.environ.get(LOG_PATH_ENV) or DEFAULT_LOG_PATH
         self.tmpdir = os.environ.get(TMPDIR_ENV) or DEFAULT_TMPDIR
+        self.ca_readable_path = (
+            os.environ.get(CA_READABLE_PATH_ENV) or DEFAULT_CA_READABLE_PATH
+        )
 
     @staticmethod
     def _resolve_port() -> int:
@@ -171,6 +193,7 @@ class SecretGatewayJob(BackgroundJob):
         self._task = None
         self._state = "stopped"
 
+        self._deprovision_ca_trust()
         self._deprovision_forwarding()
 
     # -- forwarding provisioning -------------------------------------------
@@ -254,6 +277,151 @@ class SecretGatewayJob(BackgroundJob):
                 data={"removed": removed},
             )
 
+    # -- CA trust provisioning ---------------------------------------------
+
+    def _mitm_ca_path(self) -> Path:
+        """Return the CA public certificate mitmdump generates in its confdir."""
+        return Path(self.confdir) / MITM_CA_CERT_BASENAME
+
+    async def _await_ca_file(self) -> Path | None:
+        """Wait for mitmdump to generate its CA, up to a bounded timeout.
+
+        mitmdump creates the CA on first start, so this cannot run during
+        ``start()``: the file does not exist yet. Polling with a ceiling keeps a
+        proxy that fails to initialise from blocking the job forever.
+        """
+        ca_path = self._mitm_ca_path()
+        deadline = asyncio.get_running_loop().time() + CA_WAIT_TIMEOUT_SECONDS
+        while True:
+            if ca_path.is_file():
+                return ca_path
+            if asyncio.get_running_loop().time() >= deadline:
+                return None
+            await asyncio.sleep(CA_WAIT_INTERVAL_SECONDS)
+
+    async def _provision_ca_trust(self) -> None:
+        """Publish the CA and install it into the system trust store.
+
+        Runs after the proxy is up because mitmdump owns CA generation. Every
+        failure is recorded and surfaced through ``gateway.status`` rather than
+        raised: a trust-store problem must not take the data plane down, since
+        traffic still flows (clients just have to trust the CA themselves).
+        """
+        policy = self._policy
+        if policy is None:
+            return
+
+        if not policy.ca_readable_copy and not policy.install_system_trust:
+            self._ca_status = "disabled"
+            return
+
+        # _run_once runs again on every proxy restart. Redoing the work is
+        # harmless but re-running update-ca-trust on each iteration of a crash
+        # loop is not free, so skip when the anchor is verifiably still there.
+        if (
+            self._ca_status == "installed"
+            and self._trust_store is not None
+            and self._trust_store.is_installed()
+        ):
+            return
+
+        ca_path = await self._await_ca_file()
+        if ca_path is None:
+            self._ca_status = f"failed:CA not generated at {self._mitm_ca_path()}"
+            logger.error(
+                "secret gateway CA did not appear at %s within %.0fs; "
+                "clients will not trust the gateway",
+                self._mitm_ca_path(),
+                CA_WAIT_TIMEOUT_SECONDS,
+            )
+            return
+
+        if policy.ca_readable_copy:
+            try:
+                publish_readable_copy(ca_path, Path(self.ca_readable_path))
+                self._ca_published_path = self.ca_readable_path
+            except CaTrustError as exc:
+                self._ca_published_path = None
+                logger.error("secret gateway CA publish failed: %s", exc)
+
+        if not policy.install_system_trust:
+            self._ca_status = "disabled"
+            logger.info(
+                "secret gateway system trust install disabled "
+                "(forwarding.install_system_trust=false)"
+            )
+            return
+
+        store = SystemTrustStore()
+        if not store.is_available():
+            self._trust_store = None
+            self._ca_status = "skipped:no recognised system trust store"
+            logger.warning(
+                "secret gateway found no system trust store to install the CA "
+                "into; clients must trust %s themselves",
+                self._ca_published_path or ca_path,
+            )
+            return
+
+        try:
+            outcome = store.install(ca_path)
+        except CaTrustError as exc:
+            self._trust_store = None
+            self._ca_status = f"failed:{exc}"
+            logger.error("secret gateway CA trust install failed: %s", exc)
+            return
+
+        self._trust_store = store
+        self._ca_status = "installed"
+        log_daemon_event(
+            event="secret_gateway_ca_installed",
+            message=(
+                f"secret gateway CA installed into system trust store: "
+                f"kind={outcome.kind.value} anchor={outcome.anchor_path}"
+            ),
+            data={
+                "kind": outcome.kind.value,
+                "anchor_path": str(outcome.anchor_path),
+                "readable_path": self._ca_published_path,
+            },
+        )
+
+    def _deprovision_ca_trust(self) -> None:
+        """Remove the CA from the system trust store and drop the public copy.
+
+        Leaving the CA behind would let anything holding the (now orphaned)
+        private key impersonate every host the agent talks to, so removal is not
+        optional cleanup.
+        """
+        store = self._trust_store
+        if store is not None:
+            try:
+                if store.uninstall():
+                    log_daemon_event(
+                        event="secret_gateway_ca_removed",
+                        message="secret gateway CA removed from system trust store",
+                        data={"anchor_path": str(store.anchor_path())},
+                    )
+            except CaTrustError as exc:
+                logger.error("secret gateway CA trust removal failed: %s", exc)
+            finally:
+                self._trust_store = None
+
+        if self._ca_published_path is not None:
+            try:
+                Path(self._ca_published_path).unlink()
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                logger.warning(
+                    "could not remove published CA %s: %s",
+                    self._ca_published_path,
+                    exc,
+                )
+            self._ca_published_path = None
+
+        self._ca_status = "pending"
+
     def status(self) -> JobStatus:
         """Return the JobManager-facing status."""
         return JobStatus(
@@ -285,6 +453,8 @@ class SecretGatewayJob(BackgroundJob):
                     "agent_user": policy.agent_user,
                     "redirect_ports": list(policy.ports),
                     "manage_rules": policy.manage_rules,
+                    "install_system_trust": policy.install_system_trust,
+                    "ca_readable_copy": policy.ca_readable_copy,
                 }
             )
         if self._forwarding_error:
@@ -294,6 +464,13 @@ class SecretGatewayJob(BackgroundJob):
         forwarding["rules_installed"] = (
             self._rules.is_fully_installed() if self._rules is not None else False
         )
+        # Same principle for the trust store: report the anchor file that is
+        # actually on disk, not merely that we tried to install it.
+        forwarding["ca_install_status"] = self._ca_status
+        forwarding["ca_trust_installed"] = (
+            self._trust_store.is_installed() if self._trust_store is not None else False
+        )
+        forwarding["ca_readable_path"] = self._ca_published_path
 
         return {
             "state": self._state,
@@ -419,7 +596,9 @@ class SecretGatewayJob(BackgroundJob):
         if not os.path.exists(self.mitmdump_path):
             raise FileNotFoundError(
                 f"mitmdump not found at {self.mitmdump_path}; "
-                "run scripts/secret-gateway/prepare-mitmproxy.sh"
+                "reinstall sec-core (RPM: /opt/agent-sec/bin/mitmdump ships "
+                "with agent-sec-cli; raw: bin/mitmdump next to the wrapper) "
+                "or override AGENT_SEC_GATEWAY_MITMDUMP"
             )
 
         os.makedirs(self.tmpdir, exist_ok=True)
@@ -454,6 +633,11 @@ class SecretGatewayJob(BackgroundJob):
             },
             trace_context=trace_context,
         )
+
+        # mitmdump generates its CA on first start, so trust provisioning has to
+        # happen here rather than in start(). Awaiting it before process.wait()
+        # is safe: it has its own bounded timeout.
+        await self._provision_ca_trust()
 
         returncode = await process.wait()
         self._process = None
