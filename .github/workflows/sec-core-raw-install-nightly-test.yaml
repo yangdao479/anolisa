@@ -36,7 +36,9 @@ jobs:
         if: matrix.container == ''
         run: |
           sudo apt-get update
-          sudo apt-get install -y curl git make tar jq python3-pip
+          # GitHub-hosted runners ship every sec-core runtime dependency except
+          # bubblewrap, which the deps preflight probes with `bwrap --version`.
+          sudo apt-get install -y curl git make tar jq python3-pip bubblewrap
 
       - name: Configure mirrors and install base tools (Alinux4)
         if: matrix.container != ''
