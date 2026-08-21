@@ -38,7 +38,12 @@ jobs:
           sudo apt-get update
           # GitHub-hosted runners ship every sec-core runtime dependency except
           # bubblewrap, which the deps preflight probes with `bwrap --version`.
-          sudo apt-get install -y curl git make tar jq python3-pip bubblewrap
+          #
+          # dnf is for the client, not for sec-core: the image ships `rpm` and
+          # therefore carries an rpmdb, so `anolisa install` cannot degrade its
+          # system-RPM presence check the way it does on a plain deb host and
+          # refuses the raw install while rpm/dnf tooling is incomplete.
+          sudo apt-get install -y curl git make tar jq python3-pip bubblewrap dnf
 
       - name: Configure mirrors and install base tools (Alinux4)
         if: matrix.container != ''
