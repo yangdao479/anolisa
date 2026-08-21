@@ -169,6 +169,14 @@ if cmp -s "$STALE_ARTIFACT" "$LOCAL_REPO/v1/$ARTIFACT"; then
     echo "ERROR: ARTIFACT environment override selected a stale archive" >&2
     exit 1
 fi
+# `--repo` makes this repository the identity authority for the invocation,
+# so install refuses the component unless the generation-2 identity index is
+# published next to the distribution index.
+test -f "$LOCAL_REPO/v1/components-v2.toml"
+grep -Fqx 'schema_version = 2' "$LOCAL_REPO/v1/components-v2.toml"
+grep -Fqx 'name = "sec-core"' "$LOCAL_REPO/v1/components-v2.toml"
+grep -Fqx 'targets = [{ os = "linux", arch = "x86_64" }]' \
+    "$LOCAL_REPO/v1/components-v2.toml"
 
 printf 'stale repository entry\n' > "$LOCAL_REPO/v1/stale"
 OUTPUT_DIR="$OUT_ONE" \
