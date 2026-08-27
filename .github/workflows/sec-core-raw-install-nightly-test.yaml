@@ -4,9 +4,7 @@ on:
   schedule:
     # UTC 16:00 = Beijing 00:00
     - cron: "0 16 * * *"
-  pull_request:            # 提交到 main 的 PR 触发
-    branches:
-      - main
+  pull_request:            # 任意目标分支的 PR 均触发
   workflow_dispatch:       # 手动触发，便于改动本 workflow 后立即验证
 
 permissions:
