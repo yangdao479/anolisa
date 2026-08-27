@@ -1,5 +1,64 @@
 # Changelog
 
+## 0.11.1
+
+**Prompt Scanner**
+
+- Restricted the invisible-character injection rule so emoji ZWJ sequences, Persian ZWNJ, and leading BOM no longer score as critical injections. (#2900)
+- Refused non-loopback model service base URLs derived from the environment in both the Rust and Python model service paths. (#2893)
+- Reported `daemon.health` prompt_scan state as untracked instead of unconditionally ready now that scanning runs in-process. (#2892)
+- Dropped the dead prompt model preload environment flag and the obsolete scan-prompt protocol document. (#2886)
+
+**Skill Ledger Runtime**
+
+- Skipped host-backed read-only system Skills in batch `scan --all` and default `init` instead of failing them. (#2906)
+- Rejected the placeholder `set-policy` and `rotate-keys` commands so they no longer report false success. (#2876)
+
+**Asset Verification**
+
+- Reported explicit `CHECKED` / `PASSED` / `FAILED` counters and a distinct zero-candidate outcome for `agent-sec-cli verify`. (#2875)
+
+**Security Events & CLI**
+
+- Enforced owner-only permissions on files created by the CLI. (#2873)
+
+**Documentation**
+
+- Documented the five hidden `agent-sec-cli` integration commands and their contract caveats. (#2887)
+- Documented the rule-only L1 detection boundary and how to read `pass` together with degraded fields. (#2895)
+
+## 0.11.0
+
+**Prompt Scanner**
+
+- Rewrote prompt scanner core in Rust for native performance. (#2409)
+- Added ATR (Agent Threat Rules) rule packs and reduced compile time. (#2531)
+- Added Warden-Gen L2 backend option for prompt scanning. (#2699)
+- Routed Rust native extension logs to Python logging framework. (#2640)
+- Corrected warmup documentation to describe model availability checks and silenced per-invocation scan mode logging in the Codex, cosh, and Qwen Code prompt scanner hooks. (#2745)
+
+**Hermes Hook Integration**
+
+- Dropped Hermes synthetic warning injection; PII and Skill Ledger policies now use native observe/block boundaries. (#2712)
+
+**PII Checker**
+
+- Refined PII detection to reduce JWT and Email false positives and aligned user notices across all host adapters. (#2443)
+
+**Skill Ledger Runtime**
+
+- Added SkillFS HMAC peer authentication for cross-container Skill Ledger deployments. (#2493)
+
+**Security Events & CLI**
+
+- Added `agent-sec-cli capabilities` subcommand for environment-based hook configuration inspection. (#2356)
+- Set observability hook timeout to 10s and CLI default timeout to 5s. (#2346)
+- Added security observability skill for structured event and session report queries. (#2245)
+
+**Documentation**
+
+- Corrected and restructured user docs to align with 0.10.x shipped behavior. (#2456)
+
 ## 0.10.1
 
 **OpenClaw & cosh Hook Integrations**
