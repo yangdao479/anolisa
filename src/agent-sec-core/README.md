@@ -9,6 +9,12 @@ security event store. Everything runs locally with no Token cost. Applicable to
 Agent OS platforms such as [ANOLISA](../../README.md) and to the six Agent hosts
 listed below.
 
+[![AARM Aligned](https://img.shields.io/badge/AARM-Aligned-blue.svg)](https://aarm.dev/builders/agentseccore-anolisa)
+
+**AgentSecCore (ANOLISA)** is listed in the [AARM Builder Registry](https://aarm.dev/builders/agentseccore-anolisa) with **Aligned** status.
+
+AgentSecCore contributes controls to the [ANOLISA OWASP Agentic Top 10 mapping](../../docs/user-guide/en/agent-security/owasp-agentic-top10.md).
+
 ## Background
 
 As AI Agents gradually gain OS-level execution capabilities (file I/O, network access, process management, etc.), traditional application security boundaries no longer apply. Agent Sec Core builds a **defense-in-depth** system at the OS layer, ensuring Agents run in a controlled, auditable, least-privilege environment.
@@ -102,7 +108,7 @@ agent-sec-core/
 ├── qwen-code-extension/       # Qwen Code hooks
 ├── qoder-plugin/              # Qoder CLI hooks
 ├── codex-plugin/              # Codex hooks
-├── skills/                    # Security skills: code-scanner, prompt-scanner, skill-ledger
+├── skills/                    # Bundled security scanning and audit skills
 ├── tools/                     # sign-skill.sh — PGP skill signing utility
 ├── packaging/                 # raw package build + systemd unit template
 ├── scripts/                   # CLI/daemon wrappers and CI helpers
@@ -338,6 +344,9 @@ Full daemon endpoint, CLI, and host-hook status:
 ## PII Checker
 
 Detects personal data and credentials, and can emit redacted text.
+
+The bundled [pii-checker Skill](skills/pii-checker/SKILL.md) lets an Agent scan
+specified text or files and generate redacted text with the V1 CLI.
 
 ```bash
 agent-sec-cli scan-pii --text "contact alice@example.com" --source manual

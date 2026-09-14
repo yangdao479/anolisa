@@ -26,6 +26,7 @@ members = [
     "crates/policy/asc-pap",
     "crates/policy/asc-pap-repository-memory",
     "crates/policy/asc-pcp",
+    "crates/policy/asc-policy-runtime",
     "crates/policy/asc-policy-engine",
     "crates/policy/asc-policy-target-contracts",
     "crates/policy/asc-policy-types",
@@ -43,6 +44,7 @@ publish = false
 [workspace.dependencies]
 asc-action-runtime = { path = "crates/action/asc-action-runtime" }
 asc-action-types = { path = "crates/action/asc-action-types" }
+asc-policy-runtime = { path = "crates/policy/asc-policy-runtime" }
 asc-agentsight-client = { path = "crates/integrations/asc-agentsight-client" }
 asc-capability-code-scan = { path = "crates/action/capabilities/asc-capability-code-scan" }
 asc-daemon = { path = "apps/asc-daemon" }
@@ -80,6 +82,7 @@ sha2 = "0.10"
 tempfile = "3"
 thiserror = "2"
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+unicode-properties = "0.1"
 ureq = { version = "2.12", default-features = false, features = ["tls"] }
 url = "2"
 uuid = { version = "1", features = ["v4"] }

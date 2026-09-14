@@ -7,6 +7,12 @@
 存储。全部本地运行，无 Token 消耗。适用于 [ANOLISA](../../README_zh.md) 等 AI Agent
 运行平台，以及下文列出的六个 Agent 宿主。
 
+[![AARM Aligned](https://img.shields.io/badge/AARM-Aligned-blue.svg)](https://aarm.dev/builders/agentseccore-anolisa)
+
+**AgentSecCore (ANOLISA)** 已登记于 [AARM Builder Registry](https://aarm.dev/builders/agentseccore-anolisa)，当前状态为 **Aligned**。
+
+AgentSecCore 的相关安全控制已纳入 [ANOLISA OWASP Agentic Top 10 控制映射](../../docs/user-guide/zh/agent-security/owasp-agentic-top10.md)。
+
 ## 背景
 
 随着 AI Agent 逐步获得操作系统级别的执行能力（文件读写、网络访问、进程管理等），传统应用安全边界已不再适用。Agent Sec Core 从 **OS 层面** 为 Agent 构建纵深防御体系，确保 Agent 在受控、可审计、最小权限的环境中运行。
@@ -98,7 +104,7 @@ agent-sec-core/
 ├── qwen-code-extension/       # Qwen Code hooks
 ├── qoder-plugin/              # Qoder CLI hooks
 ├── codex-plugin/              # Codex hooks
-├── skills/                    # 安全 skill：code-scanner、prompt-scanner、skill-ledger
+├── skills/                    # 随包提供的安全扫描与审计 Skill
 ├── tools/                     # sign-skill.sh — PGP 技能签名工具
 ├── packaging/                 # raw 包构建 + systemd unit 模板
 ├── scripts/                   # CLI/daemon wrapper 与 CI 辅助脚本
@@ -319,6 +325,9 @@ code-scan telemetry，因此依赖它们的 hook 仍处于延期状态。
 ## PII Checker
 
 检测个人数据与凭证，可输出脱敏文本。
+
+随包提供的 [pii-checker Skill](skills/pii-checker/SKILL.md) 支持 Agent 通过 V1 CLI
+检查指定文本或文件，并生成脱敏文本。
 
 ```bash
 agent-sec-cli scan-pii --text "contact alice@example.com" --source manual

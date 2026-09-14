@@ -13,6 +13,7 @@ use asc_event_sink::ConfiguredSecurityEventSinks;
 use asc_pap::PapService;
 use asc_pap_repository_memory::ProcessLocalPapRepository;
 use asc_policy_engine::PolicyTemplateCompiler;
+use asc_policy_runtime::reconciliation::ReconciliationRuntime;
 use asc_security_events::config::daemon_security_event_paths;
 
 use crate::sinks::EventSinkAdapter;
@@ -58,11 +59,6 @@ async fn run() -> (ExitCode, Option<Arc<ConfiguredSecurityEventSinks>>) {
         }
     };
     let repository = Arc::new(ProcessLocalPapRepository::default());
-    let pap = PapService::new(repository, Arc::new(PolicyTemplateCompiler));
-    let principal_policy = Arc::new(RootManagedPrincipalPolicy::with_admin_uids(
-        cli.policy_admin_uids,
-    ));
-    let policy_for_handler: Arc<dyn PrincipalPolicy> = principal_policy.clone();
     let (finalizer, event_sinks) = match event_finalizer() {
         Ok(sinks) => sinks,
         Err(error) => {
@@ -70,6 +66,27 @@ async fn run() -> (ExitCode, Option<Arc<ConfiguredSecurityEventSinks>>) {
             return (ExitCode::FAILURE, None);
         }
     };
+    let policy_runtime = match asc_daemon::start_policy_reconciliation(repository.clone()) {
+        Ok(runtime) => Some(runtime),
+        Err(error) => {
+            eprintln!("asc-daemon: reconciliation unavailable; Binding mutations disabled");
+            report_error(&error);
+            None
+        }
+    };
+    let enqueuer: Arc<dyn asc_pap::BindingReconcileEnqueuer> = policy_runtime.as_ref().map_or_else(
+        || {
+            Arc::new(asc_daemon::UnavailableReconciliation)
+                as Arc<dyn asc_pap::BindingReconcileEnqueuer>
+        },
+        |runtime| runtime.enqueuer(),
+    );
+    let pap = PapService::new(repository, Arc::new(PolicyTemplateCompiler))
+        .with_reconcile_enqueuer(enqueuer);
+    let principal_policy = Arc::new(RootManagedPrincipalPolicy::with_admin_uids(
+        cli.policy_admin_uids,
+    ));
+    let policy_for_handler: Arc<dyn PrincipalPolicy> = principal_policy.clone();
     let dispatcher = Arc::new(DaemonDispatcher::new_with_finalizer(
         pap,
         policy_for_handler,
@@ -78,6 +95,9 @@ async fn run() -> (ExitCode, Option<Arc<ConfiguredSecurityEventSinks>>) {
     eprintln!("agent-sec-daemon: warning: PAP state is process-local and is lost on restart");
 
     let shutdown = ShutdownToken::new();
+    let health_task = policy_runtime
+        .as_ref()
+        .map(|runtime| watch_policy_health(runtime.enqueuer()));
     let signal_task = tokio::spawn(signals.request_shutdown(shutdown.clone()));
     let result = serve(
         cli.bootstrap,
@@ -87,12 +107,28 @@ async fn run() -> (ExitCode, Option<Arc<ConfiguredSecurityEventSinks>>) {
     )
     .await;
     signal_task.abort();
-    let exit_code = match result {
-        Ok(_) => ExitCode::SUCCESS,
-        Err(problem) => {
-            report_error(&problem);
-            ExitCode::FAILURE
+    if let Some(health_task) = health_task {
+        health_task.abort();
+    }
+    // The UDS service has stopped admission and drained requests. Retain the
+    // blocking join task even on timeout; only process exit may cut off calls.
+    let drain = tokio::task::spawn_blocking(move || {
+        policy_runtime.map_or(Ok(()), ReconciliationRuntime::shutdown)
+    });
+    let exit_code = if matches!(
+        tokio::time::timeout(Duration::from_secs(30), drain).await,
+        Ok(Ok(Ok(())))
+    ) {
+        match result {
+            Ok(_) => ExitCode::SUCCESS,
+            Err(problem) => {
+                report_error(&problem);
+                ExitCode::FAILURE
+            }
         }
+    } else {
+        eprintln!("asc-daemon: reconciliation drain failed or timed out");
+        ExitCode::FAILURE
     };
     (exit_code, Some(event_sinks))
 }
@@ -118,4 +154,26 @@ fn report_error(problem: &dyn std::error::Error) {
         eprintln!("  caused by: {cause}");
         source = cause.source();
     }
+}
+
+fn watch_policy_health(
+    queue: Arc<asc_policy_runtime::reconciliation::WorkQueue>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut healthy = true;
+        loop {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let current = queue.is_healthy();
+            if current != healthy {
+                eprintln!(
+                    "asc-daemon: reconciliation health {}",
+                    if current { "running" } else { "degraded" }
+                );
+                healthy = current;
+            }
+            if queue.has_failed() {
+                break;
+            }
+        }
+    })
 }
