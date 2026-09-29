@@ -42,7 +42,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22.23.2'
 
       - name: Build the V2 raw artifact
         run: |
