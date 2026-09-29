@@ -4,7 +4,7 @@ on:
   pull_request:
     paths:
       - 'src/agent-sec-core/**'
-      - 'src/anolisa/**'
+      - 'distribution/anolisa/**'
       - '.github/workflows/sec-core-raw-v2.yaml'
   workflow_dispatch:
 
