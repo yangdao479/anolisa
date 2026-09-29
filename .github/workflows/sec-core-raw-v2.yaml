@@ -47,6 +47,7 @@ jobs:
       - name: Build the V2 raw artifact
         run: |
           set -euo pipefail
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           SOURCE_DATE_EPOCH="$(git log -1 --format=%ct HEAD)" \
             make -C src/agent-sec-core package-raw
           find src/agent-sec-core/target/raw -name 'sec-core-*-linux-x86_64.tar.gz' -print
