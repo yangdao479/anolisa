@@ -25,17 +25,16 @@ jobs:
 
       - uses: actions/checkout@v4
 
-      - name: Install the latest ANOLISA CLI RPM
-        run: |
-          set -euo pipefail
-          dnf clean all
-          dnf makecache --refresh
-          dnf install -y anolisa
-          anolisa --version
-
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: '1.93.1'
+
+      - name: Build a temporary ANOLISA CLI
+        run: |
+          set -euo pipefail
+          cargo build --release --locked --manifest-path distribution/anolisa/Cargo.toml
+          install -m 0755 distribution/anolisa/target/release/anolisa /usr/local/bin/anolisa
+          anolisa --version
 
       - uses: astral-sh/setup-uv@v8.0.0
         with:
