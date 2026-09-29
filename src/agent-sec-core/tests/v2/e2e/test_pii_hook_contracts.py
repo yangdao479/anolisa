@@ -214,10 +214,14 @@ def test_standalone_scanner_failure_preserves_fail_open(
 
 
 def _hermes(hook, event):
+    plugin_root = _asset("hermes")
+    environment = {"PYTHONPATH": str(plugin_root)}
+    if os.environ.get("PII_HOOK_LAYOUT") == "raw":
+        environment["PII_TEST_HERMES_PLUGIN_ROOT"] = str(plugin_root)
     return _run(
         [sys.executable, str(FIXTURES / "hermes_pii_hook.py")],
         {"hook": hook, "event": event},
-        {"PYTHONPATH": str(_asset("hermes"))},
+        environment,
     )
 
 
