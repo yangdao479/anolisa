@@ -107,10 +107,10 @@ jobs:
           agent-sec-cli --help
           agent-sec-daemon --help
           linux-sandbox --help
-          test -f /usr/lib/systemd/system/agent-sec-core.service
-          test ! -e /usr/lib/systemd/user/agent-sec-core.service
+          test -f /usr/local/lib/systemd/system/agent-sec-core.service
+          test ! -e /usr/local/lib/systemd/user/agent-sec-core.service
           test ! -e /usr/local/lib/anolisa/sec-core/python3.11/site-packages
-          systemd-analyze verify /usr/lib/systemd/system/agent-sec-core.service
+          systemd-analyze verify /usr/local/lib/systemd/system/agent-sec-core.service
 
       - name: Start V2 daemon for installed-binary E2E
         run: |
