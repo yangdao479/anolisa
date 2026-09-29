@@ -1,4 +1,4 @@
-name: Validate agent-sec-core V2 raw package
+name: CI / sec-core Raw Build
 
 on:
   pull_request:
