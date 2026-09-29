@@ -66,17 +66,7 @@ jobs:
           sha256="$(sha256sum "$repo/$artifact_name" | cut -d ' ' -f 1)"
           manifest_digest="sha256:$(sha256sum src/agent-sec-core/.anolisa/component.toml | cut -d ' ' -f 1)"
 
-          cat > "$repo/components-v2.toml" <<EOF
-          schema_version = 2
-
-          [[components]]
-          name = "sec-core"
-          targets = [{ os = "linux", arch = "x86_64" }]
-
-          [[components.backends]]
-          kind = "raw"
-          package = "sec-core"
-          EOF
+          cp distribution/anolisa/manifests/components-v2.toml "$repo/components-v2.toml"
 
           cat > "$repo/index-v2.toml" <<EOF
           schema_version = 1
